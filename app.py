@@ -388,10 +388,12 @@ def read_full_excel(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
             "sku": find_col_exact(raw.columns, ["SKU", "SKU ML"]),
             "descripcion": find_col_safe_contains(raw.columns, ["Descripción", "Descripcion", "Producto", "Title", "Titulo", "Título"]),
             "unidades": find_col_exact(raw.columns, ["Unidades", "Cantidad", "Cant"]),
-            "identificacion": find_col_exact(raw.columns, ["Identificación", "Identificacion"]),
-            "vence": find_col_exact(raw.columns, ["Vence", "Vencimiento"]),
-            "dia": find_col_exact(raw.columns, ["Dia", "Día"]),
-            "hora": find_col_exact(raw.columns, ["Hora"]),
+            # FULL viene con estructura fija. Se fuerzan por posición para no mezclar columnas:
+            # H = Identificación / Etiquetado, I = Vence / Vencimiento.
+            "identificacion": raw.columns[7] if len(raw.columns) > 7 else find_col_exact(raw.columns, ["Identificación", "Identificacion"]),
+            "vence": raw.columns[8] if len(raw.columns) > 8 else find_col_exact(raw.columns, ["Vence", "Vencimiento"]),
+            "dia": raw.columns[9] if len(raw.columns) > 9 else find_col_exact(raw.columns, ["Dia", "Día"]),
+            "hora": raw.columns[10] if len(raw.columns) > 10 else find_col_exact(raw.columns, ["Hora"]),
         }
 
         if not col["unidades"] or not (col["sku"] or col["codigo_ml"] or col["codigo_universal"]):
@@ -544,6 +546,35 @@ def reset_scan_state():
     st.session_state["scan_ml"] = ""
     st.session_state["scan_sec"] = ""
     st.session_state["sin_ean"] = False
+    st.session_state["primary_validated"] = False
+    st.session_state["primary_code"] = ""
+    st.session_state["candidate_id"] = None
+    st.session_state["candidate_mode"] = ""
+
+
+def etiqueta_operativa(v: str) -> str:
+    s = clean_text(v)
+    u = s.upper()
+    if not s:
+        return ""
+    if "SUPERMERCADO" in u:
+        return "SUPERMERCADO"
+    if "OBLIGATORIO" in u:
+        return "Etiquetado obligatorio"
+    # Importante: "SI" pertenece a Vencimiento, no a Etiquetado.
+    # No se convierte en etiquetado obligatorio para evitar mezclar columnas H/I.
+    return s
+
+
+def get_item_row(items: pd.DataFrame, item_id):
+    try:
+        iid = int(item_id)
+    except Exception:
+        return None
+    m = items[items["id"].astype(int) == iid]
+    if m.empty:
+        return None
+    return m.iloc[0]
 
 
 # ============================================================
@@ -670,65 +701,115 @@ elif page == "Escaneo":
 
             st.divider()
 
+            # Estados mínimos para que la PDA no valide automáticamente al escanear.
+            if "primary_validated" not in st.session_state:
+                st.session_state["primary_validated"] = False
+            if "primary_code" not in st.session_state:
+                st.session_state["primary_code"] = ""
+            if "candidate_id" not in st.session_state:
+                st.session_state["candidate_id"] = None
+            if "candidate_mode" not in st.session_state:
+                st.session_state["candidate_mode"] = ""
+
             st.text_input("Código ML o EAN supermercado", key="scan_ml")
+
+            col_val, col_limpiar = st.columns([2, 1])
+            with col_val:
+                validar_primario = st.button("Validar código", type="primary")
+            with col_limpiar:
+                limpiar = st.button("Limpiar")
+
+            if limpiar:
+                reset_scan_state()
+                st.rerun()
 
             scan_ml_v = st.session_state.get("scan_ml", "")
             scan_sec_v = st.session_state.get("scan_sec", "")
-            sin_ean = bool(st.session_state.get("sin_ean", False))
             candidate = None
             modo = ""
 
-            if scan_ml_v:
-                # Primero intentamos SUPERMERCADO: este es el único caso en que el primer campo acepta código universal/EAN/SKU.
-                sm = match_secondary(items, scan_ml_v, only_super=True)
-                if not sm.empty:
-                    candidate = best_match(sm)
-                    modo = "SUPERMERCADO"
+            if validar_primario:
+                st.session_state["candidate_id"] = None
+                st.session_state["candidate_mode"] = ""
+                st.session_state["primary_validated"] = False
+                st.session_state["primary_code"] = norm_code(scan_ml_v)
+                st.session_state["scan_sec"] = ""
+                st.session_state["sin_ean"] = False
+
+                if not norm_code(scan_ml_v):
+                    st.error("Escanea o ingresa un código antes de validar.")
                 else:
-                    m1 = match_ml(items, scan_ml_v)
-                    if m1.empty:
-                        st.error("Código no encontrado en pendientes.")
+                    # SUPERMERCADO: único caso en que el primer campo acepta EAN/Código Universal/SKU.
+                    sm = match_secondary(items, scan_ml_v, only_super=True)
+                    if not sm.empty:
+                        cand = best_match(sm)
+                        st.session_state["candidate_id"] = int(cand["id"])
+                        st.session_state["candidate_mode"] = "SUPERMERCADO"
+                        st.session_state["primary_validated"] = True
                     else:
-                        # Al existir Código ML normal, recién aquí se despliega el segundo campo.
-                        tmp = m1.copy()
-                        tmp["pendiente"] = (tmp["unidades"].astype(int) - tmp["acopiadas"].astype(int)).clip(lower=0)
-                        preview = best_match(tmp)
-                        if preview is not None:
-                            st.markdown(f"<div class='operador-producto'>{preview['descripcion']}</div>", unsafe_allow_html=True)
-                            p_preview = int(preview["unidades"]) - int(preview["acopiadas"])
-                            q1, q2, q3 = st.columns(3)
-                            q1.metric("Solicitadas", int(preview["unidades"]))
-                            q2.metric("Acopiadas", int(preview["acopiadas"]))
-                            q3.metric("Pendientes", max(p_preview, 0))
+                        m1 = match_ml(items, scan_ml_v)
+                        if m1.empty:
+                            st.error("Código no encontrado en productos pendientes.")
+                        else:
+                            st.session_state["primary_validated"] = True
 
-                        st.text_input("SKU / EAN / Código Universal", key="scan_sec")
+            primary_ok = bool(st.session_state.get("primary_validated", False))
+            primary_code = st.session_state.get("primary_code", "")
+            candidate_id = st.session_state.get("candidate_id", None)
+            candidate_mode = st.session_state.get("candidate_mode", "")
 
-                        if st.button("Sin EAN"):
+            if candidate_id:
+                candidate = get_item_row(items, candidate_id)
+                modo = candidate_mode
+
+            elif primary_ok and primary_code:
+                m1 = match_ml(items, primary_code)
+                if not m1.empty:
+                    preview = best_match(m1)
+                    if preview is not None:
+                        p_preview = int(preview["unidades"]) - int(preview["acopiadas"])
+                        st.markdown(f"<div class='operador-producto'>{esc(preview['descripcion'])}</div>", unsafe_allow_html=True)
+                        q1, q2, q3 = st.columns(3)
+                        q1.metric("Solicitadas", int(preview["unidades"]))
+                        q2.metric("Acopiadas", int(preview["acopiadas"]))
+                        q3.metric("Pendientes", max(p_preview, 0))
+
+                    st.text_input("SKU / EAN / Código Universal", key="scan_sec")
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        validar_sec = st.button("Validar SKU/EAN", type="primary")
+                    with b2:
+                        sin_ean_btn = st.button("Sin EAN")
+
+                    if sin_ean_btn:
+                        m_no_super = m1[~m1["identificacion"].map(is_supermercado)]
+                        if m_no_super.empty:
+                            st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
+                        else:
+                            cand = best_match(m_no_super)
+                            st.session_state["candidate_id"] = int(cand["id"])
+                            st.session_state["candidate_mode"] = "SIN_EAN"
                             st.session_state["sin_ean"] = True
                             st.rerun()
 
+                    if validar_sec:
                         scan_sec_v = st.session_state.get("scan_sec", "")
-                        sin_ean = bool(st.session_state.get("sin_ean", False))
-
-                        if scan_sec_v:
+                        if not norm_code(scan_sec_v):
+                            st.error("Escanea o ingresa el SKU/EAN antes de validar.")
+                        else:
                             m2 = match_secondary(m1, scan_sec_v, only_super=False)
                             if m2.empty:
                                 st.error("El SKU/EAN/Código Universal no corresponde a este producto.")
                             else:
-                                candidate = best_match(m2)
-                                modo = "ML+SECUNDARIO"
-                        elif sin_ean:
-                            m1 = m1[~m1["identificacion"].map(is_supermercado)]
-                            if m1.empty:
-                                st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
-                            else:
-                                candidate = best_match(m1)
-                                modo = "SIN_EAN"
+                                cand = best_match(m2)
+                                st.session_state["candidate_id"] = int(cand["id"])
+                                st.session_state["candidate_mode"] = "ML+SECUNDARIO"
+                                st.rerun()
 
             if candidate is not None:
                 pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
                 st.markdown("<div class='operador-ok'>Producto validado</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='operador-producto'>{candidate['descripcion']}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='operador-producto'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
                 x1, x2, x3, x4 = st.columns(4)
                 x1.metric("SKU", candidate["sku"])
                 x2.metric("Solicitadas", int(candidate["unidades"]))
@@ -736,7 +817,7 @@ elif page == "Escaneo":
                 x4.metric("Pendientes", max(pendiente, 0))
                 qty = st.number_input("Cantidad a agregar", min_value=1, max_value=max(pendiente, 1), value=1, step=1)
                 if st.button("Agregar cantidad", type="primary"):
-                    ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), scan_ml_v, scan_sec_v, modo)
+                    ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_ml", ""), st.session_state.get("scan_sec", ""), modo)
                     if ok:
                         reset_scan_state()
                         st.success(msg)
@@ -809,7 +890,7 @@ elif page == "Control":
             show_clean["Unidades"] = show_clean["unidades"].astype(int)
             show_clean["Acopiadas"] = show_clean["acopiadas"].astype(int)
             show_clean["Pendiente"] = show_clean["pendiente"].astype(int)
-            show_clean["Etiquetado"] = show_clean["identificacion"].map(clean_text)
+            show_clean["Etiquetado"] = show_clean["identificacion"].map(etiqueta_operativa)
             show_clean["Vencimiento"] = show_clean["vence"].map(clean_text)
             show_clean["Procesado"] = show_clean["procesado_at"].map(fmt_dt)
             show_clean["Estado"] = show_clean["estado"].map(clean_text)
@@ -824,12 +905,9 @@ elif page == "Control":
                     unidades = int(r.get("Unidades", 0))
                     acopiadas = int(r.get("Acopiadas", 0))
                     pendiente = int(r.get("Pendiente", 0))
-                    etiquetado = clean_text(r.get("Etiquetado", "")) or "Sin indicación"
-                    vencimiento = clean_text(r.get("Vencimiento", "")) or "Sin vencimiento"
+                    etiquetado = etiqueta_operativa(r.get("Etiquetado", ""))
                     procesado = clean_text(r.get("Procesado", "")) or "Sin procesar"
-                    estado = clean_text(r.get("Estado", ""))
-                    badge_estado = "badge-ok" if estado == "COMPLETO" else "badge-pending"
-                    badge_etiqueta = "badge-alert" if etiquetado.upper() in {"ETIQUETADO OBLIGATORIO", "SUPERMERCADO"} or "SUPERMERCADO" in etiquetado.upper() else ""
+                    badge_etiqueta = "badge-alert" if etiquetado else ""
                     st.markdown(
                         f"""
                         <div class="control-card">
@@ -838,10 +916,8 @@ elif page == "Control":
                             <span class="badge">Unidades: {unidades}</span>
                             <span class="badge">Acopiadas: {acopiadas}</span>
                             <span class="badge">Pendiente: {pendiente}</span>
-                            <span class="badge {badge_etiqueta}">Etiquetado: {esc(etiquetado)}</span>
-                            <span class="badge badge-alert">Vencimiento: {esc(vencimiento)}</span>
+                            {f'<span class="badge {badge_etiqueta}">Etiquetado: {esc(etiquetado)}</span>' if etiquetado else ''}
                             <span class="badge">Procesado: {esc(procesado)}</span>
-                            <span class="badge {badge_estado}">Estado: {esc(estado)}</span>
                         </div>
                         """,
                         unsafe_allow_html=True,
