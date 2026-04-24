@@ -118,6 +118,17 @@ def is_supermercado(v) -> bool:
 # Base de datos
 # ============================================================
 
+def ensure_column(conn, table: str, column: str, definition: str):
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+def ensure_column(conn, table: str, column: str, definition: str):
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     with db() as c:
         c.execute("""
@@ -131,23 +142,23 @@ def init_db():
         c.execute("""
             CREATE TABLE IF NOT EXISTS full_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                area TEXT,
-                nro TEXT,
-                codigo_ml TEXT,
-                codigo_universal TEXT,
-                sku TEXT,
-                descripcion TEXT,
-                unidades INTEGER NOT NULL DEFAULT 0,
-                acopiadas INTEGER NOT NULL DEFAULT 0,
-                identificacion TEXT,
-                vence TEXT,
-                dia TEXT,
-                hora TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                lote_id INTEGER NOT NULL
             )
         """)
+        ensure_column(c, "full_items", "area", "TEXT")
+        ensure_column(c, "full_items", "nro", "TEXT")
+        ensure_column(c, "full_items", "codigo_ml", "TEXT")
+        ensure_column(c, "full_items", "codigo_universal", "TEXT")
+        ensure_column(c, "full_items", "sku", "TEXT")
+        ensure_column(c, "full_items", "descripcion", "TEXT")
+        ensure_column(c, "full_items", "unidades", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "full_items", "acopiadas", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "full_items", "identificacion", "TEXT")
+        ensure_column(c, "full_items", "vence", "TEXT")
+        ensure_column(c, "full_items", "dia", "TEXT")
+        ensure_column(c, "full_items", "hora", "TEXT")
+        ensure_column(c, "full_items", "created_at", "TEXT")
+        ensure_column(c, "full_items", "updated_at", "TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS full_scans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +180,6 @@ def init_db():
             )
         """)
         c.commit()
-
 
 def list_lotes() -> pd.DataFrame:
     with db() as c:
@@ -503,12 +513,44 @@ def export_lote(lote_id: int) -> bytes:
 init_db()
 maestro_count, maestro_source = load_maestro_from_repo()
 
-st.title("📦 Control FULL Aurora")
-st.caption("App limpia para validar FULL. Producto normal: Código ML + SKU/EAN/Código Universal. SUPERMERCADO: solo SKU/EAN/Código Universal.")
+st.markdown("""
+<style>
+/* Ajustes PDA solo para operación: campos, botones y métricas más grandes */
+div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label {
+    font-size: 1.25rem !important;
+    font-weight: 800 !important;
+}
+div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input {
+    font-size: 1.55rem !important;
+    min-height: 3.3rem !important;
+}
+.stButton > button {
+    font-size: 1.25rem !important;
+    min-height: 3.2rem !important;
+    width: 100%;
+    font-weight: 800 !important;
+}
+div[data-testid="stMetricValue"] {
+    font-size: 1.85rem !important;
+}
+div[data-testid="stMetricLabel"] {
+    font-size: 1.05rem !important;
+}
+.operador-producto {
+    font-size: 1.35rem;
+    font-weight: 800;
+    line-height: 1.25;
+}
+.operador-ok {
+    font-size: 1.3rem;
+    font-weight: 800;
+}
+</style>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Cargar lote FULL", "Escaneo", "Control", "Maestro SKU/EAN"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Control"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -517,11 +559,6 @@ with st.sidebar:
     else:
         options = {f"{r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}": int(r.id) for r in lotes.itertuples(index=False)}
         active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
-    st.divider()
-    if maestro_count:
-        st.success(f"Maestro cargado desde {maestro_source}: {maestro_count} códigos.")
-    else:
-        st.error("No encontré maestro en data/maestro_sku_ean.xlsx")
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
@@ -547,7 +584,6 @@ if page == "Cargar lote FULL":
                 st.rerun()
 
 elif page == "Escaneo":
-    st.subheader("Escaneo FULL")
     if not active_lote:
         st.warning("Primero crea un lote FULL.")
     else:
@@ -564,17 +600,8 @@ elif page == "Escaneo":
             c.metric("Pendiente", max(total - done, 0))
 
             st.divider()
-            st.markdown("### Validación")
-            st.info("Normal: escanea Código ML y luego SKU/EAN/Código Universal. SUPERMERCADO: escanea solo SKU/EAN/Código Universal.")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.text_input("1) Código ML", key="scan_ml")
-            with col2:
-                st.text_input("2) SKU / EAN / Código Universal", key="scan_sec")
-
-            if st.button("Sin EAN / sin código universal"):
-                st.session_state["sin_ean"] = True
+            st.text_input("Código ML o EAN supermercado", key="scan_ml")
 
             scan_ml_v = st.session_state.get("scan_ml", "")
             scan_sec_v = st.session_state.get("scan_sec", "")
@@ -582,46 +609,61 @@ elif page == "Escaneo":
             candidate = None
             modo = ""
 
-            if scan_sec_v and not scan_ml_v:
-                sm = match_secondary(items, scan_sec_v, only_super=True)
+            if scan_ml_v:
+                # Primero intentamos SUPERMERCADO: este es el único caso en que el primer campo acepta código universal/EAN/SKU.
+                sm = match_secondary(items, scan_ml_v, only_super=True)
                 if not sm.empty:
                     candidate = best_match(sm)
                     modo = "SUPERMERCADO"
                 else:
-                    st.warning("No encontré producto SUPERMERCADO pendiente con ese SKU/EAN/Código Universal. Si es normal, falta Código ML.")
-
-            elif scan_ml_v and scan_sec_v:
-                m1 = match_ml(items, scan_ml_v)
-                if m1.empty:
-                    st.error("No encontré ese Código ML pendiente en el lote.")
-                else:
-                    m2 = match_secondary(m1, scan_sec_v, only_super=False)
-                    if m2.empty:
-                        st.error("El Código ML existe, pero el SKU/EAN/Código Universal no corresponde a ese producto.")
+                    m1 = match_ml(items, scan_ml_v)
+                    if m1.empty:
+                        st.error("Código no encontrado en pendientes.")
                     else:
-                        candidate = best_match(m2)
-                        modo = "ML+SECUNDARIO"
+                        # Al existir Código ML normal, recién aquí se despliega el segundo campo.
+                        tmp = m1.copy()
+                        tmp["pendiente"] = (tmp["unidades"].astype(int) - tmp["acopiadas"].astype(int)).clip(lower=0)
+                        preview = best_match(tmp)
+                        if preview is not None:
+                            st.markdown(f"<div class='operador-producto'>{preview['descripcion']}</div>", unsafe_allow_html=True)
+                            p_preview = int(preview["unidades"]) - int(preview["acopiadas"])
+                            q1, q2, q3 = st.columns(3)
+                            q1.metric("Solicitadas", int(preview["unidades"]))
+                            q2.metric("Acopiadas", int(preview["acopiadas"]))
+                            q3.metric("Pendientes", max(p_preview, 0))
 
-            elif scan_ml_v and sin_ean:
-                m1 = match_ml(items, scan_ml_v)
-                m1 = m1[~m1["identificacion"].map(is_supermercado)]
-                if m1.empty:
-                    st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
-                else:
-                    candidate = best_match(m1)
-                    modo = "SIN_EAN"
+                        st.text_input("SKU / EAN / Código Universal", key="scan_sec")
 
-            elif scan_ml_v and not scan_sec_v:
-                st.warning("Escanea también SKU/EAN/Código Universal, o usa Sin EAN si corresponde.")
+                        if st.button("Sin EAN"):
+                            st.session_state["sin_ean"] = True
+                            st.rerun()
+
+                        scan_sec_v = st.session_state.get("scan_sec", "")
+                        sin_ean = bool(st.session_state.get("sin_ean", False))
+
+                        if scan_sec_v:
+                            m2 = match_secondary(m1, scan_sec_v, only_super=False)
+                            if m2.empty:
+                                st.error("El SKU/EAN/Código Universal no corresponde a este producto.")
+                            else:
+                                candidate = best_match(m2)
+                                modo = "ML+SECUNDARIO"
+                        elif sin_ean:
+                            m1 = m1[~m1["identificacion"].map(is_supermercado)]
+                            if m1.empty:
+                                st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
+                            else:
+                                candidate = best_match(m1)
+                                modo = "SIN_EAN"
 
             if candidate is not None:
                 pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
-                st.success("Producto validado.")
-                st.markdown(f"**{candidate['descripcion']}**")
+                st.markdown("<div class='operador-ok'>Producto validado</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='operador-producto'>{candidate['descripcion']}</div>", unsafe_allow_html=True)
                 x1, x2, x3, x4 = st.columns(4)
                 x1.metric("SKU", candidate["sku"])
                 x2.metric("Solicitadas", int(candidate["unidades"]))
-                x3.metric("Ya acopiadas", int(candidate["acopiadas"]))
+                x3.metric("Acopiadas", int(candidate["acopiadas"]))
                 x4.metric("Pendientes", max(pendiente, 0))
                 qty = st.number_input("Cantidad a agregar", min_value=1, max_value=max(pendiente, 1), value=1, step=1)
                 if st.button("Agregar cantidad", type="primary"):
@@ -678,12 +720,3 @@ elif page == "Control":
                 delete_lote(active_lote)
                 st.success("Lote eliminado.")
                 st.rerun()
-
-elif page == "Maestro SKU/EAN":
-    st.subheader("Maestro SKU/EAN")
-    st.write(f"Ruta obligatoria del repo: `{MAESTRO_PATH}`")
-    if maestro_count:
-        st.success(f"Maestro cargado desde repo: {maestro_count} códigos.")
-    else:
-        st.error("No se cargó el maestro. Debe existir exactamente como data/maestro_sku_ean.xlsx")
-    st.caption("Esta app ya no pide subir maestro. Lo lee desde la repo en cada reinicio.")
