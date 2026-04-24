@@ -97,6 +97,34 @@ def find_col(columns, aliases):
     return None
 
 
+def find_col_exact(columns, aliases):
+    """Busca columnas solo por coincidencia exacta normalizada.
+    Evita mezclar campos parecidos como Identificación / Vence.
+    """
+    normalized = {normalize_header(c): c for c in columns}
+    for a in aliases:
+        key = normalize_header(a)
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def find_col_safe_contains(columns, aliases, forbidden=()):
+    """Fallback controlado: permite contains, pero descarta encabezados conflictivos."""
+    exact = find_col_exact(columns, aliases)
+    if exact:
+        return exact
+    alias_norms = [normalize_header(a) for a in aliases]
+    forbidden_norms = [normalize_header(f) for f in forbidden]
+    for c in columns:
+        n = normalize_header(c)
+        if any(f and f in n for f in forbidden_norms):
+            continue
+        if any(a and a in n for a in alias_norms):
+            return c
+    return None
+
+
 def split_codes(v):
     text = clean_text(v)
     if not text:
@@ -319,17 +347,17 @@ def read_full_excel(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
         raw.columns = [clean_text(c) for c in raw.columns]
 
         col = {
-            "area": find_col(raw.columns, ["Area", "Area."]),
-            "nro": find_col(raw.columns, ["Nº", "N°", "Nro", "Numero", "Número"]),
-            "codigo_ml": find_col(raw.columns, ["Código ML", "Codigo ML", "Cod ML", "COD ML"]),
-            "codigo_universal": find_col(raw.columns, ["Código Universal", "Codigo Universal", "Cod Universal", "COD UNIVERSAL", "EAN"]),
-            "sku": find_col(raw.columns, ["SKU", "SKU ML"]),
-            "descripcion": find_col(raw.columns, ["Descripción", "Descripcion", "Producto", "Title", "Titulo", "Título"]),
-            "unidades": find_col(raw.columns, ["Unidades", "Cantidad", "Cant"]),
-            "identificacion": find_col(raw.columns, ["Identificación", "Identificacion", "Etiqueta", "Etiquetar"]),
-            "vence": find_col(raw.columns, ["Vence", "Vencimiento"]),
-            "dia": find_col(raw.columns, ["Dia", "Día"]),
-            "hora": find_col(raw.columns, ["Hora"]),
+            "area": find_col_safe_contains(raw.columns, ["Area", "Area."]),
+            "nro": find_col_safe_contains(raw.columns, ["Nº", "N°", "Nro", "Numero", "Número"]),
+            "codigo_ml": find_col_safe_contains(raw.columns, ["Código ML", "Codigo ML", "Cod ML", "COD ML"]),
+            "codigo_universal": find_col_safe_contains(raw.columns, ["Código Universal", "Codigo Universal", "Cod Universal", "COD UNIVERSAL", "EAN"]),
+            "sku": find_col_exact(raw.columns, ["SKU", "SKU ML"]),
+            "descripcion": find_col_safe_contains(raw.columns, ["Descripción", "Descripcion", "Producto", "Title", "Titulo", "Título"]),
+            "unidades": find_col_exact(raw.columns, ["Unidades", "Cantidad", "Cant"]),
+            "identificacion": find_col_exact(raw.columns, ["Identificación", "Identificacion"]),
+            "vence": find_col_exact(raw.columns, ["Vence", "Vencimiento"]),
+            "dia": find_col_exact(raw.columns, ["Dia", "Día"]),
+            "hora": find_col_exact(raw.columns, ["Hora"]),
         }
 
         if not col["unidades"] or not (col["sku"] or col["codigo_ml"] or col["codigo_universal"]):
@@ -711,8 +739,9 @@ elif page == "Control":
             elif filtro == "Supermercado":
                 show = view[view["identificacion"].map(is_supermercado)]
 
-            cols = ["area", "nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "acopiadas", "pendiente", "identificacion", "vence", "estado"]
-            st.dataframe(show[cols], use_container_width=True, hide_index=True)
+            cols = ["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "acopiadas", "pendiente", "identificacion", "vence", "estado"]
+            available_cols = [c for c in cols if c in show.columns]
+            st.dataframe(show[available_cols], use_container_width=True, hide_index=True)
             st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             st.divider()
