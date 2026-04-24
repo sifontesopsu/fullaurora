@@ -10,13 +10,13 @@ import streamlit as st
 
 APP_TITLE = "Control FULL Aurora"
 DATA_DIR = Path("data")
-DB_PATH = DATA_DIR / "aurora_full_v2.db"   # Base nueva para no arrastrar datos contaminados
+DB_PATH = DATA_DIR / "aurora_full_v3.db"
 MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
 # ============================================================
-# Limpieza y normalización
+# Utilidades
 # ============================================================
 
 def ensure_data_dir():
@@ -97,92 +97,41 @@ def fmt_dt(v) -> str:
         return s
 
 
+def col_exact(columns, aliases):
+    cmap = {normalize_header(c): c for c in columns}
+    for a in aliases:
+        key = normalize_header(a)
+        if key in cmap:
+            return cmap[key]
+    return None
+
+
+def col_required(columns, field_name, aliases):
+    c = col_exact(columns, aliases)
+    if not c:
+        raise ValueError(f"No encontré columna obligatoria para {field_name}. Encabezados leídos: {list(columns)}")
+    return c
+
+
+def split_codes(v):
+    text = clean_text(v)
+    if not text:
+        return []
+    parts = re.split(r"[,;/|\n\t ]+", text)
+    out = []
+    for p in parts:
+        c = norm_code(p)
+        if c:
+            out.append(c)
+    return list(dict.fromkeys(out))
+
+
 def is_supermercado(v) -> bool:
     return "SUPERMERCADO" in clean_text(v).upper()
 
 
 # ============================================================
-# Mapeo de columnas FULL: estricto y sin mezclar Identificación/Vence
-# ============================================================
-
-COLUMN_ALIASES = {
-    "area": ["area", "area."],
-    "nro": ["n", "no", "nro", "numero", "número", "nº", "n°"],
-    "codigo_ml": ["codigo ml", "cod ml", "código ml"],
-    "codigo_universal": ["codigo universal", "código universal", "cod universal", "ean"],
-    "sku": ["sku", "sku ml"],
-    "descripcion": ["descripcion", "descripción", "producto", "titulo", "título", "title"],
-    "unidades": ["unidades", "cantidad", "cant"],
-    # Importante: Identificación NO se cruza con Vence.
-    "identificacion": ["identificacion", "identificación", "etiqueta", "etiq", "instrucciones de preparacion", "instrucciones de preparación"],
-    "vence": ["vence", "vencimiento", "vcto", "fecha vencimiento", "fecha de vencimiento"],
-    "dia": ["dia", "día"],
-    "hora": ["hora"],
-}
-
-
-def find_col_exact(columns, aliases):
-    normalized = {normalize_header(c): c for c in columns}
-    for alias in aliases:
-        key = normalize_header(alias)
-        if key in normalized:
-            return normalized[key]
-    return None
-
-
-def map_full_columns(columns):
-    mapped = {}
-    for key, aliases in COLUMN_ALIASES.items():
-        mapped[key] = find_col_exact(columns, aliases)
-    return mapped
-
-
-def read_full_excel(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
-    warnings = []
-    xls = pd.ExcelFile(uploaded_file)
-    frames = []
-
-    for sheet in xls.sheet_names:
-        raw = pd.read_excel(xls, sheet_name=sheet, dtype=object).dropna(how="all")
-        if raw.empty:
-            continue
-
-        raw.columns = [clean_text(c) for c in raw.columns]
-        col = map_full_columns(raw.columns)
-
-        missing = []
-        for required in ["codigo_ml", "sku", "descripcion", "unidades"]:
-            if not col.get(required):
-                missing.append(required)
-
-        if missing:
-            warnings.append(f"Hoja omitida '{sheet}': faltan columnas obligatorias: {', '.join(missing)}")
-            continue
-
-        df = pd.DataFrame()
-        for k in ["area", "nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence", "dia", "hora"]:
-            source_col = col.get(k)
-            df[k] = raw[source_col] if source_col else ""
-
-        for k in ["area", "nro", "descripcion", "identificacion", "vence", "dia", "hora"]:
-            df[k] = df[k].map(clean_text)
-        for k in ["codigo_ml", "codigo_universal", "sku"]:
-            df[k] = df[k].map(norm_code)
-        df["unidades"] = df["unidades"].map(to_int)
-
-        df = df[(df["unidades"] > 0) & ((df["sku"] != "") | (df["codigo_ml"] != "") | (df["codigo_universal"] != ""))]
-        if not df.empty:
-            df["hoja_origen"] = sheet
-            frames.append(df)
-
-    columns = ["area", "nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence", "dia", "hora", "hoja_origen"]
-    if not frames:
-        return pd.DataFrame(columns=columns), warnings
-    return pd.concat(frames, ignore_index=True)[columns], warnings
-
-
-# ============================================================
-# Base de datos nueva
+# Base de datos nueva v3
 # ============================================================
 
 def init_db():
@@ -192,6 +141,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nombre TEXT NOT NULL,
                 archivo TEXT,
+                hoja TEXT,
                 created_at TEXT NOT NULL
             )
         """)
@@ -211,7 +161,6 @@ def init_db():
                 vence TEXT,
                 dia TEXT,
                 hora TEXT,
-                hoja_origen TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -239,30 +188,27 @@ def init_db():
         c.commit()
 
 
-def list_lotes() -> pd.DataFrame:
+def list_lotes():
     with db() as c:
-        return pd.read_sql_query(
-            """
-            SELECT l.id, l.nombre, l.archivo, l.created_at,
-                   COALESCE(SUM(i.unidades), 0) AS unidades,
-                   COALESCE(SUM(i.acopiadas), 0) AS acopiadas,
-                   COUNT(i.id) AS lineas
+        return pd.read_sql_query("""
+            SELECT l.id, l.nombre, l.archivo, l.hoja, l.created_at,
+                   COALESCE(SUM(i.unidades), 0) unidades,
+                   COALESCE(SUM(i.acopiadas), 0) acopiadas,
+                   COUNT(i.id) lineas
             FROM lotes l
             LEFT JOIN items i ON i.lote_id = l.id
             GROUP BY l.id
             ORDER BY l.id DESC
-            """,
-            c,
-        )
+        """, c)
 
 
-def get_lote(lote_id: int):
+def get_lote(lote_id):
     with db() as c:
         row = c.execute("SELECT * FROM lotes WHERE id=?", (lote_id,)).fetchone()
-    return dict(row) if row else None
+    return dict(row) if row else {}
 
 
-def get_items(lote_id: int) -> pd.DataFrame:
+def get_items(lote_id):
     with db() as c:
         return pd.read_sql_query(
             "SELECT * FROM items WHERE lote_id=? ORDER BY area, CAST(nro AS INTEGER), id",
@@ -271,45 +217,54 @@ def get_items(lote_id: int) -> pd.DataFrame:
         )
 
 
-def create_lote(nombre: str, archivo: str, df: pd.DataFrame):
+def get_last_scans(lote_id):
+    with db() as c:
+        return pd.read_sql_query("""
+            SELECT item_id, MAX(created_at) procesado_at, SUM(cantidad) escaneado_total
+            FROM scans
+            WHERE lote_id=?
+            GROUP BY item_id
+        """, c, params=(lote_id,))
+
+
+def create_lote(nombre, archivo, hoja, df):
     now = datetime.now().isoformat(timespec="seconds")
     with db() as c:
-        cur = c.execute("INSERT INTO lotes (nombre, archivo, created_at) VALUES (?, ?, ?)", (nombre, archivo, now))
+        cur = c.execute(
+            "INSERT INTO lotes (nombre, archivo, hoja, created_at) VALUES (?, ?, ?, ?)",
+            (nombre, archivo, hoja, now),
+        )
         lote_id = cur.lastrowid
         rows = []
         for r in df.itertuples(index=False):
             rows.append((
                 lote_id,
-                clean_text(getattr(r, "area", "")),
-                clean_text(getattr(r, "nro", "")),
-                norm_code(getattr(r, "codigo_ml", "")),
-                norm_code(getattr(r, "codigo_universal", "")),
-                norm_code(getattr(r, "sku", "")),
-                clean_text(getattr(r, "descripcion", "")),
-                int(getattr(r, "unidades", 0)),
+                clean_text(r.area),
+                clean_text(r.nro),
+                norm_code(r.codigo_ml),
+                norm_code(r.codigo_universal),
+                norm_code(r.sku),
+                clean_text(r.descripcion),
+                int(r.unidades),
                 0,
-                clean_text(getattr(r, "identificacion", "")),
-                clean_text(getattr(r, "vence", "")),
-                clean_text(getattr(r, "dia", "")),
-                clean_text(getattr(r, "hora", "")),
-                clean_text(getattr(r, "hoja_origen", "")),
+                clean_text(r.identificacion),
+                clean_text(r.vence),
+                clean_text(r.dia),
+                clean_text(r.hora),
                 now,
                 now,
             ))
-        c.executemany(
-            """
+        c.executemany("""
             INSERT INTO items
             (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
-             identificacion, vence, dia, hora, hoja_origen, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
+             identificacion, vence, dia, hora, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
         c.commit()
     return lote_id
 
 
-def delete_lote(lote_id: int):
+def delete_lote(lote_id):
     with db() as c:
         c.execute("DELETE FROM scans WHERE lote_id=?", (lote_id,))
         c.execute("DELETE FROM items WHERE lote_id=?", (lote_id,))
@@ -317,7 +272,7 @@ def delete_lote(lote_id: int):
         c.commit()
 
 
-def add_acopio(lote_id: int, item_id: int, cantidad: int, scan_primario: str, scan_secundario: str, modo: str):
+def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
     now = datetime.now().isoformat(timespec="seconds")
     with db() as c:
         item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lote_id)).fetchone()
@@ -331,74 +286,116 @@ def add_acopio(lote_id: int, item_id: int, cantidad: int, scan_primario: str, sc
         if cantidad > pendiente:
             return False, f"No puedes agregar {cantidad}. Solo quedan {pendiente} pendientes."
         c.execute("UPDATE items SET acopiadas=acopiadas+?, updated_at=? WHERE id=?", (cantidad, now, item_id))
-        c.execute(
-            """
+        c.execute("""
             INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now),
-        )
+        """, (lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now))
         c.commit()
     return True, "Cantidad agregada."
 
 
-def undo_last_scan(lote_id: int):
+def undo_last_scan(lote_id):
     with db() as c:
         row = c.execute("SELECT * FROM scans WHERE lote_id=? ORDER BY id DESC LIMIT 1", (lote_id,)).fetchone()
         if not row:
             return False, "No hay escaneos para deshacer."
         now = datetime.now().isoformat(timespec="seconds")
-        c.execute("UPDATE items SET acopiadas=MAX(acopiadas-?, 0), updated_at=? WHERE id=?", (int(row["cantidad"]), now, int(row["item_id"])))
+        c.execute("UPDATE items SET acopiadas=MAX(acopiadas-?,0), updated_at=? WHERE id=?", (int(row["cantidad"]), now, int(row["item_id"])))
         c.execute("DELETE FROM scans WHERE id=?", (int(row["id"]),))
         c.commit()
     return True, "Último escaneo deshecho."
 
 
-def get_last_scans(lote_id: int) -> pd.DataFrame:
-    with db() as c:
-        return pd.read_sql_query(
-            """
-            SELECT item_id, MAX(created_at) AS procesado_at, COALESCE(SUM(cantidad), 0) AS escaneado_total
-            FROM scans
-            WHERE lote_id=?
-            GROUP BY item_id
-            """,
-            c,
-            params=(lote_id,),
-        )
+# ============================================================
+# Lectura Excel: UNA hoja por lote, sin mezclar formatos históricos
+# ============================================================
+
+def sheet_names(uploaded_file):
+    xls = pd.ExcelFile(uploaded_file)
+    return xls.sheet_names
+
+
+def read_full_excel_sheet(uploaded_file, sheet_name):
+    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=object)
+    raw = raw.dropna(how="all")
+    if raw.empty:
+        return pd.DataFrame(), ["La hoja seleccionada está vacía."]
+
+    raw.columns = [clean_text(c) for c in raw.columns]
+    cols = list(raw.columns)
+
+    warnings = []
+
+    area_col = col_exact(cols, ["Area.", "Area", "AREA"])
+    nro_col = col_exact(cols, ["Nº", "N°", "n°", "NRO", "Numero", "Número"])
+    codigo_ml_col = col_required(cols, "Código ML", ["Código ML", "Codigo ML", "CODIGO ML", "COD ML", "Cod ML"])
+    codigo_universal_col = col_exact(cols, ["Código Universal", "Codigo Universal", "COD UNIVERSAL", "Codigo de barras", "EAN"])
+    sku_col = col_required(cols, "SKU", ["SKU", "SKU ML"])
+    descripcion_col = col_required(cols, "Descripción", ["Descripción", "Descripcion", "DESCRIPCION", "Producto", "Título", "Titulo"])
+    unidades_col = col_required(cols, "Unidades", ["Unidades", "CANT", "Cant", "Cantidad"])
+
+    # Separación estricta: Identificación y Vence son columnas independientes.
+    identificacion_col = col_exact(cols, ["Identificación", "Identificacion", "ETIQUETA", "ETIQ"])
+    vence_col = col_exact(cols, ["Vence", "VCTO", "Vencimiento", "Fecha vencimiento", "Fecha de vencimiento"])
+    dia_col = col_exact(cols, ["Dia", "Día"])
+    hora_col = col_exact(cols, ["Hora"])
+
+    if not identificacion_col:
+        warnings.append("No encontré columna de Identificación/ETIQUETA/ETIQ en esta hoja. Se cargará vacía.")
+    if not vence_col:
+        warnings.append("No encontré columna Vence/VCTO en esta hoja. Se cargará vacía.")
+
+    df = pd.DataFrame({
+        "area": raw[area_col] if area_col else "",
+        "nro": raw[nro_col] if nro_col else "",
+        "codigo_ml": raw[codigo_ml_col],
+        "codigo_universal": raw[codigo_universal_col] if codigo_universal_col else "",
+        "sku": raw[sku_col],
+        "descripcion": raw[descripcion_col],
+        "unidades": raw[unidades_col],
+        "identificacion": raw[identificacion_col] if identificacion_col else "",
+        "vence": raw[vence_col] if vence_col else "",
+        "dia": raw[dia_col] if dia_col else "",
+        "hora": raw[hora_col] if hora_col else "",
+    })
+
+    for k in ["area", "nro", "descripcion", "identificacion", "vence", "dia", "hora"]:
+        df[k] = df[k].map(clean_text)
+    for k in ["codigo_ml", "codigo_universal", "sku"]:
+        df[k] = df[k].map(norm_code)
+    df["unidades"] = df["unidades"].map(to_int)
+
+    df = df[(df["unidades"] > 0) & ((df["sku"] != "") | (df["codigo_ml"] != "") | (df["codigo_universal"] != ""))]
+    return df.reset_index(drop=True), warnings
 
 
 # ============================================================
 # Maestro SKU/EAN desde repo
 # ============================================================
 
-def split_codes(v):
-    text = clean_text(v)
-    if not text:
-        return []
-    parts = re.split(r"[,;/|\n\t ]+", text)
-    return list(dict.fromkeys([norm_code(p) for p in parts if norm_code(p)]))
-
-
-def parse_maestro(file_or_path) -> pd.DataFrame:
+def parse_maestro(file_or_path):
+    if not Path(file_or_path).exists():
+        return pd.DataFrame(columns=["code", "sku", "descripcion"])
     xls = pd.ExcelFile(file_or_path)
-    rows = []
-    for sheet in xls.sheet_names:
-        raw = pd.read_excel(xls, sheet_name=sheet, dtype=object).dropna(how="all")
+    frames = []
+    for sh in xls.sheet_names:
+        raw = pd.read_excel(xls, sheet_name=sh, dtype=object).dropna(how="all")
         if raw.empty:
             continue
         raw.columns = [clean_text(c) for c in raw.columns]
-        sku_col = find_col_exact(raw.columns, ["SKU", "SKU ML", "sku_ml"])
-        desc_col = find_col_exact(raw.columns, ["Descripción", "Descripcion", "Producto", "Title", "Titulo"])
+        cols = list(raw.columns)
+        sku_col = col_exact(cols, ["SKU", "SKU ML", "sku_ml"])
+        desc_col = col_exact(cols, ["Descripción", "Descripcion", "Producto", "Title", "Titulo"])
         if not sku_col:
             continue
         barcode_cols = []
-        for c in raw.columns:
+        for c in cols:
             h = normalize_header(c)
             if any(x in h for x in ["ean", "barra", "barcode", "codigo universal", "cod universal", "codigo de barras"]):
                 barcode_cols.append(c)
         if sku_col not in barcode_cols:
             barcode_cols.append(sku_col)
+        rows = []
         for _, r in raw.iterrows():
             sku = norm_code(r.get(sku_col, ""))
             if not sku:
@@ -410,46 +407,40 @@ def parse_maestro(file_or_path) -> pd.DataFrame:
                     codes.add(code)
             for code in codes:
                 rows.append({"code": code, "sku": sku, "descripcion": desc})
-    if not rows:
+        if rows:
+            frames.append(pd.DataFrame(rows))
+    if not frames:
         return pd.DataFrame(columns=["code", "sku", "descripcion"])
-    return pd.DataFrame(rows).drop_duplicates(subset=["code"])
-
-
-def import_maestro(df: pd.DataFrame):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        c.execute("DELETE FROM maestro")
-        c.executemany(
-            "INSERT OR REPLACE INTO maestro (code, sku, descripcion, updated_at) VALUES (?, ?, ?, ?)",
-            [(norm_code(r.code), norm_code(r.sku), clean_text(r.descripcion), now) for r in df.itertuples(index=False)],
-        )
-        c.commit()
+    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["code"])
 
 
 def load_maestro_from_repo():
-    if not MAESTRO_PATH.exists():
-        return 0
     df = parse_maestro(MAESTRO_PATH)
     if df.empty:
         return 0
-    import_maestro(df)
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as c:
+        c.execute("DELETE FROM maestro")
+        c.executemany("INSERT OR REPLACE INTO maestro (code, sku, descripcion, updated_at) VALUES (?, ?, ?, ?)",
+                      [(norm_code(r.code), norm_code(r.sku), clean_text(r.descripcion), now) for r in df.itertuples(index=False)])
+        c.commit()
     return len(df)
 
 
-def maestro_lookup(code: str) -> str:
-    code_n = norm_code(code)
-    if not code_n:
+def maestro_lookup(code):
+    cn = norm_code(code)
+    if not cn:
         return ""
     with db() as c:
-        row = c.execute("SELECT sku FROM maestro WHERE code=?", (code_n,)).fetchone()
+        row = c.execute("SELECT sku FROM maestro WHERE code=?", (cn,)).fetchone()
     return clean_text(row["sku"]) if row else ""
 
 
 # ============================================================
-# Matching operativo
+# Matching
 # ============================================================
 
-def pending_items(items: pd.DataFrame) -> pd.DataFrame:
+def pending_items(items):
     if items.empty:
         return items
     p = items.copy()
@@ -457,57 +448,47 @@ def pending_items(items: pd.DataFrame) -> pd.DataFrame:
     return p[p["pendiente"] > 0]
 
 
-def best_match(matches: pd.DataFrame):
-    if matches.empty:
+def match_ml(items, code):
+    cn = norm_code(code)
+    p = pending_items(items)
+    return p[p["codigo_ml"].map(norm_code) == cn] if cn else p.iloc[0:0]
+
+
+def match_secondary(items, code, only_super=None):
+    cn = norm_code(code)
+    if not cn:
+        return items.iloc[0:0]
+    sku_master = norm_code(maestro_lookup(cn))
+    p = pending_items(items)
+    if only_super is True:
+        p = p[p["identificacion"].map(is_supermercado)]
+    elif only_super is False:
+        p = p[~p["identificacion"].map(is_supermercado)]
+    mask = (p["sku"].map(norm_code) == cn) | (p["codigo_universal"].map(norm_code) == cn)
+    if sku_master:
+        mask = mask | (p["sku"].map(norm_code) == sku_master)
+    return p[mask]
+
+
+def best_match(df):
+    if df.empty:
         return None
-    m = matches.copy()
+    m = df.copy()
     m["pendiente"] = (m["unidades"].astype(int) - m["acopiadas"].astype(int)).clip(lower=0)
     return m.sort_values(["pendiente", "id"], ascending=[False, True]).iloc[0]
 
 
-def match_primary(items: pd.DataFrame, code: str) -> tuple[pd.DataFrame, str]:
-    """Primer campo: Código ML normal. Para supermercado, también acepta SKU/EAN/Código Universal."""
-    c = norm_code(code)
-    p = pending_items(items)
-    if not c:
-        return p.iloc[0:0], ""
-
-    super_mask = p["identificacion"].map(is_supermercado)
-    p_super = p[super_mask]
-    sku_from_master = norm_code(maestro_lookup(c))
-    m_super = p_super[(p_super["sku"].map(norm_code) == c) | (p_super["codigo_universal"].map(norm_code) == c)]
-    if sku_from_master:
-        m_super = p_super[(p_super["sku"].map(norm_code) == sku_from_master) | (p_super["sku"].map(norm_code) == c) | (p_super["codigo_universal"].map(norm_code) == c)]
-    if not m_super.empty:
-        return m_super, "SUPERMERCADO"
-
-    m_ml = p[p["codigo_ml"].map(norm_code) == c]
-    return m_ml, "ML"
-
-
-def match_secondary(items_for_ml: pd.DataFrame, code: str) -> pd.DataFrame:
-    c = norm_code(code)
-    if not c:
-        return items_for_ml.iloc[0:0]
-    sku_from_master = norm_code(maestro_lookup(c))
-    p = pending_items(items_for_ml)
-    mask = (p["sku"].map(norm_code) == c) | (p["codigo_universal"].map(norm_code) == c)
-    if sku_from_master:
-        mask = mask | (p["sku"].map(norm_code) == sku_from_master)
-    return p[mask]
-
-
 def reset_scan_state():
-    for k in ["scan_primary", "scan_secondary", "primary_validated", "primary_code", "primary_mode", "candidate_id", "candidate_mode"]:
+    for k in ["scan_primary", "scan_secondary", "primary_validated", "primary_code", "candidate_id", "candidate_mode"]:
         if k in ["primary_validated"]:
             st.session_state[k] = False
-        elif k in ["candidate_id"]:
+        elif k == "candidate_id":
             st.session_state[k] = None
         else:
             st.session_state[k] = ""
 
 
-def get_item_row(items: pd.DataFrame, item_id):
+def get_item_row(items, item_id):
     try:
         iid = int(item_id)
     except Exception:
@@ -520,11 +501,12 @@ def get_item_row(items: pd.DataFrame, item_id):
 # Exportación
 # ============================================================
 
-def export_lote(lote_id: int) -> bytes:
+def export_lote(lote_id):
     items = get_items(lote_id)
     if not items.empty:
         items["pendiente"] = (items["unidades"].astype(int) - items["acopiadas"].astype(int)).clip(lower=0)
         items["estado"] = items["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
+    scans = pd.DataFrame()
     with db() as c:
         scans = pd.read_sql_query("SELECT created_at, item_id, scan_primario, scan_secundario, cantidad, modo FROM scans WHERE lote_id=? ORDER BY id DESC", c, params=(lote_id,))
     out = io.BytesIO()
@@ -543,19 +525,16 @@ load_maestro_from_repo()
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem;}
 div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label {font-size:1.25rem!important;font-weight:800!important;}
-div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input {font-size:1.55rem!important;min-height:3.25rem!important;}
-.stButton > button {font-size:1.18rem!important;min-height:3rem!important;width:100%;font-weight:800!important;}
+div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input {font-size:1.55rem!important;min-height:3.3rem!important;}
+.stButton > button {font-size:1.2rem!important;min-height:3.1rem!important;width:100%;font-weight:800!important;}
 div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
-.product-title {font-size:1.35rem;font-weight:900;line-height:1.25;margin:.4rem 0;}
-.product-sub {font-size:1rem;color:#374151;margin-bottom:.4rem;}
-.card {border:1px solid #E5E7EB;border-radius:14px;padding:14px 16px;margin:10px 0;background:#fff;}
-.card-title {font-size:1.05rem;font-weight:850;line-height:1.3;margin-bottom:8px;}
-.card-meta {font-size:.92rem;color:#374151;margin-bottom:8px;}
-.badge {display:inline-block;padding:5px 9px;border-radius:999px;background:#F3F4F6;margin:3px 4px 3px 0;font-size:.9rem;font-weight:750;}
-.badge-att {background:#FFF7ED;}
-.badge-super {background:#ECFDF5;}
+.product-title {font-size:1.3rem;font-weight:850;line-height:1.25;margin:8px 0;}
+.control-card {border:1px solid #E5E7EB;border-radius:16px;padding:15px 17px;margin:12px 0;background:#FFF;}
+.control-title {font-size:1.05rem;font-weight:850;line-height:1.35;margin-bottom:8px;}
+.control-meta {font-size:.92rem;color:#374151;margin-bottom:8px;}
+.badge {display:inline-block;padding:6px 10px;border-radius:999px;background:#F3F4F6;margin:3px 4px 3px 0;font-size:.92rem;font-weight:750;}
+.badge-alert {background:#FFF7ED;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -575,118 +554,117 @@ if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
     full_file = st.file_uploader("Excel FULL", type=["xlsx"])
     if full_file:
-        df, warns = read_full_excel(full_file)
-        for w in warns:
-            st.warning(w)
-        if df.empty:
-            st.error("No se pudieron leer productos válidos desde el Excel.")
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Líneas", len(df))
-            c2.metric("Unidades", int(df["unidades"].sum()))
-            c3.metric("Con identificación", int((df["identificacion"].map(clean_text) != "").sum()))
-            c4.metric("Con vence", int((df["vence"].map(clean_text) != "").sum()))
-
-            with st.expander("Revisión rápida de columnas leídas", expanded=True):
-                st.dataframe(
-                    df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            nombre = st.text_input("Nombre del lote", value=f"FULL {datetime.now().strftime('%d-%m-%Y %H:%M')}")
-            if st.button("Crear lote", type="primary"):
-                create_lote(nombre, full_file.name, df)
-                reset_scan_state()
-                st.success("Lote creado correctamente.")
-                st.rerun()
+        names = sheet_names(full_file)
+        default_idx = len(names) - 1 if names else 0
+        selected_sheet = st.selectbox("Hoja a cargar", names, index=default_idx)
+        try:
+            df, warns = read_full_excel_sheet(full_file, selected_sheet)
+            for w in warns:
+                st.warning(w)
+            if df.empty:
+                st.error("No se encontraron productos válidos en la hoja seleccionada.")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Hoja", selected_sheet)
+                c2.metric("Líneas", len(df))
+                c3.metric("Unidades", int(df["unidades"].sum()))
+                c4.metric("SKUs únicos", int(df["sku"].nunique()))
+                with st.expander("Revisión rápida de columnas leídas", expanded=True):
+                    st.dataframe(df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20), use_container_width=True, hide_index=True)
+                nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+                if st.button("Crear lote", type="primary"):
+                    create_lote(nombre, full_file.name, selected_sheet, df)
+                    reset_scan_state()
+                    st.success("Lote creado correctamente.")
+                    st.rerun()
+        except Exception as e:
+            st.error(f"No pude leer la hoja seleccionada: {e}")
 
 elif page == "Escaneo":
     if not active_lote:
         st.warning("Primero crea un lote FULL.")
     else:
         items = get_items(active_lote)
-        if items.empty:
-            st.warning("El lote activo no tiene productos.")
-        else:
-            total = int(items["unidades"].sum())
-            done = int(items["acopiadas"].sum())
-            st.progress(done / total if total else 0)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Solicitado", total)
-            m2.metric("Acopiado", done)
-            m3.metric("Pendiente", max(total - done, 0))
-            st.divider()
+        total = int(items["unidades"].sum()) if not items.empty else 0
+        done = int(items["acopiadas"].sum()) if not items.empty else 0
+        st.progress(done / total if total else 0)
+        a, b, c = st.columns(3)
+        a.metric("Solicitado", total)
+        b.metric("Acopiado", done)
+        c.metric("Pendiente", max(total - done, 0))
+        st.divider()
 
-            if "primary_validated" not in st.session_state:
-                reset_scan_state()
+        for k, v in {"primary_validated": False, "primary_code": "", "candidate_id": None, "candidate_mode": ""}.items():
+            if k not in st.session_state:
+                st.session_state[k] = v
 
-            st.text_input("Código ML o EAN supermercado", key="scan_primary")
-            b1, b2 = st.columns([2, 1])
-            with b1:
-                validate_primary = st.button("Validar código", type="primary")
-            with b2:
-                clear = st.button("Limpiar")
+        st.text_input("Código ML o EAN supermercado", key="scan_primary")
+        cv, cl = st.columns([2, 1])
+        with cv:
+            validar_primario = st.button("Validar código", type="primary")
+        with cl:
+            limpiar = st.button("Limpiar")
+        if limpiar:
+            reset_scan_state(); st.rerun()
 
-            if clear:
-                reset_scan_state()
-                st.rerun()
-
-            if validate_primary:
-                st.session_state["candidate_id"] = None
-                st.session_state["candidate_mode"] = ""
-                st.session_state["primary_validated"] = False
-                st.session_state["primary_code"] = norm_code(st.session_state.get("scan_primary", ""))
-                st.session_state["primary_mode"] = ""
-                st.session_state["scan_secondary"] = ""
-
-                if not st.session_state["primary_code"]:
-                    st.error("Ingresa o escanea un código.")
+        if validar_primario:
+            st.session_state["candidate_id"] = None
+            st.session_state["candidate_mode"] = ""
+            st.session_state["primary_validated"] = False
+            st.session_state["primary_code"] = norm_code(st.session_state.get("scan_primary", ""))
+            st.session_state["scan_secondary"] = ""
+            code = st.session_state["primary_code"]
+            if not code:
+                st.error("Escanea o ingresa un código.")
+            else:
+                sm = match_secondary(items, code, only_super=True)
+                if not sm.empty:
+                    cand = best_match(sm)
+                    st.session_state["candidate_id"] = int(cand["id"])
+                    st.session_state["candidate_mode"] = "SUPERMERCADO"
+                    st.session_state["primary_validated"] = True
                 else:
-                    matches, mode = match_primary(items, st.session_state["primary_code"])
-                    if matches.empty:
+                    m1 = match_ml(items, code)
+                    if m1.empty:
                         st.error("Código no encontrado en productos pendientes.")
-                    elif mode == "SUPERMERCADO":
-                        cand = best_match(matches)
-                        st.session_state["candidate_id"] = int(cand["id"])
-                        st.session_state["candidate_mode"] = "SUPERMERCADO"
-                        st.session_state["primary_validated"] = True
-                        st.session_state["primary_mode"] = mode
-                        st.rerun()
                     else:
                         st.session_state["primary_validated"] = True
-                        st.session_state["primary_mode"] = mode
-                        st.rerun()
 
-            candidate = None
-            candidate_mode = st.session_state.get("candidate_mode", "")
-            if st.session_state.get("candidate_id"):
-                candidate = get_item_row(items, st.session_state.get("candidate_id"))
-
-            elif st.session_state.get("primary_validated") and st.session_state.get("primary_code"):
-                matches, mode = match_primary(items, st.session_state["primary_code"])
-                preview = best_match(matches)
-                if preview is not None:
-                    pendiente_preview = int(preview["unidades"]) - int(preview["acopiadas"])
-                    st.markdown(f"<div class='product-title'>{esc(preview['descripcion'])}</div>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='product-sub'><b>SKU:</b> {esc(preview['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(preview['codigo_ml'])}</div>", unsafe_allow_html=True)
-                    q1, q2, q3 = st.columns(3)
-                    q1.metric("Solicitadas", int(preview["unidades"]))
-                    q2.metric("Acopiadas", int(preview["acopiadas"]))
-                    q3.metric("Pendientes", max(pendiente_preview, 0))
-
+        candidate = None
+        modo = st.session_state.get("candidate_mode", "")
+        if st.session_state.get("candidate_id"):
+            candidate = get_item_row(items, st.session_state["candidate_id"])
+        elif st.session_state.get("primary_validated") and st.session_state.get("primary_code"):
+            m1 = match_ml(items, st.session_state["primary_code"])
+            preview = best_match(m1)
+            if preview is not None:
+                pendiente = int(preview["unidades"]) - int(preview["acopiadas"])
+                st.markdown(f"<div class='product-title'>{esc(preview['descripcion'])}</div>", unsafe_allow_html=True)
+                q1, q2, q3 = st.columns(3)
+                q1.metric("Solicitadas", int(preview["unidades"]))
+                q2.metric("Acopiadas", int(preview["acopiadas"]))
+                q3.metric("Pendientes", max(pendiente, 0))
                 st.text_input("SKU / EAN / Código Universal", key="scan_secondary")
-                s1, s2 = st.columns(2)
-                with s1:
-                    validate_secondary = st.button("Validar SKU/EAN", type="primary")
-                with s2:
-                    no_ean = st.button("Sin EAN")
-
-                if validate_secondary:
-                    if not norm_code(st.session_state.get("scan_secondary", "")):
-                        st.error("Ingresa o escanea el SKU/EAN.")
+                b1, b2 = st.columns(2)
+                with b1:
+                    validar_sec = st.button("Validar SKU/EAN", type="primary")
+                with b2:
+                    sin_ean = st.button("Sin EAN")
+                if sin_ean:
+                    m_no_super = m1[~m1["identificacion"].map(is_supermercado)]
+                    if m_no_super.empty:
+                        st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
                     else:
-                        m2 = match_secondary(matches, st.session_state["scan_secondary"])
+                        cand = best_match(m_no_super)
+                        st.session_state["candidate_id"] = int(cand["id"])
+                        st.session_state["candidate_mode"] = "SIN_EAN"
+                        st.rerun()
+                if validar_sec:
+                    sec = st.session_state.get("scan_secondary", "")
+                    if not norm_code(sec):
+                        st.error("Escanea o ingresa el SKU/EAN.")
+                    else:
+                        m2 = match_secondary(m1, sec, only_super=False)
                         if m2.empty:
                             st.error("El SKU/EAN/Código Universal no corresponde a este producto.")
                         else:
@@ -695,66 +673,56 @@ elif page == "Escaneo":
                             st.session_state["candidate_mode"] = "ML+SECUNDARIO"
                             st.rerun()
 
-                if no_ean:
-                    normal = matches[~matches["identificacion"].map(is_supermercado)]
-                    if normal.empty:
-                        st.error("No encontré producto normal pendiente para usar Sin EAN.")
-                    else:
-                        cand = best_match(normal)
-                        st.session_state["candidate_id"] = int(cand["id"])
-                        st.session_state["candidate_mode"] = "SIN_EAN"
-                        st.rerun()
-
-            if candidate is not None:
-                pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
-                st.success("Producto validado")
-                st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='product-sub'><b>SKU:</b> {esc(candidate['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(candidate['codigo_ml'])}</div>", unsafe_allow_html=True)
-                x1, x2, x3 = st.columns(3)
-                x1.metric("Solicitadas", int(candidate["unidades"]))
-                x2.metric("Acopiadas", int(candidate["acopiadas"]))
-                x3.metric("Pendientes", max(pendiente, 0))
-                qty = st.number_input("Cantidad a agregar", min_value=1, max_value=max(pendiente, 1), value=1, step=1)
-                if st.button("Agregar cantidad", type="primary"):
-                    ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), candidate_mode)
-                    if ok:
-                        reset_scan_state()
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-            st.divider()
-            if st.button("Deshacer último escaneo"):
-                ok, msg = undo_last_scan(active_lote)
-                st.success(msg) if ok else st.warning(msg)
+        if candidate is not None:
+            pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
+            st.success("Producto validado")
+            st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("SKU", candidate["sku"])
+            x2.metric("Solicitadas", int(candidate["unidades"]))
+            x3.metric("Acopiadas", int(candidate["acopiadas"]))
+            x4.metric("Pendientes", max(pendiente, 0))
+            qty = st.number_input("Cantidad a agregar", min_value=1, max_value=max(pendiente, 1), value=1, step=1)
+            if st.button("Agregar cantidad", type="primary"):
+                ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
                 if ok:
-                    st.rerun()
+                    reset_scan_state(); st.success(msg); st.rerun()
+                else:
+                    st.error(msg)
+
+        st.divider()
+        if st.button("Deshacer último escaneo"):
+            ok, msg = undo_last_scan(active_lote)
+            st.success(msg) if ok else st.warning(msg)
+            if ok: st.rerun()
 
 elif page == "Control":
     st.subheader("Control de lote")
     if not active_lote:
         st.warning("No hay lote activo.")
     else:
+        lote = get_lote(active_lote)
         items = get_items(active_lote)
         if items.empty:
             st.warning("El lote no tiene productos.")
         else:
-            lote = get_lote(active_lote) or {}
             view = items.copy()
             view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
             view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
-            total = int(view["unidades"].sum())
-            done = int(view["acopiadas"].sum())
+            scans = get_last_scans(active_lote)
+            if not scans.empty:
+                view = view.merge(scans, left_on="id", right_on="item_id", how="left")
+            else:
+                view["procesado_at"] = ""
             c1, c2, c3, c4 = st.columns(4)
+            total = int(view["unidades"].sum()); done = int(view["acopiadas"].sum())
             c1.metric("Unidades", total)
             c2.metric("Acopiadas", done)
-            c3.metric("Pendientes", max(total - done, 0))
-            c4.metric("Avance", f"{(done / total * 100) if total else 0:.1f}%")
+            c3.metric("Pendientes", max(total-done, 0))
+            c4.metric("Avance", f"{(done/total*100) if total else 0:.1f}%")
+            st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
 
-            st.caption(f"Lote: {clean_text(lote.get('nombre',''))} · Cargado: {fmt_dt(lote.get('created_at',''))} · Archivo: {clean_text(lote.get('archivo',''))}")
-
-            filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado", "Con identificación", "Con vencimiento"])
+            filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"])
             show = view
             if filtro == "Pendientes":
                 show = view[view["pendiente"] > 0]
@@ -762,58 +730,42 @@ elif page == "Control":
                 show = view[view["pendiente"] == 0]
             elif filtro == "Supermercado":
                 show = view[view["identificacion"].map(is_supermercado)]
-            elif filtro == "Con identificación":
-                show = view[view["identificacion"].map(clean_text) != ""]
-            elif filtro == "Con vencimiento":
-                show = view[view["vence"].map(clean_text) != ""]
-
-            scans = get_last_scans(active_lote)
-            if not scans.empty:
-                show = show.merge(scans, left_on="id", right_on="item_id", how="left")
-            else:
-                show["procesado_at"] = ""
 
             modo_vista = st.radio("Vista", ["Tarjetas operativas", "Tabla"], horizontal=True)
             if modo_vista == "Tarjetas operativas":
                 for _, r in show.iterrows():
-                    pendiente = int(r["unidades"]) - int(r["acopiadas"])
                     ident = clean_text(r.get("identificacion", ""))
-                    processed = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
-                    ident_badge = "badge-super" if is_supermercado(ident) else "badge-att"
-                    ident_html = f'<span class="badge {ident_badge}">Identificación: {esc(ident)}</span>' if ident else ''
-                    st.markdown(
-                        f"""
-                        <div class="card">
-                            <div class="card-title">{esc(r.get('descripcion', ''))}</div>
-                            <div class="card-meta"><b>SKU:</b> {esc(r.get('sku', ''))} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r.get('codigo_ml', ''))}</div>
-                            <span class="badge">Unidades: {int(r['unidades'])}</span>
-                            <span class="badge">Acopiadas: {int(r['acopiadas'])}</span>
-                            <span class="badge">Pendiente: {max(pendiente, 0)}</span>
-                            {ident_html}
-                            <span class="badge">Procesado: {esc(processed)}</span>
+                    vence = clean_text(r.get("vence", ""))
+                    proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
+                    badges = f"""
+                        <span class='badge'>Unidades: {int(r['unidades'])}</span>
+                        <span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>
+                        <span class='badge'>Pendiente: {int(r['pendiente'])}</span>
+                    """
+                    if ident:
+                        badges += f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>"
+                    if vence:
+                        badges += f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>"
+                    badges += f"<span class='badge'>Procesado: {esc(proc)}</span>"
+                    st.markdown(f"""
+                        <div class='control-card'>
+                            <div class='control-title'>{esc(r['descripcion'])}</div>
+                            <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
+                            {badges}
                         </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    """, unsafe_allow_html=True)
             else:
-                table = show.copy()
-                table["Producto"] = table["descripcion"].map(clean_text)
-                table["SKU"] = table["sku"].map(norm_code)
-                table["Código ML"] = table["codigo_ml"].map(norm_code)
-                table["EAN / Código universal"] = table["codigo_universal"].map(norm_code)
-                table["Unidades"] = table["unidades"].astype(int)
-                table["Acopiadas"] = table["acopiadas"].astype(int)
-                table["Pendiente"] = table["pendiente"].astype(int)
-                table["Identificación"] = table["identificacion"].map(clean_text)
-                table["Vence"] = table["vence"].map(clean_text)
-                table["Procesado"] = table["procesado_at"].map(fmt_dt)
-                table["Estado"] = table["estado"].map(clean_text)
-                display_cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Identificación", "Vence", "Procesado", "Estado"]
-                st.dataframe(table[display_cols], use_container_width=True, hide_index=True, height=620)
+                out = show.copy()
+                out["Procesado"] = out["procesado_at"].map(fmt_dt)
+                out = out.rename(columns={
+                    "sku":"SKU", "codigo_ml":"Código ML", "codigo_universal":"EAN / Código universal",
+                    "descripcion":"Producto", "unidades":"Unidades", "acopiadas":"Acopiadas", "pendiente":"Pendiente",
+                    "identificacion":"Identificación", "vence":"Vence", "estado":"Estado"
+                })
+                cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Identificación", "Vence", "Procesado", "Estado"]
+                st.dataframe(out[cols], use_container_width=True, hide_index=True, height=620)
 
             st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.divider()
             if st.button("Eliminar lote activo"):
-                delete_lote(active_lote)
-                st.success("Lote eliminado.")
-                st.rerun()
+                delete_lote(active_lote); st.success("Lote eliminado."); st.rerun()
