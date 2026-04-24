@@ -388,10 +388,10 @@ def read_full_excel(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
             "sku": find_col_exact(raw.columns, ["SKU", "SKU ML"]),
             "descripcion": find_col_safe_contains(raw.columns, ["Descripción", "Descripcion", "Producto", "Title", "Titulo", "Título"]),
             "unidades": find_col_exact(raw.columns, ["Unidades", "Cantidad", "Cant"]),
-            # FULL viene con estructura fija. Se fuerzan por posición para no mezclar columnas:
-            # H = Identificación / Etiquetado, I = Vence / Vencimiento.
-            "identificacion": raw.columns[7] if len(raw.columns) > 7 else find_col_exact(raw.columns, ["Identificación", "Identificacion"]),
-            "vence": raw.columns[8] if len(raw.columns) > 8 else find_col_exact(raw.columns, ["Vence", "Vencimiento"]),
+            # Identificación/Etiquetado y Vencimiento se buscan solo por encabezado exacto.
+            # No se fuerzan posiciones porque puede leer Unidades como Etiquetado.
+            "identificacion": find_col_exact(raw.columns, ["Identificación", "Identificacion", "Etiquetado", "Etiqueta", "Instrucciones de preparación", "Instrucciones de preparacion"]),
+            "vence": find_col_exact(raw.columns, ["Vence", "Vencimiento", "Fecha vencimiento", "Fecha de vencimiento"]),
             "dia": raw.columns[9] if len(raw.columns) > 9 else find_col_exact(raw.columns, ["Dia", "Día"]),
             "hora": raw.columns[10] if len(raw.columns) > 10 else find_col_exact(raw.columns, ["Hora"]),
         }
@@ -557,12 +557,14 @@ def etiqueta_operativa(v: str) -> str:
     u = s.upper()
     if not s:
         return ""
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", s):
+        return ""
     if "SUPERMERCADO" in u:
         return "SUPERMERCADO"
     if "OBLIGATORIO" in u:
         return "Etiquetado obligatorio"
-    # Importante: "SI" pertenece a Vencimiento, no a Etiquetado.
-    # No se convierte en etiquetado obligatorio para evitar mezclar columnas H/I.
+    if u in {"SI", "SÍ", "NO"}:
+        return ""
     return s
 
 
