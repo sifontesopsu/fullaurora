@@ -1,5 +1,6 @@
 import io
 import re
+import html
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -220,6 +221,44 @@ def list_lotes() -> pd.DataFrame:
             c,
         )
 
+
+
+
+def get_lote_info(lote_id: int):
+    with db() as c:
+        row = c.execute(
+            "SELECT id, nombre, archivo, created_at FROM full_lotes WHERE id=?",
+            (lote_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_last_scans(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        return pd.read_sql_query(
+            """
+            SELECT s.item_id, MAX(s.created_at) AS procesado_at, COALESCE(SUM(s.cantidad), 0) AS escaneado_total
+            FROM full_scans s
+            WHERE s.lote_id=?
+            GROUP BY s.item_id
+            """,
+            c,
+            params=(lote_id,),
+        )
+
+
+def esc(v) -> str:
+    return html.escape(clean_text(v), quote=True)
+
+
+def fmt_dt(v) -> str:
+    s = clean_text(v)
+    if not s:
+        return ""
+    try:
+        return datetime.fromisoformat(s).strftime("%d-%m-%Y %H:%M:%S")
+    except Exception:
+        return s
 
 def get_items(lote_id: int) -> pd.DataFrame:
     with db() as c:
@@ -568,6 +607,14 @@ div[data-testid="stMetricLabel"] {
     font-size: 1.3rem;
     font-weight: 800;
 }
+
+.control-card {border:1px solid #E5E7EB;border-radius:14px;padding:14px 16px;margin:10px 0;background:#FFFFFF;}
+.control-title {font-size:1.05rem;font-weight:800;line-height:1.3;margin-bottom:8px;}
+.control-meta {font-size:.92rem;color:#374151;margin-bottom:8px;}
+.badge {display:inline-block;padding:5px 9px;border-radius:999px;background:#F3F4F6;margin:3px 4px 3px 0;font-size:.9rem;font-weight:700;}
+.badge-alert {background:#FFF7ED;}
+.badge-ok {background:#ECFDF5;}
+.badge-pending {background:#FEF2F2;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -598,7 +645,6 @@ if page == "Cargar lote FULL":
             c2.metric("Unidades", int(df["unidades"].sum()))
             c3.metric("SKUs únicos", df["sku"].nunique())
 
-            st.info("Vista previa eliminada. Se cargan las columnas internas sin mostrarlas para evitar confusión visual.")
             nombre = st.text_input("Nombre del lote", value=f"FULL {datetime.now().strftime('%d-%m-%Y %H:%M')}")
             if st.button("Crear lote", type="primary"):
                 create_lote(nombre, full_file.name, df)
@@ -734,39 +780,94 @@ elif page == "Control":
             elif filtro == "Supermercado":
                 show = view[view["identificacion"].map(is_supermercado)]
 
-            # Vista limpia para producción.
-            # No mostramos columnas técnicas crudas juntas porque en PDA/operación confunden:
-            # - codigo_universal queda disponible en exportación, no en la vista principal.
-            # - vence se normaliza como Vencimiento para no parecer mezclado con Etiquetado.
+            lote_info = get_lote_info(active_lote) or {}
+            scans = get_last_scans(active_lote)
             show_clean = show.copy()
+            if not scans.empty:
+                show_clean = show_clean.merge(scans, left_on="id", right_on="item_id", how="left")
+            else:
+                show_clean["procesado_at"] = ""
+                show_clean["escaneado_total"] = 0
+
+            cargado_el = fmt_dt(lote_info.get("created_at", ""))
+            archivo = clean_text(lote_info.get("archivo", ""))
+            nombre_lote = clean_text(lote_info.get("nombre", ""))
+            ultima_accion = fmt_dt(show_clean["updated_at"].dropna().max()) if "updated_at" in show_clean.columns and not show_clean.empty else ""
+
+            st.markdown("### Información del lote")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Lote", nombre_lote or active_lote)
+            m2.metric("Cargado", cargado_el or "-")
+            m3.metric("Último movimiento", ultima_accion or "-")
+            if archivo:
+                st.caption(f"Archivo cargado: {archivo}")
+
             show_clean["Producto"] = show_clean["descripcion"].map(clean_text)
             show_clean["SKU"] = show_clean["sku"].map(norm_code)
             show_clean["Código ML"] = show_clean["codigo_ml"].map(norm_code)
+            show_clean["EAN / Código universal"] = show_clean["codigo_universal"].map(norm_code)
             show_clean["Unidades"] = show_clean["unidades"].astype(int)
             show_clean["Acopiadas"] = show_clean["acopiadas"].astype(int)
             show_clean["Pendiente"] = show_clean["pendiente"].astype(int)
             show_clean["Etiquetado"] = show_clean["identificacion"].map(clean_text)
             show_clean["Vencimiento"] = show_clean["vence"].map(clean_text)
+            show_clean["Procesado"] = show_clean["procesado_at"].map(fmt_dt)
             show_clean["Estado"] = show_clean["estado"].map(clean_text)
 
-            display_cols = ["SKU", "Código ML", "Producto", "Unidades", "Acopiadas", "Pendiente", "Etiquetado", "Vencimiento", "Estado"]
-            st.dataframe(
-                show_clean[display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "SKU": st.column_config.TextColumn("SKU", width="small"),
-                    "Código ML": st.column_config.TextColumn("Código ML", width="small"),
-                    "Producto": st.column_config.TextColumn("Producto", width="large"),
-                    "Unidades": st.column_config.NumberColumn("Unidades", width="small"),
-                    "Acopiadas": st.column_config.NumberColumn("Acopiadas", width="small"),
-                    "Pendiente": st.column_config.NumberColumn("Pendiente", width="small"),
-                    "Etiquetado": st.column_config.TextColumn("Etiquetado", width="medium"),
-                    "Vencimiento": st.column_config.TextColumn("Vencimiento", width="small"),
-                    "Estado": st.column_config.TextColumn("Estado", width="small"),
-                },
-            )
-            st.caption("La vista principal está simplificada. El Excel exportado mantiene todos los códigos y columnas internas.")
+            modo_vista = st.radio("Vista", ["Tarjetas operativas", "Tabla"], horizontal=True)
+
+            if modo_vista == "Tarjetas operativas":
+                for _, r in show_clean.iterrows():
+                    sku = clean_text(r.get("SKU", ""))
+                    cod_ml = clean_text(r.get("Código ML", ""))
+                    producto = clean_text(r.get("Producto", ""))
+                    unidades = int(r.get("Unidades", 0))
+                    acopiadas = int(r.get("Acopiadas", 0))
+                    pendiente = int(r.get("Pendiente", 0))
+                    etiquetado = clean_text(r.get("Etiquetado", "")) or "Sin indicación"
+                    vencimiento = clean_text(r.get("Vencimiento", "")) or "Sin vencimiento"
+                    procesado = clean_text(r.get("Procesado", "")) or "Sin procesar"
+                    estado = clean_text(r.get("Estado", ""))
+                    badge_estado = "badge-ok" if estado == "COMPLETO" else "badge-pending"
+                    badge_etiqueta = "badge-alert" if etiquetado.upper() in {"ETIQUETADO OBLIGATORIO", "SUPERMERCADO"} or "SUPERMERCADO" in etiquetado.upper() else ""
+                    st.markdown(
+                        f"""
+                        <div class="control-card">
+                            <div class="control-title">{esc(producto)}</div>
+                            <div class="control-meta"><b>SKU:</b> {esc(sku)} &nbsp; | &nbsp; <b>Código ML:</b> {esc(cod_ml or '-')}</div>
+                            <span class="badge">Unidades: {unidades}</span>
+                            <span class="badge">Acopiadas: {acopiadas}</span>
+                            <span class="badge">Pendiente: {pendiente}</span>
+                            <span class="badge {badge_etiqueta}">Etiquetado: {esc(etiquetado)}</span>
+                            <span class="badge badge-alert">Vencimiento: {esc(vencimiento)}</span>
+                            <span class="badge">Procesado: {esc(procesado)}</span>
+                            <span class="badge {badge_estado}">Estado: {esc(estado)}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+            else:
+                display_cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Etiquetado", "Vencimiento", "Procesado", "Estado"]
+                st.dataframe(
+                    show_clean[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=620,
+                    column_config={
+                        "SKU": st.column_config.TextColumn("SKU", width="medium"),
+                        "Código ML": st.column_config.TextColumn("Código ML", width="medium"),
+                        "EAN / Código universal": st.column_config.TextColumn("EAN / Código universal", width="medium"),
+                        "Producto": st.column_config.TextColumn("Producto", width="large"),
+                        "Unidades": st.column_config.NumberColumn("Unidades", width="small"),
+                        "Acopiadas": st.column_config.NumberColumn("Acopiadas", width="small"),
+                        "Pendiente": st.column_config.NumberColumn("Pendiente", width="small"),
+                        "Etiquetado": st.column_config.TextColumn("Etiquetado", width="large"),
+                        "Vencimiento": st.column_config.TextColumn("Vencimiento", width="medium"),
+                        "Procesado": st.column_config.TextColumn("Procesado", width="medium"),
+                        "Estado": st.column_config.TextColumn("Estado", width="medium"),
+                    },
+                )
+
             st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             st.divider()
