@@ -151,11 +151,6 @@ def ensure_column(conn, table: str, column: str, definition: str):
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-def ensure_column(conn, table: str, column: str, definition: str):
-    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
 
 def init_db():
     with db() as c:
@@ -739,9 +734,39 @@ elif page == "Control":
             elif filtro == "Supermercado":
                 show = view[view["identificacion"].map(is_supermercado)]
 
-            cols = ["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "acopiadas", "pendiente", "identificacion", "vence", "estado"]
-            available_cols = [c for c in cols if c in show.columns]
-            st.dataframe(show[available_cols], use_container_width=True, hide_index=True)
+            # Vista limpia para producción.
+            # No mostramos columnas técnicas crudas juntas porque en PDA/operación confunden:
+            # - codigo_universal queda disponible en exportación, no en la vista principal.
+            # - vence se normaliza como Vencimiento para no parecer mezclado con Etiquetado.
+            show_clean = show.copy()
+            show_clean["Producto"] = show_clean["descripcion"].map(clean_text)
+            show_clean["SKU"] = show_clean["sku"].map(norm_code)
+            show_clean["Código ML"] = show_clean["codigo_ml"].map(norm_code)
+            show_clean["Unidades"] = show_clean["unidades"].astype(int)
+            show_clean["Acopiadas"] = show_clean["acopiadas"].astype(int)
+            show_clean["Pendiente"] = show_clean["pendiente"].astype(int)
+            show_clean["Etiquetado"] = show_clean["identificacion"].map(clean_text)
+            show_clean["Vencimiento"] = show_clean["vence"].map(clean_text)
+            show_clean["Estado"] = show_clean["estado"].map(clean_text)
+
+            display_cols = ["SKU", "Código ML", "Producto", "Unidades", "Acopiadas", "Pendiente", "Etiquetado", "Vencimiento", "Estado"]
+            st.dataframe(
+                show_clean[display_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "SKU": st.column_config.TextColumn("SKU", width="small"),
+                    "Código ML": st.column_config.TextColumn("Código ML", width="small"),
+                    "Producto": st.column_config.TextColumn("Producto", width="large"),
+                    "Unidades": st.column_config.NumberColumn("Unidades", width="small"),
+                    "Acopiadas": st.column_config.NumberColumn("Acopiadas", width="small"),
+                    "Pendiente": st.column_config.NumberColumn("Pendiente", width="small"),
+                    "Etiquetado": st.column_config.TextColumn("Etiquetado", width="medium"),
+                    "Vencimiento": st.column_config.TextColumn("Vencimiento", width="small"),
+                    "Estado": st.column_config.TextColumn("Estado", width="small"),
+                },
+            )
+            st.caption("La vista principal está simplificada. El Excel exportado mantiene todos los códigos y columnas internas.")
             st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             st.divider()
