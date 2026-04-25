@@ -532,9 +532,8 @@ load_maestro_from_repo()
 
 st.markdown("""
 <style>
-div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label {font-size:1.25rem!important;font-weight:800!important;}
-div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input {font-size:1.55rem!important;min-height:3.3rem!important;}
-.stButton > button {font-size:1.2rem!important;min-height:3.1rem!important;width:100%;font-weight:800!important;}
+/* Estilo general: control y carga mantienen tamaño normal para no desproporcionar la UI */
+.stButton > button {font-weight:800!important;}
 div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 .product-title {font-size:1.3rem;font-weight:850;line-height:1.25;margin:8px 0;}
 .control-card {border:1px solid #E5E7EB;border-radius:16px;padding:15px 17px;margin:12px 0;background:#FFF;}
@@ -588,6 +587,14 @@ if page == "Cargar lote FULL":
             st.error(f"No pude leer la hoja seleccionada: {e}")
 
 elif page == "Escaneo":
+    st.markdown("""
+    <style>
+    /* Escaneo PDA: letras grandes solo en este módulo */
+    div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label {font-size:1.35rem!important;font-weight:850!important;}
+    div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input {font-size:1.75rem!important;min-height:3.6rem!important;}
+    .stButton > button {font-size:1.28rem!important;min-height:3.25rem!important;width:100%;font-weight:850!important;}
+    </style>
+    """, unsafe_allow_html=True)
     if not active_lote:
         st.warning("Primero crea un lote FULL.")
     else:
@@ -732,9 +739,14 @@ elif page == "Control":
             st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
 
             filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"])
+
+            if "control_search_pending" in st.session_state:
+                st.session_state["control_search"] = st.session_state.pop("control_search_pending")
+
             busqueda = st.text_input(
                 "Buscar tarjeta",
                 placeholder="Nombre, MLC/Código ML, código universal, SKU o supermercado",
+                key="control_search",
             )
 
             show = view
@@ -746,6 +758,28 @@ elif page == "Control":
                 show = view[view["identificacion"].map(is_supermercado)]
 
             query = clean_text(busqueda).upper()
+
+            if query:
+                suggestion_source = show.copy()
+                suggestion_source["_search_text"] = (
+                    suggestion_source["descripcion"].map(clean_text) + " " +
+                    suggestion_source["codigo_ml"].map(clean_text) + " " +
+                    suggestion_source["codigo_universal"].map(clean_text) + " " +
+                    suggestion_source["sku"].map(clean_text) + " " +
+                    suggestion_source["identificacion"].map(clean_text)
+                ).str.upper()
+                terms_sug = [t for t in query.split() if t]
+                sug = suggestion_source[suggestion_source["_search_text"].apply(lambda txt: all(t in txt for t in terms_sug))].head(6)
+                if not sug.empty:
+                    st.caption("Sugerencias")
+                    cols_sug = st.columns(2)
+                    for idx, (_, sr) in enumerate(sug.iterrows()):
+                        label = clean_text(sr.get("descripcion", ""))[:70]
+                        cod = clean_text(sr.get("codigo_ml", "")) or clean_text(sr.get("sku", ""))
+                        if cols_sug[idx % 2].button(f"{label} · {cod}", key=f"sug_{int(sr['id'])}_{idx}"):
+                            st.session_state["control_search_pending"] = clean_text(sr.get("descripcion", ""))
+                            st.rerun()
+
             if query:
                 searchable = (
                     show["descripcion"].map(clean_text) + " " +
