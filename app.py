@@ -732,6 +732,11 @@ elif page == "Control":
             st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
 
             filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"])
+            busqueda = st.text_input(
+                "Buscar tarjeta",
+                placeholder="Nombre, MLC/Código ML, código universal, SKU o supermercado",
+            )
+
             show = view
             if filtro == "Pendientes":
                 show = view[view["pendiente"] > 0]
@@ -740,29 +745,49 @@ elif page == "Control":
             elif filtro == "Supermercado":
                 show = view[view["identificacion"].map(is_supermercado)]
 
+            query = clean_text(busqueda).upper()
+            if query:
+                searchable = (
+                    show["descripcion"].map(clean_text) + " " +
+                    show["codigo_ml"].map(clean_text) + " " +
+                    show["codigo_universal"].map(clean_text) + " " +
+                    show["sku"].map(clean_text) + " " +
+                    show["identificacion"].map(clean_text) + " " +
+                    show["vence"].map(clean_text)
+                ).str.upper()
+                terms = [t for t in query.split() if t]
+                mask = searchable.apply(lambda txt: all(t in txt for t in terms))
+                show = show[mask]
+
+            st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
+
             modo_vista = st.radio("Vista", ["Tarjetas operativas", "Tabla"], horizontal=True)
             if modo_vista == "Tarjetas operativas":
                 for _, r in show.iterrows():
                     ident = clean_text(r.get("identificacion", ""))
                     vence = clean_text(r.get("vence", ""))
                     proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
-                    badges = f"""
-                        <span class='badge'>Unidades: {int(r['unidades'])}</span>
-                        <span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>
-                        <span class='badge'>Pendiente: {int(r['pendiente'])}</span>
-                    """
+                    badges_parts = [
+                        f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
+                        f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
+                        f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
+                    ]
                     if ident:
-                        badges += f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>"
+                        badges_parts.append(f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>")
                     if vence:
-                        badges += f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>"
-                    badges += f"<span class='badge'>Procesado: {esc(proc)}</span>"
-                    st.markdown(f"""
+                        badges_parts.append(f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>")
+                    badges_parts.append(f"<span class='badge'>Procesado: {esc(proc)}</span>")
+                    badges = "".join(badges_parts)
+                    st.markdown(
+                        f"""
                         <div class='control-card'>
                             <div class='control-title'>{esc(r['descripcion'])}</div>
                             <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
-                            {badges}
+                            <div>{badges}</div>
                         </div>
-                    """, unsafe_allow_html=True)
+                        """,
+                        unsafe_allow_html=True,
+                    )
             else:
                 out = show.copy()
                 out["Procesado"] = out["procesado_at"].map(fmt_dt)
