@@ -1,7 +1,11 @@
 import io
 import re
 import html
+import json
+import os
 import sqlite3
+import threading
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -12,6 +16,7 @@ APP_TITLE = "Control FULL Aurora"
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "aurora_full_v3.db"
 MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
+DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
@@ -185,7 +190,133 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS backup_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )
+        """)
         c.commit()
+
+
+# ============================================================
+# Respaldo externo Google Sheets por webhook
+# ============================================================
+
+def get_backup_webhook_url() -> str:
+    """URL de respaldo externo.
+    Prioridad: Streamlit Secrets, variable de entorno y URL integrada en este app.py.
+    """
+    try:
+        url = st.secrets.get("SHEETS_WEBHOOK_URL", "")
+    except Exception:
+        url = ""
+    if not url:
+        url = os.environ.get("SHEETS_WEBHOOK_URL", "")
+    if not url:
+        url = DEFAULT_SHEETS_WEBHOOK_URL
+    return clean_text(url)
+
+
+def enqueue_backup_event(event_type: str, payload: dict):
+    """Guarda el evento en cola local y dispara envío en segundo plano.
+    La operación principal nunca queda bloqueada por Google Sheets.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    safe_payload = json.dumps(payload, ensure_ascii=False, default=str)
+    with db() as c:
+        c.execute(
+            "INSERT INTO backup_queue (event_type, payload_json, status, attempts, created_at) VALUES (?, ?, 'pending', 0, ?)",
+            (event_type, safe_payload, now),
+        )
+        c.commit()
+
+    webhook_url = get_backup_webhook_url()
+    if webhook_url:
+        threading.Thread(target=flush_backup_queue, args=(webhook_url,), daemon=True).start()
+
+
+def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
+    url = clean_text(webhook_url or get_backup_webhook_url())
+    if not url:
+        return
+
+    with db() as c:
+        rows = c.execute(
+            """
+            SELECT id, event_type, payload_json, attempts, created_at
+            FROM backup_queue
+            WHERE status='pending'
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    for row in rows:
+        event = {
+            "event_type": row["event_type"],
+            "queue_id": int(row["id"]),
+            "queued_at": row["created_at"],
+            **json.loads(row["payload_json"]),
+        }
+        try:
+            body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resp.read()
+
+            sent_at = datetime.now().isoformat(timespec="seconds")
+            with db() as c:
+                c.execute(
+                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
+                    (sent_at, int(row["id"])),
+                )
+                c.commit()
+
+        except Exception as e:
+            with db() as c:
+                c.execute(
+                    "UPDATE backup_queue SET attempts=attempts+1, last_error=? WHERE id=?",
+                    (str(e)[:500], int(row["id"])),
+                )
+                c.commit()
+
+
+def backup_status():
+    with db() as c:
+        row = c.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                MAX(sent_at) AS last_sent
+            FROM backup_queue
+            """
+        ).fetchone()
+    return dict(row) if row else {"pending": 0, "sent": 0, "last_sent": ""}
+
+
+def build_lote_payload(lote_id: int) -> dict:
+    lote = get_lote(lote_id)
+    return {
+        "lote_id": lote_id,
+        "lote_nombre": clean_text(lote.get("nombre", "")),
+        "archivo": clean_text(lote.get("archivo", "")),
+        "hoja": clean_text(lote.get("hoja", "")),
+    }
+
 
 
 def list_lotes():
@@ -261,15 +392,30 @@ def create_lote(nombre, archivo, hoja, df):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         c.commit()
+
+    enqueue_backup_event("lote_creado", {
+        **build_lote_payload(lote_id),
+        "created_at": now,
+        "total_lineas": int(len(df)),
+        "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
+    })
     return lote_id
 
 
 def delete_lote(lote_id):
+    lote_payload = build_lote_payload(lote_id)
+    items_count = len(get_items(lote_id))
     with db() as c:
         c.execute("DELETE FROM scans WHERE lote_id=?", (lote_id,))
         c.execute("DELETE FROM items WHERE lote_id=?", (lote_id,))
         c.execute("DELETE FROM lotes WHERE id=?", (lote_id,))
         c.commit()
+
+    enqueue_backup_event("lote_eliminado", {
+        **lote_payload,
+        "items_eliminados": int(items_count),
+        "deleted_at": datetime.now().isoformat(timespec="seconds"),
+    })
 
 
 def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
@@ -291,6 +437,20 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now))
         c.commit()
+
+    enqueue_backup_event("scan_agregado", {
+        **build_lote_payload(lote_id),
+        "item_id": int(item_id),
+        "sku": clean_text(item["sku"]),
+        "codigo_ml": clean_text(item["codigo_ml"]),
+        "codigo_universal": clean_text(item["codigo_universal"]),
+        "descripcion": clean_text(item["descripcion"]),
+        "cantidad": int(cantidad),
+        "modo": clean_text(modo),
+        "scan_primario": norm_code(scan_primario),
+        "scan_secundario": norm_code(scan_secundario),
+        "created_at": now,
+    })
     return True, "Cantidad agregada."
 
 
@@ -300,9 +460,25 @@ def undo_last_scan(lote_id):
         if not row:
             return False, "No hay escaneos para deshacer."
         now = datetime.now().isoformat(timespec="seconds")
+        item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(row["item_id"]), lote_id)).fetchone()
         c.execute("UPDATE items SET acopiadas=MAX(acopiadas-?,0), updated_at=? WHERE id=?", (int(row["cantidad"]), now, int(row["item_id"])))
         c.execute("DELETE FROM scans WHERE id=?", (int(row["id"]),))
         c.commit()
+
+    item_payload = dict(item) if item else {}
+    enqueue_backup_event("scan_deshacer", {
+        **build_lote_payload(lote_id),
+        "item_id": int(row["item_id"]),
+        "sku": clean_text(item_payload.get("sku", "")),
+        "codigo_ml": clean_text(item_payload.get("codigo_ml", "")),
+        "codigo_universal": clean_text(item_payload.get("codigo_universal", "")),
+        "descripcion": clean_text(item_payload.get("descripcion", "")),
+        "cantidad": int(row["cantidad"]),
+        "modo": clean_text(row["modo"]),
+        "scan_primario": norm_code(row["scan_primario"]),
+        "scan_secundario": norm_code(row["scan_secundario"]),
+        "created_at": now,
+    })
     return True, "Último escaneo deshecho."
 
 
@@ -555,6 +731,19 @@ with st.sidebar:
     else:
         options = {f"{r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}": int(r.id) for r in lotes.itertuples(index=False)}
         active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
+
+    st.divider()
+    bs = backup_status()
+    pending_backup = int(bs.get("pending") or 0)
+    if pending_backup:
+        st.warning(f"Respaldo externo: {pending_backup} eventos pendientes")
+        if st.button("Reintentar respaldo"):
+            flush_backup_queue(limit=100)
+            st.rerun()
+    else:
+        st.success("Respaldo externo activo")
+    if bs.get("last_sent"):
+        st.caption(f"Último respaldo: {fmt_dt(bs.get('last_sent'))}")
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
