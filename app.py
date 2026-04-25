@@ -479,13 +479,20 @@ def best_match(df):
 
 
 def reset_scan_state():
-    for k in ["scan_primary", "scan_secondary", "primary_validated", "primary_code", "candidate_id", "candidate_mode"]:
-        if k in ["primary_validated"]:
-            st.session_state[k] = False
-        elif k == "candidate_id":
-            st.session_state[k] = None
-        else:
-            st.session_state[k] = ""
+    """Limpia el flujo de escaneo sin modificar directamente widgets ya creados."""
+    st.session_state["primary_validated"] = False
+    st.session_state["primary_code"] = ""
+    st.session_state["candidate_id"] = None
+    st.session_state["candidate_mode"] = ""
+    st.session_state["_clear_scan_inputs_next_run"] = True
+
+
+def clear_scan_inputs_if_needed():
+    """Se ejecuta antes de crear los text_input de escaneo."""
+    if st.session_state.get("_clear_scan_inputs_next_run", False):
+        st.session_state["scan_primary"] = ""
+        st.session_state["scan_secondary"] = ""
+        st.session_state["_clear_scan_inputs_next_run"] = False
 
 
 def get_item_row(items, item_id):
@@ -594,9 +601,11 @@ elif page == "Escaneo":
         c.metric("Pendiente", max(total - done, 0))
         st.divider()
 
-        for k, v in {"primary_validated": False, "primary_code": "", "candidate_id": None, "candidate_mode": ""}.items():
+        for k, v in {"primary_validated": False, "primary_code": "", "candidate_id": None, "candidate_mode": "", "_clear_scan_inputs_next_run": False}.items():
             if k not in st.session_state:
                 st.session_state[k] = v
+
+        clear_scan_inputs_if_needed()
 
         st.text_input("Código ML o EAN supermercado", key="scan_primary")
         cv, cl = st.columns([2, 1])
@@ -617,9 +626,6 @@ elif page == "Escaneo":
             if not code:
                 st.error("Escanea o ingresa un código.")
             else:
-                # Regla operativa:
-                # - SUPERMERCADO se confirma únicamente por SKU/EAN/Código Universal en este primer campo.
-                # - Los productos normales se validan por Código ML y luego por SKU/EAN.
                 sm = match_secondary(items, code, only_super=True)
                 if not sm.empty:
                     cand = best_match(sm)
@@ -628,15 +634,10 @@ elif page == "Escaneo":
                     st.session_state["primary_validated"] = True
                 else:
                     m1 = match_ml(items, code)
-                    if not m1.empty:
-                        # Si el Código ML pertenece solo a productos SUPERMERCADO pendientes, no se acepta.
-                        m1_no_super = m1[~m1["identificacion"].map(is_supermercado)]
-                        if m1_no_super.empty:
-                            st.error("Producto SUPERMERCADO: debes validar con SKU/EAN/Código Universal, no con Código ML.")
-                        else:
-                            st.session_state["primary_validated"] = True
-                    else:
+                    if m1.empty:
                         st.error("Código no encontrado en productos pendientes.")
+                    else:
+                        st.session_state["primary_validated"] = True
 
         candidate = None
         modo = st.session_state.get("candidate_mode", "")
@@ -745,24 +746,23 @@ elif page == "Control":
                     ident = clean_text(r.get("identificacion", ""))
                     vence = clean_text(r.get("vence", ""))
                     proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
-                    badges = (
-                        f"<span class='badge'>Unidades: {int(r['unidades'])}</span>"
-                        f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>"
-                        f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>"
-                    )
+                    badges = f"""
+                        <span class='badge'>Unidades: {int(r['unidades'])}</span>
+                        <span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>
+                        <span class='badge'>Pendiente: {int(r['pendiente'])}</span>
+                    """
                     if ident:
                         badges += f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>"
                     if vence:
                         badges += f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>"
                     badges += f"<span class='badge'>Procesado: {esc(proc)}</span>"
-                    card_html = (
-                        "<div class='control-card'>"
-                        f"<div class='control-title'>{esc(r['descripcion'])}</div>"
-                        f"<div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>"
-                        f"{badges}"
-                        "</div>"
-                    )
-                    st.markdown(card_html, unsafe_allow_html=True)
+                    st.markdown(f"""
+                        <div class='control-card'>
+                            <div class='control-title'>{esc(r['descripcion'])}</div>
+                            <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
+                            {badges}
+                        </div>
+                    """, unsafe_allow_html=True)
             else:
                 out = show.copy()
                 out["Procesado"] = out["procesado_at"].map(fmt_dt)
