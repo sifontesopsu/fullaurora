@@ -367,6 +367,31 @@ def restore_from_backup_if_empty():
                 "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
                 "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
             }
+        elif et == "lote_snapshot_chunk":
+            items = ev.get("items") or []
+            for item_ev in items:
+                try:
+                    item_id = int(item_ev.get("item_id"))
+                except Exception:
+                    continue
+                items_by_lote.setdefault(lote_id, {})[item_id] = {
+                    "id": item_id,
+                    "lote_id": lote_id,
+                    "area": clean_text(item_ev.get("area", "")),
+                    "nro": clean_text(item_ev.get("nro", "")),
+                    "codigo_ml": norm_code(item_ev.get("codigo_ml", "")),
+                    "codigo_universal": norm_code(item_ev.get("codigo_universal", "")),
+                    "sku": norm_code(item_ev.get("sku", "")),
+                    "descripcion": clean_text(item_ev.get("descripcion", "")),
+                    "unidades": to_int(item_ev.get("unidades", 0)),
+                    "acopiadas": 0,
+                    "identificacion": clean_text(item_ev.get("identificacion", "")),
+                    "vence": clean_text(item_ev.get("vence", "")),
+                    "dia": clean_text(item_ev.get("dia", "")),
+                    "hora": clean_text(item_ev.get("hora", "")),
+                    "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                    "updated_at": clean_text(item_ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                }
         elif et == "scan_agregado":
             try:
                 item_id = int(ev.get("item_id"))
@@ -588,17 +613,11 @@ def create_lote(nombre, archivo, hoja, df):
         c.commit()
 
     lote_payload = build_lote_payload(lote_id)
-    events = [("lote_creado", {
-        **lote_payload,
-        "created_at": now,
-        "total_lineas": int(len(df)),
-        "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
-    })]
-
     inserted = get_items(lote_id)
+
+    snapshot_items = []
     for r in inserted.itertuples(index=False):
-        events.append(("lote_item", {
-            **lote_payload,
+        snapshot_items.append({
             "item_id": int(r.id),
             "area": clean_text(r.area),
             "nro": clean_text(r.nro),
@@ -613,9 +632,31 @@ def create_lote(nombre, archivo, hoja, df):
             "hora": clean_text(r.hora),
             "item_created_at": clean_text(r.created_at),
             "item_updated_at": clean_text(r.updated_at),
+        })
+
+    events = [("lote_creado", {
+        **lote_payload,
+        "created_at": now,
+        "total_lineas": int(len(df)),
+        "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
+        "snapshot_mode": "chunks",
+    })]
+
+    CHUNK_SIZE = 25
+    total_chunks = (len(snapshot_items) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    for idx in range(total_chunks):
+        chunk = snapshot_items[idx * CHUNK_SIZE:(idx + 1) * CHUNK_SIZE]
+        events.append(("lote_snapshot_chunk", {
+            **lote_payload,
             "created_at": now,
+            "chunk_index": idx + 1,
+            "total_chunks": total_chunks,
+            "items_count": len(chunk),
+            "items": chunk,
         }))
+
     enqueue_backup_events_batch(events)
+    flush_backup_queue(limit=max(1000, len(events) + 10))
     return lote_id
 
 def delete_lote(lote_id):
@@ -969,6 +1010,23 @@ with st.sidebar:
         st.success(f"Respaldo externo activo · enviados: {sent_backup}")
     if bs.get("last_sent"):
         st.caption(f"Último respaldo: {fmt_dt(bs.get('last_sent'))}")
+    if st.session_state.get("_auto_restore_msg"):
+        if st.session_state.get("_auto_restore_ok"):
+            st.success(st.session_state.get("_auto_restore_msg"))
+        else:
+            st.caption(f"Restauración: {st.session_state.get('_auto_restore_msg')}")
+    if st.button("Restaurar desde Sheets"):
+        if local_lotes_count() > 0:
+            st.warning("Ya hay lotes en la base local.")
+        else:
+            ok_restore, msg_restore = restore_from_backup_if_empty()
+            st.session_state["_auto_restore_ok"] = ok_restore
+            st.session_state["_auto_restore_msg"] = msg_restore
+            if ok_restore:
+                st.success(msg_restore)
+                st.rerun()
+            else:
+                st.error(msg_restore)
     if st.button("Probar respaldo Sheets"):
         ok_test, detail_test = test_backup_webhook()
         if ok_test:
