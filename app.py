@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -242,6 +243,178 @@ def enqueue_backup_event(event_type: str, payload: dict):
         threading.Thread(target=flush_backup_queue, args=(webhook_url,), daemon=True).start()
 
 
+def send_webhook_event(url: str, event: dict) -> tuple[bool, str]:
+    """Envía un evento a Apps Script y valida que la respuesta sea JSON con ok=true.
+    Esto evita marcar como enviado cuando Google responde una página HTML de error/autorización.
+    """
+    body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        status = getattr(resp, "status", None) or resp.getcode()
+        response_text = resp.read().decode("utf-8", errors="replace")
+
+    if status < 200 or status >= 300:
+        return False, f"HTTP {status}: {response_text[:300]}"
+
+    try:
+        parsed = json.loads(response_text)
+    except Exception:
+        return False, f"Respuesta no JSON desde Apps Script: {response_text[:300]}"
+
+    if parsed.get("ok") is True:
+        return True, response_text[:300]
+
+    return False, f"Apps Script respondió ok=false: {response_text[:500]}"
+
+
+
+
+def enqueue_backup_events_batch(events):
+    """Inserta muchos eventos en la cola local y dispara un solo envío."""
+    if not events:
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    rows = [(et, json.dumps(payload, ensure_ascii=False, default=str), now) for et, payload in events]
+    with db() as c:
+        c.executemany(
+            "INSERT INTO backup_queue (event_type, payload_json, status, attempts, created_at) VALUES (?, ?, 'pending', 0, ?)",
+            rows,
+        )
+        c.commit()
+    url = get_backup_webhook_url()
+    if url:
+        threading.Thread(target=flush_backup_queue, args=(url, 1000), daemon=True).start()
+
+
+def get_backup_events_from_sheets():
+    url = get_backup_webhook_url()
+    if not url:
+        return False, [], "No hay URL de respaldo configurada."
+    sep = "&" if "?" in url else "?"
+    read_url = f"{url}{sep}{urllib.parse.urlencode({'action': 'events'})}"
+    try:
+        with urllib.request.urlopen(read_url, timeout=20) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(text)
+        if data.get("ok") is not True:
+            return False, [], f"Apps Script respondió error: {text[:500]}"
+        return True, data.get("events") or [], f"Eventos leídos: {len(data.get('events') or [])}"
+    except Exception as e:
+        return False, [], f"No pude leer respaldo externo: {e}"
+
+
+def local_lotes_count():
+    with db() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM lotes").fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+def restore_from_backup_if_empty():
+    if local_lotes_count() > 0:
+        return False, "Base local con datos; no se restaura."
+    ok, events, msg = get_backup_events_from_sheets()
+    if not ok:
+        return False, msg
+    if not events:
+        return False, "No hay eventos en el respaldo externo."
+
+    lotes = {}
+    items_by_lote = {}
+    deleted_lotes = set()
+    movement_by_item = {}
+    scan_rows = []
+
+    for ev in events:
+        et = clean_text(ev.get("event_type", ""))
+        try:
+            lote_id = int(ev.get("lote_id"))
+        except Exception:
+            continue
+
+        if et == "lote_creado":
+            lotes[lote_id] = {
+                "id": lote_id,
+                "nombre": clean_text(ev.get("lote_nombre", "")) or f"Lote {lote_id}",
+                "archivo": clean_text(ev.get("archivo", "")),
+                "hoja": clean_text(ev.get("hoja", "")),
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+            }
+        elif et == "lote_item":
+            try:
+                item_id = int(ev.get("item_id"))
+            except Exception:
+                continue
+            items_by_lote.setdefault(lote_id, {})[item_id] = {
+                "id": item_id,
+                "lote_id": lote_id,
+                "area": clean_text(ev.get("area", "")),
+                "nro": clean_text(ev.get("nro", "")),
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion", "")),
+                "unidades": to_int(ev.get("unidades", 0)),
+                "acopiadas": 0,
+                "identificacion": clean_text(ev.get("identificacion", "")),
+                "vence": clean_text(ev.get("vence", "")),
+                "dia": clean_text(ev.get("dia", "")),
+                "hora": clean_text(ev.get("hora", "")),
+                "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+            }
+        elif et == "scan_agregado":
+            try:
+                item_id = int(ev.get("item_id"))
+                qty = int(ev.get("cantidad") or 0)
+            except Exception:
+                continue
+            movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
+            scan_rows.append((lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")), qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds")))
+        elif et == "scan_deshacer":
+            try:
+                item_id = int(ev.get("item_id"))
+                qty = int(ev.get("cantidad") or 0)
+            except Exception:
+                continue
+            movement_by_item[item_id] = movement_by_item.get(item_id, 0) - qty
+        elif et == "lote_eliminado":
+            deleted_lotes.add(lote_id)
+
+    active_lote_ids = [lid for lid in lotes if lid not in deleted_lotes and items_by_lote.get(lid)]
+    if not active_lote_ids:
+        return False, "No encontré lotes activos con snapshot completo en Sheets. Crea el lote una vez con esta nueva versión para activar restauración automática."
+
+    now = datetime.now().isoformat(timespec="seconds")
+    restored_lotes = 0
+    restored_items = 0
+    with db() as c:
+        for lid in sorted(active_lote_ids):
+            lote = lotes[lid]
+            c.execute("INSERT OR REPLACE INTO lotes (id, nombre, archivo, hoja, created_at) VALUES (?, ?, ?, ?, ?)", (lote["id"], lote["nombre"], lote["archivo"], lote["hoja"], lote["created_at"]))
+            restored_lotes += 1
+            for item in items_by_lote[lid].values():
+                qty = max(0, min(int(item["unidades"]), int(movement_by_item.get(int(item["id"]), 0))))
+                item["acopiadas"] = qty
+                item["updated_at"] = now if qty else item["updated_at"]
+                c.execute("""
+                    INSERT OR REPLACE INTO items
+                    (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
+                     identificacion, vence, dia, hora, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item["dia"], item["hora"], item["created_at"], item["updated_at"]))
+                restored_items += 1
+        for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at in scan_rows:
+            if lote_id in active_lote_ids and cantidad > 0:
+                c.execute("INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at))
+        c.commit()
+    return True, f"Restauración automática completa: {restored_lotes} lote(s), {restored_items} producto(s)."
+
+
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
     url = clean_text(webhook_url or get_backup_webhook_url())
     if not url:
@@ -267,15 +440,9 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
             **json.loads(row["payload_json"]),
         }
         try:
-            body = json.dumps(event, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                resp.read()
+            ok, detail = send_webhook_event(url, event)
+            if not ok:
+                raise RuntimeError(detail)
 
             sent_at = datetime.now().isoformat(timespec="seconds")
             with db() as c:
@@ -301,11 +468,38 @@ def backup_status():
             SELECT
                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
-                MAX(sent_at) AS last_sent
+                MAX(sent_at) AS last_sent,
+                MAX(last_error) AS last_error
             FROM backup_queue
             """
         ).fetchone()
-    return dict(row) if row else {"pending": 0, "sent": 0, "last_sent": ""}
+    return dict(row) if row else {"pending": 0, "sent": 0, "last_sent": "", "last_error": ""}
+
+
+def test_backup_webhook() -> tuple[bool, str]:
+    url = get_backup_webhook_url()
+    if not url:
+        return False, "No hay SHEETS_WEBHOOK_URL configurada."
+    event = {
+        "event_type": "test_webhook",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "lote_id": "TEST",
+        "lote_nombre": "Prueba manual desde Streamlit",
+        "archivo": "test",
+        "hoja": "test",
+        "item_id": "",
+        "sku": "TEST-SKU",
+        "codigo_ml": "TEST-ML",
+        "codigo_universal": "TEST-EAN",
+        "descripcion": "Evento de prueba de respaldo externo",
+        "cantidad": 1,
+        "modo": "TEST",
+        "scan_primario": "TEST",
+        "scan_secundario": "TEST",
+        "operador": "",
+        "dispositivo": "",
+    }
+    return send_webhook_event(url, event)
 
 
 def build_lote_payload(lote_id: int) -> dict:
@@ -393,14 +587,36 @@ def create_lote(nombre, archivo, hoja, df):
         """, rows)
         c.commit()
 
-    enqueue_backup_event("lote_creado", {
-        **build_lote_payload(lote_id),
+    lote_payload = build_lote_payload(lote_id)
+    events = [("lote_creado", {
+        **lote_payload,
         "created_at": now,
         "total_lineas": int(len(df)),
         "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
-    })
-    return lote_id
+    })]
 
+    inserted = get_items(lote_id)
+    for r in inserted.itertuples(index=False):
+        events.append(("lote_item", {
+            **lote_payload,
+            "item_id": int(r.id),
+            "area": clean_text(r.area),
+            "nro": clean_text(r.nro),
+            "codigo_ml": norm_code(r.codigo_ml),
+            "codigo_universal": norm_code(r.codigo_universal),
+            "sku": norm_code(r.sku),
+            "descripcion": clean_text(r.descripcion),
+            "unidades": int(r.unidades),
+            "identificacion": clean_text(r.identificacion),
+            "vence": clean_text(r.vence),
+            "dia": clean_text(r.dia),
+            "hora": clean_text(r.hora),
+            "item_created_at": clean_text(r.created_at),
+            "item_updated_at": clean_text(r.updated_at),
+            "created_at": now,
+        }))
+    enqueue_backup_events_batch(events)
+    return lote_id
 
 def delete_lote(lote_id):
     lote_payload = build_lote_payload(lote_id)
@@ -706,6 +922,12 @@ def export_lote(lote_id):
 init_db()
 load_maestro_from_repo()
 
+if "_auto_restore_checked" not in st.session_state:
+    st.session_state["_auto_restore_checked"] = True
+    restored, restore_msg = restore_from_backup_if_empty()
+    st.session_state["_auto_restore_msg"] = restore_msg
+    st.session_state["_auto_restore_ok"] = restored
+
 st.markdown("""
 <style>
 /* Estilo general: control y carga mantienen tamaño normal para no desproporcionar la UI */
@@ -735,15 +957,24 @@ with st.sidebar:
     st.divider()
     bs = backup_status()
     pending_backup = int(bs.get("pending") or 0)
+    sent_backup = int(bs.get("sent") or 0)
     if pending_backup:
         st.warning(f"Respaldo externo: {pending_backup} eventos pendientes")
+        if bs.get("last_error"):
+            st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
         if st.button("Reintentar respaldo"):
             flush_backup_queue(limit=100)
             st.rerun()
     else:
-        st.success("Respaldo externo activo")
+        st.success(f"Respaldo externo activo · enviados: {sent_backup}")
     if bs.get("last_sent"):
         st.caption(f"Último respaldo: {fmt_dt(bs.get('last_sent'))}")
+    if st.button("Probar respaldo Sheets"):
+        ok_test, detail_test = test_backup_webhook()
+        if ok_test:
+            st.success("Prueba enviada a Google Sheets.")
+        else:
+            st.error(f"Falló prueba Sheets: {detail_test[:250]}")
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
