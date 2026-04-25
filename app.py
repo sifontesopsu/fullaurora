@@ -639,20 +639,16 @@ def create_lote(nombre, archivo, hoja, df):
         "created_at": now,
         "total_lineas": int(len(df)),
         "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
-        "snapshot_mode": "chunks",
+        "snapshot_mode": "lote_item",
     })]
 
-    CHUNK_SIZE = 25
-    total_chunks = (len(snapshot_items) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    for idx in range(total_chunks):
-        chunk = snapshot_items[idx * CHUNK_SIZE:(idx + 1) * CHUNK_SIZE]
-        events.append(("lote_snapshot_chunk", {
+    # Respaldo de snapshot producto a producto.
+    # Esto es más largo en Sheets, pero es mucho más seguro y fácil de auditar/restaurar.
+    for item in snapshot_items:
+        events.append(("lote_item", {
             **lote_payload,
             "created_at": now,
-            "chunk_index": idx + 1,
-            "total_chunks": total_chunks,
-            "items_count": len(chunk),
-            "items": chunk,
+            **item,
         }))
 
     enqueue_backup_events_batch(events)
@@ -921,11 +917,11 @@ def reset_scan_state():
 
 
 def clear_scan_inputs_if_needed():
-    """Se ejecuta antes de crear los text_input de escaneo."""
+    """Se ejecuta antes de crear los inputs de escaneo/cantidad."""
     if st.session_state.get("_clear_scan_inputs_next_run", False):
         st.session_state["scan_primary"] = ""
         st.session_state["scan_secondary"] = ""
-        st.session_state["scan_qty"] = ""
+        st.session_state["scan_qty_input"] = ""
         st.session_state["_clear_scan_inputs_next_run"] = False
 
 
@@ -1127,6 +1123,7 @@ elif page == "Escaneo":
             st.session_state["candidate_mode"] = ""
             st.session_state["primary_validated"] = False
             st.session_state["primary_code"] = norm_code(st.session_state.get("scan_primary", ""))
+            st.session_state["scan_secondary"] = ""
             code = st.session_state["primary_code"]
             if not code:
                 st.error("Escanea o ingresa un código.")
@@ -1148,6 +1145,8 @@ elif page == "Escaneo":
 
         candidate = None
         modo = st.session_state.get("candidate_mode", "")
+        candidate_from_preview_this_run = False
+
         if st.session_state.get("candidate_id"):
             candidate = get_item_row(items, st.session_state["candidate_id"])
         elif st.session_state.get("primary_validated") and st.session_state.get("primary_code"):
@@ -1155,18 +1154,19 @@ elif page == "Escaneo":
             m1 = m1[~m1["identificacion"].map(is_supermercado)]
             preview = best_match(m1)
             if preview is not None:
-                pendiente = int(preview["unidades"]) - int(preview["acopiadas"])
+                pendiente_preview = int(preview["unidades"]) - int(preview["acopiadas"])
                 st.markdown(f"<div class='product-title'>{esc(preview['descripcion'])}</div>", unsafe_allow_html=True)
                 q1, q2, q3 = st.columns(3)
                 q1.metric("Solicitadas", int(preview["unidades"]))
                 q2.metric("Acopiadas", int(preview["acopiadas"]))
-                q3.metric("Pendientes", max(pendiente, 0))
+                q3.metric("Pendientes", max(pendiente_preview, 0))
                 st.text_input("SKU / EAN / Código Universal", key="scan_secondary")
                 b1, b2 = st.columns(2)
                 with b1:
                     validar_sec = st.button("Validar SKU/EAN", type="primary")
                 with b2:
                     sin_ean = st.button("Sin EAN")
+
                 if sin_ean:
                     m_no_super = m1[~m1["identificacion"].map(is_supermercado)]
                     if m_no_super.empty:
@@ -1177,7 +1177,9 @@ elif page == "Escaneo":
                         st.session_state["candidate_mode"] = "SIN_EAN"
                         candidate = cand
                         modo = "SIN_EAN"
-                if validar_sec:
+                        candidate_from_preview_this_run = True
+
+                if validar_sec and candidate is None:
                     sec = st.session_state.get("scan_secondary", "")
                     if not norm_code(sec):
                         st.error("Escanea o ingresa el SKU/EAN.")
@@ -1191,28 +1193,43 @@ elif page == "Escaneo":
                             st.session_state["candidate_mode"] = "ML+SECUNDARIO"
                             candidate = cand
                             modo = "ML+SECUNDARIO"
+                            candidate_from_preview_this_run = True
 
         if candidate is not None:
             pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
             st.success("Producto validado")
-            st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
-            x1, x2, x3, x4 = st.columns(4)
-            x1.metric("SKU", candidate["sku"])
-            x2.metric("Solicitadas", int(candidate["unidades"]))
-            x3.metric("Acopiadas", int(candidate["acopiadas"]))
-            x4.metric("Pendientes", max(pendiente, 0))
-            st.text_input("Cantidad a agregar", key="scan_qty", placeholder="Ingresa cantidad")
-            if st.button("Agregar cantidad", type="primary"):
-                qty_raw = clean_text(st.session_state.get("scan_qty", ""))
-                if not qty_raw:
-                    st.error("Ingresa la cantidad antes de agregar.")
-                elif not re.fullmatch(r"\d+", qty_raw):
-                    st.error("La cantidad debe ser un número entero.")
+
+            # Si el producto se acaba de validar en esta misma corrida, ya mostramos arriba
+            # nombre y cantidades. No los duplicamos para evitar parpadeos y confusión en PDA.
+            if not candidate_from_preview_this_run:
+                st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
+                x1, x2, x3, x4 = st.columns(4)
+                x1.metric("SKU", candidate["sku"])
+                x2.metric("Solicitadas", int(candidate["unidades"]))
+                x3.metric("Acopiadas", int(candidate["acopiadas"]))
+                x4.metric("Pendientes", max(pendiente, 0))
+
+            with st.form("form_agregar_cantidad", clear_on_submit=False):
+                qty_txt = st.text_input(
+                    "Cantidad a agregar",
+                    value="",
+                    key="scan_qty_input",
+                    placeholder="Ingresa cantidad",
+                )
+                agregar = st.form_submit_button("Agregar cantidad", type="primary")
+
+            if agregar:
+                qty = to_int(qty_txt)
+                if qty <= 0:
+                    st.error("Ingresa una cantidad válida mayor a cero.")
+                elif qty > pendiente:
+                    st.error(f"No puedes agregar {qty}. Solo quedan {pendiente} pendientes.")
                 else:
-                    qty = int(qty_raw)
-                    ok, msg = add_acopio(active_lote, int(candidate["id"]), qty, st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
+                    ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
                     if ok:
-                        reset_scan_state(); st.success(msg); st.rerun()
+                        reset_scan_state()
+                        st.success(msg)
+                        st.rerun()
                     else:
                         st.error(msg)
 
