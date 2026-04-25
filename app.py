@@ -925,6 +925,7 @@ def clear_scan_inputs_if_needed():
     if st.session_state.get("_clear_scan_inputs_next_run", False):
         st.session_state["scan_primary"] = ""
         st.session_state["scan_secondary"] = ""
+        st.session_state["scan_qty"] = ""
         st.session_state["_clear_scan_inputs_next_run"] = False
 
 
@@ -1126,7 +1127,6 @@ elif page == "Escaneo":
             st.session_state["candidate_mode"] = ""
             st.session_state["primary_validated"] = False
             st.session_state["primary_code"] = norm_code(st.session_state.get("scan_primary", ""))
-            st.session_state["scan_secondary"] = ""
             code = st.session_state["primary_code"]
             if not code:
                 st.error("Escanea o ingresa un código.")
@@ -1175,7 +1175,8 @@ elif page == "Escaneo":
                         cand = best_match(m_no_super)
                         st.session_state["candidate_id"] = int(cand["id"])
                         st.session_state["candidate_mode"] = "SIN_EAN"
-                        st.rerun()
+                        candidate = cand
+                        modo = "SIN_EAN"
                 if validar_sec:
                     sec = st.session_state.get("scan_secondary", "")
                     if not norm_code(sec):
@@ -1188,7 +1189,8 @@ elif page == "Escaneo":
                             cand = best_match(m2)
                             st.session_state["candidate_id"] = int(cand["id"])
                             st.session_state["candidate_mode"] = "ML+SECUNDARIO"
-                            st.rerun()
+                            candidate = cand
+                            modo = "ML+SECUNDARIO"
 
         if candidate is not None:
             pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
@@ -1199,13 +1201,20 @@ elif page == "Escaneo":
             x2.metric("Solicitadas", int(candidate["unidades"]))
             x3.metric("Acopiadas", int(candidate["acopiadas"]))
             x4.metric("Pendientes", max(pendiente, 0))
-            qty = st.number_input("Cantidad a agregar", min_value=1, max_value=max(pendiente, 1), value=1, step=1)
+            st.text_input("Cantidad a agregar", key="scan_qty", placeholder="Ingresa cantidad")
             if st.button("Agregar cantidad", type="primary"):
-                ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
-                if ok:
-                    reset_scan_state(); st.success(msg); st.rerun()
+                qty_raw = clean_text(st.session_state.get("scan_qty", ""))
+                if not qty_raw:
+                    st.error("Ingresa la cantidad antes de agregar.")
+                elif not re.fullmatch(r"\d+", qty_raw):
+                    st.error("La cantidad debe ser un número entero.")
                 else:
-                    st.error(msg)
+                    qty = int(qty_raw)
+                    ok, msg = add_acopio(active_lote, int(candidate["id"]), qty, st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
+                    if ok:
+                        reset_scan_state(); st.success(msg); st.rerun()
+                    else:
+                        st.error(msg)
 
         st.divider()
         if st.button("Deshacer último escaneo"):
