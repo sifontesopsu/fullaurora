@@ -589,10 +589,30 @@ if page == "Cargar lote FULL":
 elif page == "Escaneo":
     st.markdown("""
     <style>
-    /* Escaneo PDA: letras grandes solo en este módulo */
-    div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label {font-size:1.35rem!important;font-weight:850!important;}
-    div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input {font-size:1.75rem!important;min-height:3.6rem!important;}
-    .stButton > button {font-size:1.28rem!important;min-height:3.25rem!important;width:100%;font-weight:850!important;}
+    /* Escaneo PDA: visión grande para operación en piso */
+    div[data-testid="stTextInput"] label,
+    div[data-testid="stNumberInput"] label {
+        font-size:1.85rem!important;
+        font-weight:900!important;
+        margin-bottom:.35rem!important;
+    }
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input {
+        font-size:2.35rem!important;
+        min-height:4.8rem!important;
+        font-weight:800!important;
+    }
+    .stButton > button {
+        font-size:1.75rem!important;
+        min-height:4.5rem!important;
+        width:100%;
+        font-weight:900!important;
+        border-radius:14px!important;
+    }
+    div[data-testid="stMetricLabel"] {font-size:1.35rem!important;font-weight:800!important;}
+    div[data-testid="stMetricValue"] {font-size:2.35rem!important;font-weight:900!important;}
+    .product-title {font-size:1.8rem!important;font-weight:900!important;line-height:1.25;margin:12px 0;}
+    div[data-testid="stAlert"] {font-size:1.35rem!important;font-weight:800!important;}
     </style>
     """, unsafe_allow_html=True)
     if not active_lote:
@@ -643,6 +663,8 @@ elif page == "Escaneo":
                     m1 = match_ml(items, code)
                     if m1.empty:
                         st.error("Código no encontrado en productos pendientes.")
+                    elif m1["identificacion"].map(is_supermercado).all():
+                        st.error("Este producto es SUPERMERCADO. Debe confirmarse escaneando SKU/EAN/Código Universal, no Código ML.")
                     else:
                         st.session_state["primary_validated"] = True
 
@@ -652,6 +674,7 @@ elif page == "Escaneo":
             candidate = get_item_row(items, st.session_state["candidate_id"])
         elif st.session_state.get("primary_validated") and st.session_state.get("primary_code"):
             m1 = match_ml(items, st.session_state["primary_code"])
+            m1 = m1[~m1["identificacion"].map(is_supermercado)]
             preview = best_match(m1)
             if preview is not None:
                 pendiente = int(preview["unidades"]) - int(preview["acopiadas"])
@@ -740,15 +763,6 @@ elif page == "Control":
 
             filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"])
 
-            if "control_search_pending" in st.session_state:
-                st.session_state["control_search"] = st.session_state.pop("control_search_pending")
-
-            busqueda = st.text_input(
-                "Buscar tarjeta",
-                placeholder="Nombre, MLC/Código ML, código universal, SKU o supermercado",
-                key="control_search",
-            )
-
             show = view
             if filtro == "Pendientes":
                 show = view[view["pendiente"] > 0]
@@ -757,41 +771,32 @@ elif page == "Control":
             elif filtro == "Supermercado":
                 show = view[view["identificacion"].map(is_supermercado)]
 
-            query = clean_text(busqueda).upper()
+            # Buscador dinámico nativo: el selectbox permite escribir y muestra coincidencias al instante.
+            option_rows = []
+            option_map = {"": None}
+            for _, sr in show.iterrows():
+                desc = clean_text(sr.get("descripcion", ""))
+                sku = clean_text(sr.get("sku", ""))
+                ml = clean_text(sr.get("codigo_ml", ""))
+                ean = clean_text(sr.get("codigo_universal", ""))
+                ident = clean_text(sr.get("identificacion", ""))
+                label = f"{desc} | SKU {sku} | ML {ml} | EAN {ean} | {ident}"
+                # Limita el largo visual, pero mantiene códigos suficientes para buscar.
+                label = label[:180]
+                option_rows.append(label)
+                option_map[label] = int(sr["id"])
 
-            if query:
-                suggestion_source = show.copy()
-                suggestion_source["_search_text"] = (
-                    suggestion_source["descripcion"].map(clean_text) + " " +
-                    suggestion_source["codigo_ml"].map(clean_text) + " " +
-                    suggestion_source["codigo_universal"].map(clean_text) + " " +
-                    suggestion_source["sku"].map(clean_text) + " " +
-                    suggestion_source["identificacion"].map(clean_text)
-                ).str.upper()
-                terms_sug = [t for t in query.split() if t]
-                sug = suggestion_source[suggestion_source["_search_text"].apply(lambda txt: all(t in txt for t in terms_sug))].head(6)
-                if not sug.empty:
-                    st.caption("Sugerencias")
-                    cols_sug = st.columns(2)
-                    for idx, (_, sr) in enumerate(sug.iterrows()):
-                        label = clean_text(sr.get("descripcion", ""))[:70]
-                        cod = clean_text(sr.get("codigo_ml", "")) or clean_text(sr.get("sku", ""))
-                        if cols_sug[idx % 2].button(f"{label} · {cod}", key=f"sug_{int(sr['id'])}_{idx}"):
-                            st.session_state["control_search_pending"] = clean_text(sr.get("descripcion", ""))
-                            st.rerun()
+            selected_search = st.selectbox(
+                "Buscar tarjeta",
+                [""] + option_rows,
+                index=0,
+                placeholder="Escribe nombre, SKU, Código ML, EAN o supermercado",
+                key="control_search_select",
+            )
 
-            if query:
-                searchable = (
-                    show["descripcion"].map(clean_text) + " " +
-                    show["codigo_ml"].map(clean_text) + " " +
-                    show["codigo_universal"].map(clean_text) + " " +
-                    show["sku"].map(clean_text) + " " +
-                    show["identificacion"].map(clean_text) + " " +
-                    show["vence"].map(clean_text)
-                ).str.upper()
-                terms = [t for t in query.split() if t]
-                mask = searchable.apply(lambda txt: all(t in txt for t in terms))
-                show = show[mask]
+            selected_id = option_map.get(selected_search)
+            if selected_id:
+                show = show[show["id"].astype(int) == int(selected_id)]
 
             st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
 
