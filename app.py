@@ -1,6 +1,7 @@
 import io
 import re
 import html
+import hashlib
 import json
 import os
 import sqlite3
@@ -203,6 +204,41 @@ def init_db():
                 sent_at TEXT
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS label_prints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                codigo_ml TEXT,
+                sku TEXT,
+                descripcion TEXT,
+                cantidad INTEGER NOT NULL DEFAULT 0,
+                print_scope TEXT NOT NULL,
+                print_kind TEXT NOT NULL DEFAULT 'NORMAL',
+                block_index INTEGER,
+                block_key TEXT,
+                is_reprint INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS label_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                block_index INTEGER NOT NULL,
+                block_key TEXT NOT NULL,
+                products_count INTEGER NOT NULL DEFAULT 0,
+                normal_qty INTEGER NOT NULL DEFAULT 0,
+                separator_qty INTEGER NOT NULL DEFAULT 0,
+                total_qty INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'IMPRESO',
+                download_count INTEGER NOT NULL DEFAULT 1,
+                last_printed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
         c.commit()
 
 
@@ -935,6 +971,300 @@ def get_item_row(items, item_id):
 
 
 # ============================================================
+# Etiquetas Zebra ZPL 50x30 mm (módulo independiente)
+# ============================================================
+
+ROLL_CAPACITY_DEFAULT = 2500
+LABEL_SEPARATOR_PER_PRODUCT = 2  # INICIO + FIN
+
+
+def zpl_safe(v) -> str:
+    """Limpia texto para ZPL evitando caracteres que suelen romper impresión."""
+    s = clean_text(v)
+    repl = {
+        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U", "Ü": "U", "Ñ": "N",
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n",
+        "^": "", "~": "", "\n": " ", "\r": " ",
+    }
+    for a, b in repl.items():
+        s = s.replace(a, b)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def split_desc_2_lines(desc: str, max_len: int = 34) -> tuple[str, str]:
+    text = zpl_safe(desc)
+    if len(text) <= max_len:
+        return text, ""
+    cut = text.rfind(" ", 0, max_len + 1)
+    if cut < 12:
+        cut = max_len
+    line1 = text[:cut].strip()
+    rest = text[cut:].strip()
+    if len(rest) <= max_len:
+        return line1, rest
+    cut2 = rest.rfind(" ", 0, max_len + 1)
+    if cut2 < 12:
+        cut2 = max_len
+    return line1, rest[:cut2].strip()
+
+
+def zpl_ml_label_50x30(codigo_ml, sku, descripcion, copies=1) -> str:
+    codigo = zpl_safe(codigo_ml)
+    sku = zpl_safe(sku)
+    line1, line2 = split_desc_2_lines(descripcion, 34)
+    copies = max(1, int(copies or 1))
+    return f"""^XA
+^PW400
+^LL240
+^LH0,0
+^PQ{copies}
+
+^FO15,12^BY2,2,55
+^BCN,55,N,N,N
+^FD{codigo}^FS
+
+^FO120,78^A0N,28,28
+^FD{codigo}^FS
+
+^FO15,118^A0N,21,21
+^FD{line1}^FS
+
+^FO15,145^A0N,21,21
+^FD{line2}^FS
+
+^FO15,195^A0N,25,25
+^FDSKU: {sku}^FS
+
+^XZ
+"""
+
+
+def zpl_separator_50x30(tipo: str, codigo_ml, sku, descripcion) -> str:
+    tipo = "INICIO" if clean_text(tipo).upper() == "INICIO" else "FIN"
+    codigo = zpl_safe(codigo_ml)
+    sku = zpl_safe(sku)
+    line1, line2 = split_desc_2_lines(descripcion, 28)
+    return f"""^XA
+^PW400
+^LL240
+^LH0,0
+
+^FO25,20^A0N,44,44
+^FD{tipo} PRODUCTO^FS
+
+^FO25,78^A0N,32,32
+^FD{codigo}^FS
+
+^FO25,118^A0N,22,22
+^FD{line1}^FS
+^FO25,145^A0N,22,22
+^FD{line2}^FS
+
+^FO25,190^A0N,26,26
+^FDSKU: {sku}^FS
+
+^XZ
+"""
+
+
+def zpl_for_item_with_separators(row, copies=None) -> str:
+    qty = int(copies if copies is not None else row.get("unidades", 0))
+    qty = max(1, qty)
+    return (
+        zpl_separator_50x30("INICIO", row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""))
+        + zpl_ml_label_50x30(row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""), qty)
+        + zpl_separator_50x30("FIN", row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""))
+    )
+
+
+def get_label_print_summary(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT item_id,
+                   SUM(CASE WHEN print_kind='NORMAL' THEN cantidad ELSE 0 END) AS printed_normal,
+                   SUM(CASE WHEN print_kind!='NORMAL' THEN cantidad ELSE 0 END) AS printed_separators,
+                   SUM(CASE WHEN is_reprint=1 THEN cantidad ELSE 0 END) AS reprinted_qty,
+                   MAX(created_at) AS last_label_printed_at
+            FROM label_prints
+            WHERE lote_id=?
+            GROUP BY item_id
+            """,
+            c,
+            params=(lote_id,),
+        )
+    if df.empty:
+        return pd.DataFrame(columns=["item_id", "printed_normal", "printed_separators", "reprinted_qty", "last_label_printed_at"])
+    for col in ["printed_normal", "printed_separators", "reprinted_qty"]:
+        df[col] = df[col].fillna(0).astype(int)
+    return df
+
+
+def label_control_view(lote_id: int) -> pd.DataFrame:
+    items = get_items(lote_id)
+    if items.empty:
+        return items
+    summary = get_label_print_summary(lote_id)
+    view = items.merge(summary, left_on="id", right_on="item_id", how="left")
+    for col in ["printed_normal", "printed_separators", "reprinted_qty"]:
+        view[col] = view[col].fillna(0).astype(int)
+    view["label_pending"] = (view["unidades"].astype(int) - view["printed_normal"].astype(int)).clip(lower=0)
+
+    def status_row(r):
+        req = int(r["unidades"])
+        printed = int(r["printed_normal"])
+        if printed == 0:
+            return "SIN IMPRIMIR"
+        if printed < req:
+            return "PARCIAL"
+        if printed == req:
+            return "COMPLETO"
+        return "SOBREIMPRESO"
+
+    view["label_status"] = view.apply(status_row, axis=1)
+    return view
+
+
+def item_label_total(row) -> int:
+    return int(row.get("unidades", 0)) + LABEL_SEPARATOR_PER_PRODUCT
+
+
+def build_label_blocks(items: pd.DataFrame, capacity: int = ROLL_CAPACITY_DEFAULT) -> list[dict]:
+    blocks = []
+    current = []
+    current_total = 0
+    capacity = max(1, int(capacity or ROLL_CAPACITY_DEFAULT))
+
+    for _, row in items.iterrows():
+        qty = item_label_total(row)
+        # Si un solo producto excede el rollo, se deja solo en un bloque y se advierte en UI.
+        if current and current_total + qty > capacity:
+            blocks.append({"items": current, "total_qty": current_total})
+            current = []
+            current_total = 0
+        current.append(row.to_dict())
+        current_total += qty
+
+    if current:
+        blocks.append({"items": current, "total_qty": current_total})
+
+    out = []
+    for idx, b in enumerate(blocks, start=1):
+        normal = sum(int(x.get("unidades", 0)) for x in b["items"])
+        separators = len(b["items"]) * LABEL_SEPARATOR_PER_PRODUCT
+        key_raw = "|".join(f"{int(x.get('id'))}:{int(x.get('unidades',0))}" for x in b["items"])
+        block_key = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:16]
+        out.append({
+            "block_index": idx,
+            "block_key": block_key,
+            "items": b["items"],
+            "products_count": len(b["items"]),
+            "normal_qty": normal,
+            "separator_qty": separators,
+            "total_qty": normal + separators,
+            "over_capacity": (normal + separators) > capacity,
+        })
+    return out
+
+
+def zpl_for_block(block: dict) -> str:
+    chunks = []
+    for item in block["items"]:
+        chunks.append(zpl_for_item_with_separators(item, int(item.get("unidades", 0))))
+    return "".join(chunks)
+
+
+def get_label_block_record(lote_id: int, block_index: int, block_key: str) -> dict:
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM label_blocks WHERE lote_id=? AND block_index=? AND block_key=?",
+            (int(lote_id), int(block_index), clean_text(block_key)),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def register_block_download(lote_id: int, block: dict):
+    now = datetime.now().isoformat(timespec="seconds")
+    existing = get_label_block_record(lote_id, block["block_index"], block["block_key"])
+    is_reprint = 1 if existing else 0
+    status = "REIMPRESO" if is_reprint else "IMPRESO"
+
+    with db() as c:
+        if existing:
+            c.execute(
+                """
+                UPDATE label_blocks
+                SET status=?, download_count=download_count+1, last_printed_at=?, updated_at=?
+                WHERE lote_id=? AND block_index=? AND block_key=?
+                """,
+                (status, now, now, int(lote_id), int(block["block_index"]), clean_text(block["block_key"])),
+            )
+        else:
+            c.execute(
+                """
+                INSERT INTO label_blocks
+                (lote_id, block_index, block_key, products_count, normal_qty, separator_qty, total_qty,
+                 status, download_count, last_printed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'IMPRESO', 1, ?, ?, ?)
+                """,
+                (
+                    int(lote_id), int(block["block_index"]), clean_text(block["block_key"]), int(block["products_count"]),
+                    int(block["normal_qty"]), int(block["separator_qty"]), int(block["total_qty"]), now, now, now,
+                ),
+            )
+        rows = []
+        for item in block["items"]:
+            rows.append((
+                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
+                int(block["block_index"]), clean_text(block["block_key"]), is_reprint, now,
+            ))
+            rows.append((
+                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
+                int(block["block_index"]), clean_text(block["block_key"]), is_reprint, now,
+            ))
+        c.executemany(
+            """
+            INSERT INTO label_prints
+            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+             block_index, block_key, is_reprint, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        c.commit()
+
+
+def register_individual_download(lote_id: int, item: dict, qty: int):
+    now = datetime.now().isoformat(timespec="seconds")
+    qty = max(1, int(qty or 1))
+    summary = get_label_print_summary(lote_id)
+    already = 0
+    if not summary.empty:
+        m = summary[summary["item_id"].astype(int) == int(item.get("id"))]
+        if not m.empty:
+            already = int(m.iloc[0].get("printed_normal", 0))
+    is_reprint = 1 if already >= int(item.get("unidades", 0)) else 0
+    with db() as c:
+        rows = [
+            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+             clean_text(item.get("descripcion", "")), qty, "INDIVIDUAL", "NORMAL", None, None, is_reprint, now),
+            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, is_reprint, now),
+        ]
+        c.executemany(
+            """
+            INSERT INTO label_prints
+            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+             block_index, block_key, is_reprint, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        c.commit()
+
+# ============================================================
 # Exportación
 # ============================================================
 
@@ -977,12 +1307,15 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 .control-meta {font-size:.92rem;color:#374151;margin-bottom:8px;}
 .badge {display:inline-block;padding:6px 10px;border-radius:999px;background:#F3F4F6;margin:3px 4px 3px 0;font-size:.92rem;font-weight:750;}
 .badge-alert {background:#FFF7ED;}
+.label-card {border:1px solid #D1D5DB;border-radius:16px;padding:16px;margin:12px 0;background:#FFFFFF;}
+.label-card-printed {border-color:#86EFAC;background:#F0FDF4;}
+.label-card-warn {border-color:#FDBA74;background:#FFF7ED;}
 </style>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Control"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Control", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -1238,6 +1571,124 @@ elif page == "Escaneo":
             ok, msg = undo_last_scan(active_lote)
             st.success(msg) if ok else st.warning(msg)
             if ok: st.rerun()
+
+elif page == "Etiquetas":
+    st.subheader("Etiquetas Zebra 50x30")
+    st.caption("Módulo independiente: solo genera/descarga ZPL y registra etiquetas. No modifica el escaneo ni las unidades acopiadas.")
+
+    if not active_lote:
+        st.warning("Primero crea o selecciona un lote FULL.")
+    else:
+        lote = get_lote(active_lote)
+        view = label_control_view(active_lote)
+        if view.empty:
+            st.warning("El lote activo no tiene productos.")
+        else:
+            capacity = st.number_input("Capacidad de rollo dedicado", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100)
+            blocks = build_label_blocks(view, int(capacity))
+            total_products = int(len(view))
+            total_normal = int(view["unidades"].sum())
+            total_separators = int(total_products * LABEL_SEPARATOR_PER_PRODUCT)
+            total_labels = int(total_normal + total_separators)
+            printed_normal = int(view["printed_normal"].sum())
+            pending_normal = max(total_normal - printed_normal, 0)
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Productos", total_products)
+            c2.metric("Etiquetas producto", total_normal)
+            c3.metric("Inicio/Fin", total_separators)
+            c4.metric("Total ZPL", total_labels)
+            c5.metric("Bloques", len(blocks))
+            st.caption(f"Lote: {lote.get('nombre','')} · Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')}")
+
+            if any(b.get("over_capacity") for b in blocks):
+                st.warning("Hay al menos un producto que por sí solo supera la capacidad del rollo. Ese producto quedará en un bloque propio.")
+
+            tab_blocks, tab_individual, tab_control = st.tabs(["Bloques por rollo", "Individual", "Control etiquetas"])
+
+            with tab_blocks:
+                st.info("Regla activa: 1 bloque = 1 rollo nuevo dedicado. Cada producto imprime: INICIO + etiquetas normales + FIN. Al descargar un ZPL, queda registrado automáticamente como impreso.")
+                for block in blocks:
+                    rec = get_label_block_record(active_lote, block["block_index"], block["block_key"])
+                    printed = bool(rec)
+                    status = rec.get("status", "PENDIENTE") if rec else "PENDIENTE"
+                    card_class = "label-card-printed" if printed else "label-card"
+                    first_item = block["items"][0]
+                    last_item = block["items"][-1]
+                    st.markdown(f"""
+                        <div class='label-card {card_class}'>
+                            <b>Bloque {int(block['block_index'])}</b><br>
+                            Estado: <b>{esc(status)}</b><br>
+                            Productos: <b>{int(block['products_count'])}</b> · Etiquetas normales: <b>{int(block['normal_qty'])}</b> · Inicio/Fin: <b>{int(block['separator_qty'])}</b> · Total rollo: <b>{int(block['total_qty'])}</b><br>
+                            Desde: <b>{esc(first_item.get('codigo_ml',''))}</b> / SKU {esc(first_item.get('sku',''))}<br>
+                            Hasta: <b>{esc(last_item.get('codigo_ml',''))}</b> / SKU {esc(last_item.get('sku',''))}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    zpl_data = zpl_for_block(block).encode("utf-8")
+                    fname = f"etiquetas_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
+                    if printed:
+                        st.warning(f"Bloque {int(block['block_index'])} ya fue marcado como impreso. Si descargas nuevamente, quedará registrado como REIMPRESIÓN.")
+                        label = f"Reimprimir bloque {int(block['block_index'])} y registrar reimpresión"
+                    else:
+                        label = f"Descargar ZPL bloque {int(block['block_index'])} y marcar como impreso"
+                    st.download_button(label, data=zpl_data, file_name=fname, mime="text/plain", key=f"download_block_{active_lote}_{block['block_index']}_{block['block_key']}", on_click=register_block_download, args=(active_lote, block))
+                    with st.expander(f"Ver productos del bloque {int(block['block_index'])}"):
+                        bdf = pd.DataFrame(block["items"])
+                        show_cols = ["codigo_ml", "sku", "descripcion", "unidades", "printed_normal", "label_pending", "label_status"]
+                        existing_cols = [c for c in show_cols if c in bdf.columns]
+                        st.dataframe(bdf[existing_cols], use_container_width=True, hide_index=True)
+
+            with tab_individual:
+                st.info("Para excepciones: imprimir 1 o varias etiquetas de un producto específico. También queda registrado automáticamente al descargar.")
+                options = []
+                option_map = {}
+                for _, r in view.iterrows():
+                    label = f"{clean_text(r.get('descripcion',''))[:70]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))} | Estado {clean_text(r.get('label_status',''))}"
+                    options.append(label)
+                    option_map[label] = int(r["id"])
+                selected = st.selectbox("Buscar producto", options, index=0 if options else None, placeholder="Escribe nombre, Código ML o SKU")
+                selected_id = option_map.get(selected) if selected else None
+                if selected_id:
+                    row = view[view["id"].astype(int) == int(selected_id)].iloc[0].to_dict()
+                    req = int(row.get("unidades", 0))
+                    printed = int(row.get("printed_normal", 0))
+                    pending = max(req - printed, 0)
+                    status = clean_text(row.get("label_status", ""))
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Unidades", req)
+                    m2.metric("Impresas", printed)
+                    m3.metric("Pendientes", pending)
+                    m4.metric("Estado", status)
+                    st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
+                    st.caption(f"Código ML: {clean_text(row.get('codigo_ml',''))} · SKU: {clean_text(row.get('sku',''))}")
+                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1)
+                    if printed >= req:
+                        st.warning("Este producto ya tiene todas sus etiquetas normales impresas. La descarga se registrará como REIMPRESIÓN.")
+                    elif int(qty_ind) > pending:
+                        st.warning(f"La cantidad supera lo pendiente ({pending}). Puede dejar el producto SOBREIMPRESO.")
+                    zpl_ind = zpl_for_item_with_separators(row, int(qty_ind)).encode("utf-8")
+                    fname_ind = f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
+                    st.download_button("Descargar ZPL individual y marcar como impreso", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"download_individual_{active_lote}_{selected_id}_{qty_ind}", on_click=register_individual_download, args=(active_lote, row, int(qty_ind)))
+
+            with tab_control:
+                st.caption(f"Etiquetas normales impresas: {printed_normal}/{total_normal} · Pendientes normales: {pending_normal}")
+                filtro_label = st.selectbox("Filtro estado etiquetas", ["Todos", "SIN IMPRIMIR", "PARCIAL", "COMPLETO", "SOBREIMPRESO"])
+                show = view.copy()
+                if filtro_label != "Todos":
+                    show = show[show["label_status"] == filtro_label]
+                out = show.rename(columns={
+                    "codigo_ml": "Código ML",
+                    "sku": "SKU",
+                    "descripcion": "Producto",
+                    "unidades": "Unidades requeridas",
+                    "printed_normal": "Etiquetas impresas",
+                    "label_pending": "Pendientes",
+                    "label_status": "Estado etiquetas",
+                    "printed_separators": "Inicio/Fin impresos",
+                    "last_label_printed_at": "Última impresión",
+                })
+                cols = ["Código ML", "SKU", "Producto", "Unidades requeridas", "Etiquetas impresas", "Pendientes", "Estado etiquetas", "Inicio/Fin impresos", "Última impresión"]
+                st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
 
 elif page == "Control":
     st.subheader("Control de lote")
