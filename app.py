@@ -1404,6 +1404,71 @@ def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
             params=(int(lote_id), int(limit)),
         )
 
+
+def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=None):
+    """Incidencias creadas desde terreno.
+    El operador reporta el problema en el mismo flujo de escaneo; supervisor solo gestiona/resuelve.
+    """
+    current_item_id = None
+    current_label = ""
+    if current_item is not None:
+        try:
+            current_item_id = int(current_item.get("id"))
+            current_label = f"Producto actual: {clean_text(current_item.get('descripcion',''))[:80]} | ML {clean_text(current_item.get('codigo_ml',''))} | SKU {clean_text(current_item.get('sku',''))}"
+        except Exception:
+            current_item_id = None
+            current_label = ""
+
+    with st.expander("Reportar incidencia", expanded=False):
+        st.caption("Usa esto en el momento exacto del problema. Queda registrado para que Supervisor lo resuelva antes del cierre.")
+        source_options = []
+        option_map = {}
+        if current_item_id:
+            source_options.append(current_label)
+            option_map[current_label] = current_item_id
+        source_options.append("Incidencia general del lote")
+        option_map["Incidencia general del lote"] = None
+
+        if items is not None and not items.empty:
+            source_options.append("Seleccionar otro producto")
+
+        with st.form("scan_incident_form", clear_on_submit=True):
+            selected_source = st.radio("Asociar incidencia a", source_options, horizontal=False, key="scan_inc_source")
+            selected_item_id = option_map.get(selected_source)
+
+            if selected_source == "Seleccionar otro producto":
+                choices = []
+                choice_map = {}
+                work = items.copy()
+                work["pendiente"] = (work["unidades"].astype(int) - work["acopiadas"].astype(int)).clip(lower=0)
+                work = work.sort_values(["pendiente", "descripcion"], ascending=[False, True])
+                for _, r in work.iterrows():
+                    label = f"{clean_text(r.get('descripcion',''))[:75]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))} | Pend: {int(r.get('pendiente') or 0)}"
+                    choices.append(label)
+                    choice_map[label] = int(r["id"])
+                picked = st.selectbox("Producto", choices, key="scan_inc_item_select") if choices else None
+                selected_item_id = choice_map.get(picked) if picked else None
+
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="scan_inc_tipo")
+            with c2:
+                qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="scan_inc_qty")
+            usuario_inc = st.text_input("Usuario que reporta", key="scan_inc_usuario", placeholder="Ej: p1, p2, supervisor")
+            comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, etc.")
+            submit_inc = st.form_submit_button("Guardar incidencia", type="primary")
+
+        if submit_inc:
+            if not clean_text(usuario_inc):
+                st.error("Ingresa el usuario que reporta la incidencia.")
+            elif len(clean_text(comentario_inc)) < 3:
+                st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
+            else:
+                create_incidencia(lote_id, selected_item_id, tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
+                st.success("Incidencia registrada para revisión de Supervisor.")
+                st.rerun()
+
+
 # ============================================================
 # Fase 2: Supervisor, incidencias, reimpresión controlada y cierre
 # ============================================================
@@ -2029,6 +2094,8 @@ elif page == "Escaneo":
                         else:
                             st.error(msg)
 
+        render_scan_incident_button(active_lote, items, candidate)
+
         st.divider()
         if st.button("Deshacer último escaneo"):
             ok, msg = undo_last_scan(active_lote)
@@ -2079,7 +2146,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_pendientes, tab_incid, tab_bloques, tab_reg_inc, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques", "Registrar incidencia", "Reimpresión", "Cierre"])
+        tab_resumen, tab_pendientes, tab_incid, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques", "Reimpresión", "Cierre"])
 
         with tab_resumen:
             view = items.copy()
@@ -2127,60 +2194,6 @@ elif page == "Supervisor":
             for b in expected:
                 rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if str(b["block_key"]) in printed_keys else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=520)
-
-        with tab_reg_inc:
-            st.caption("Registra y resuelve problemas operativos del lote sin salir del panel supervisor.")
-            view_inc = get_items(active_lote)
-            item_options = ["Incidencia general del lote"]
-            option_map = {"Incidencia general del lote": None}
-            if not view_inc.empty:
-                for _, r in view_inc.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:90]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                    item_options.append(label)
-                    option_map[label] = int(r["id"])
-            col_a, col_b = st.columns([2, 1])
-            with col_a:
-                selected_inc = st.selectbox("Producto asociado", item_options, key="sup_inc_item")
-                tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="sup_inc_tipo")
-            with col_b:
-                qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="sup_inc_qty")
-                usuario_inc = st.text_input("Usuario responsable", key="sup_inc_usuario", placeholder="Ej: p1, p2, supervisor")
-            comentario_inc = st.text_area("Comentario", key="sup_inc_comentario", placeholder="Describe qué ocurrió y qué evidencia existe.")
-            if st.button("Registrar incidencia", type="primary", key="sup_registrar_inc"):
-                if not clean_text(usuario_inc):
-                    st.error("Ingresa el usuario responsable.")
-                elif len(clean_text(comentario_inc)) < 3:
-                    st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
-                else:
-                    create_incidencia(active_lote, option_map.get(selected_inc), tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
-                    st.success("Incidencia registrada.")
-                    st.rerun()
-
-            st.divider()
-            st.subheader("Incidencias abiertas")
-            inc_open = get_incidencias(active_lote, status="ABIERTA")
-            if inc_open.empty:
-                st.success("No hay incidencias abiertas.")
-            else:
-                for _, r in inc_open.iterrows():
-                    st.markdown(f"""
-                    <div class='control-card'>
-                        <div class='control-title'>{esc(r.get('tipo',''))} · {esc(r.get('descripcion','') or 'General del lote')}</div>
-                        <div class='control-meta'><b>Cantidad:</b> {int(r.get('cantidad') or 0)} · <b>Usuario:</b> {esc(r.get('usuario',''))} · <b>Fecha:</b> {esc(fmt_dt(r.get('created_at','')))}</div>
-                        <div>{esc(r.get('comentario',''))}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    with st.expander(f"Resolver incidencia #{int(r['id'])}"):
-                        res_user = st.text_input("Resuelto por", key=f"sup_res_user_{int(r['id'])}", placeholder="Ej: supervisor")
-                        res_comment = st.text_area("Comentario de resolución", key=f"sup_res_comment_{int(r['id'])}")
-                        if st.button("Marcar como resuelta", key=f"sup_resolve_{int(r['id'])}", type="primary"):
-                            if not clean_text(res_user):
-                                st.error("Ingresa quién resolvió la incidencia.")
-                            else:
-                                ok_res, msg_res = resolve_incidencia(int(r["id"]), res_user, res_comment)
-                                st.success(msg_res) if ok_res else st.error(msg_res)
-                                if ok_res:
-                                    st.rerun()
 
         with tab_reimp:
             st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
