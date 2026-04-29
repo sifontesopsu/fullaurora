@@ -141,6 +141,13 @@ def is_supermercado(v) -> bool:
 # Base de datos nueva v3
 # ============================================================
 
+def ensure_column(conn, table: str, column: str, definition: str):
+    """Agrega una columna si no existe. Evita romper bases SQLite antiguas."""
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     with db() as c:
         c.execute("""
@@ -238,8 +245,66 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER,
+                item_id INTEGER,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                qty INTEGER,
+                codigo_ml TEXT,
+                sku TEXT,
+                mode TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS incidencias (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                item_id INTEGER,
+                tipo TEXT NOT NULL,
+                cantidad INTEGER NOT NULL DEFAULT 0,
+                comentario TEXT,
+                usuario TEXT,
+                status TEXT NOT NULL DEFAULT 'ABIERTA',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by TEXT,
+                resolution_comment TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS reimpresiones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                item_id INTEGER,
+                block_index INTEGER,
+                block_key TEXT,
+                scope TEXT NOT NULL,
+                cantidad INTEGER NOT NULL DEFAULT 0,
+                motivo TEXT NOT NULL,
+                usuario TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
+        ensure_column(c, "lotes", "closed_at", "TEXT")
+        ensure_column(c, "lotes", "closed_by", "TEXT")
+        ensure_column(c, "lotes", "close_note", "TEXT")
+        ensure_column(c, "label_blocks", "last_reprint_reason", "TEXT")
+        ensure_column(c, "label_blocks", "last_reprint_user", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_items_sku ON items (lote_id, sku)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scans_lote ON scans (lote_id, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_audit_lote ON audit_events (lote_id, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_incidencias_lote ON incidencias (lote_id, status, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_reimpresiones_lote ON reimpresiones (lote_id, created_at)")
         c.commit()
+
 
 
 # ============================================================
@@ -577,7 +642,7 @@ def build_lote_payload(lote_id: int) -> dict:
 def list_lotes():
     with db() as c:
         return pd.read_sql_query("""
-            SELECT l.id, l.nombre, l.archivo, l.hoja, l.created_at,
+            SELECT l.id, l.nombre, l.archivo, l.hoja, l.created_at, l.status, l.closed_at, l.closed_by,
                    COALESCE(SUM(i.unidades), 0) unidades,
                    COALESCE(SUM(i.acopiadas), 0) acopiadas,
                    COUNT(i.id) lineas
@@ -689,6 +754,7 @@ def create_lote(nombre, archivo, hoja, df):
 
     enqueue_backup_events_batch(events)
     flush_backup_queue(limit=max(1000, len(events) + 10))
+    log_audit_event(lote_id, event_type="LOTE_CREADO", detail=f"Lote creado desde {archivo} / {hoja}", qty=int(df["unidades"].sum()) if "unidades" in df.columns else 0)
     return lote_id
 
 def delete_lote(lote_id):
@@ -705,6 +771,7 @@ def delete_lote(lote_id):
         "items_eliminados": int(items_count),
         "deleted_at": datetime.now().isoformat(timespec="seconds"),
     })
+    log_audit_event(lote_id, event_type="LOTE_ELIMINADO", detail="Lote eliminado", qty=int(items_count))
 
 
 def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
@@ -740,6 +807,7 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo)
         "scan_secundario": norm_code(scan_secundario),
         "created_at": now,
     })
+    log_audit_event(lote_id, item_id, "SKU_ESCANEADO", clean_text(item["descripcion"]), int(cantidad), item["codigo_ml"], item["sku"], modo)
     return True, "Cantidad agregada."
 
 
@@ -768,6 +836,7 @@ def undo_last_scan(lote_id):
         "scan_secundario": norm_code(row["scan_secundario"]),
         "created_at": now,
     })
+    log_audit_event(lote_id, int(row["item_id"]), "SCAN_DESHECHO", clean_text(item_payload.get("descripcion", "")), int(row["cantidad"]), item_payload.get("codigo_ml", ""), item_payload.get("sku", ""), row["modo"])
     return True, "Último escaneo deshecho."
 
 
@@ -1234,6 +1303,7 @@ def register_block_download(lote_id: int, block: dict):
             rows,
         )
         c.commit()
+    log_audit_event(lote_id, event_type="ZPL_REIMPRESO" if is_reprint else "ZPL_DESCARGADO", detail=f"Bloque {int(block['block_index'])}", qty=int(block.get("total_qty", 0)), mode="BLOQUE")
 
 
 def register_individual_download(lote_id: int, item: dict, qty: int):
@@ -1263,6 +1333,387 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
             rows,
         )
         c.commit()
+    log_audit_event(lote_id, int(item.get("id")), "ZPL_INDIVIDUAL", clean_text(item.get("descripcion", "")), int(qty), item.get("codigo_ml", ""), item.get("sku", ""), "INDIVIDUAL")
+
+# ============================================================
+# Auditoría operacional Fase 1
+# ============================================================
+
+def log_audit_event(lote_id=None, item_id=None, event_type="", detail="", qty=None, codigo_ml="", sku="", mode=""):
+    """Registra una acción operacional local. No bloquea la operación si falla."""
+    try:
+        now = datetime.now().isoformat(timespec="seconds")
+        with db() as c:
+            c.execute(
+                """
+                INSERT INTO audit_events
+                (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(lote_id) if lote_id is not None else None,
+                    int(item_id) if item_id is not None else None,
+                    clean_text(event_type), clean_text(detail),
+                    int(qty) if qty is not None else None,
+                    norm_code(codigo_ml), norm_code(sku), clean_text(mode), now,
+                ),
+            )
+            c.commit()
+    except Exception:
+        pass
+
+
+def get_audit_events(lote_id=None, limit=300) -> pd.DataFrame:
+    with db() as c:
+        if lote_id:
+            return pd.read_sql_query(
+                """
+                SELECT created_at, event_type, detail, qty, codigo_ml, sku, mode, item_id
+                FROM audit_events
+                WHERE lote_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                c,
+                params=(int(lote_id), int(limit)),
+            )
+        return pd.read_sql_query(
+            """
+            SELECT created_at, lote_id, event_type, detail, qty, codigo_ml, sku, mode, item_id
+            FROM audit_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            c,
+            params=(int(limit),),
+        )
+
+
+def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
+    with db() as c:
+        return pd.read_sql_query(
+            """
+            SELECT s.created_at, i.descripcion, i.codigo_ml, i.sku, s.cantidad, s.modo
+            FROM scans s
+            LEFT JOIN items i ON i.id=s.item_id
+            WHERE s.lote_id=?
+            ORDER BY s.id DESC
+            LIMIT ?
+            """,
+            c,
+            params=(int(lote_id), int(limit)),
+        )
+
+# ============================================================
+# Fase 2: Supervisor, incidencias, reimpresión controlada y cierre
+# ============================================================
+
+INCIDENCIA_TIPOS = [
+    "Falta producto",
+    "Producto dañado",
+    "Código no coincide",
+    "Cantidad menor",
+    "Cantidad mayor",
+    "Etiqueta dañada",
+    "Problema de impresión",
+    "Otro",
+]
+
+
+def get_operator_name() -> str:
+    return clean_text(st.session_state.get("operator_name", "")) or "SIN_USUARIO"
+
+
+def get_incidencias(lote_id=None, status=None) -> pd.DataFrame:
+    with db() as c:
+        where = []
+        params = []
+        if lote_id:
+            where.append("inc.lote_id=?")
+            params.append(int(lote_id))
+        if status and clean_text(status) != "Todas":
+            where.append("inc.status=?")
+            params.append(clean_text(status))
+        sql_where = ("WHERE " + " AND ".join(where)) if where else ""
+        return pd.read_sql_query(
+            f"""
+            SELECT inc.id, inc.created_at, inc.lote_id, inc.item_id, inc.tipo, inc.cantidad,
+                   inc.comentario, inc.usuario, inc.status, inc.resolved_at, inc.resolved_by,
+                   inc.resolution_comment, i.codigo_ml, i.sku, i.descripcion
+            FROM incidencias inc
+            LEFT JOIN items i ON i.id=inc.item_id
+            {sql_where}
+            ORDER BY inc.id DESC
+            """,
+            c,
+            params=params,
+        )
+
+
+def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentario: str, usuario: str):
+    now = datetime.now().isoformat(timespec="seconds")
+    item = {}
+    if item_id:
+        with db() as c:
+            row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
+            item = dict(row) if row else {}
+    with db() as c:
+        c.execute(
+            """
+            INSERT INTO incidencias
+            (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'ABIERTA', ?)
+            """,
+            (
+                int(lote_id),
+                int(item_id) if item_id else None,
+                clean_text(tipo),
+                max(0, int(cantidad or 0)),
+                clean_text(comentario),
+                clean_text(usuario) or "SIN_USUARIO",
+                now,
+            ),
+        )
+        c.commit()
+
+    log_audit_event(
+        lote_id,
+        int(item_id) if item_id else None,
+        "INCIDENCIA_ABIERTA",
+        f"{clean_text(tipo)} · {clean_text(comentario)}",
+        max(0, int(cantidad or 0)),
+        item.get("codigo_ml", ""),
+        item.get("sku", ""),
+        clean_text(usuario) or "SIN_USUARIO",
+    )
+
+
+def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as c:
+        inc = c.execute("SELECT * FROM incidencias WHERE id=?", (int(incidencia_id),)).fetchone()
+        if not inc:
+            return False, "Incidencia no encontrada."
+        if clean_text(inc["status"]) == "RESUELTA":
+            return False, "La incidencia ya estaba resuelta."
+        c.execute(
+            """
+            UPDATE incidencias
+            SET status='RESUELTA', resolved_at=?, resolved_by=?, resolution_comment=?
+            WHERE id=?
+            """,
+            (now, clean_text(usuario) or "SIN_USUARIO", clean_text(comentario), int(incidencia_id)),
+        )
+        c.commit()
+    log_audit_event(int(inc["lote_id"]), inc["item_id"], "INCIDENCIA_RESUELTA", clean_text(comentario), inc["cantidad"], mode=clean_text(usuario) or "SIN_USUARIO")
+    return True, "Incidencia resuelta."
+
+
+def get_reimpresiones(lote_id=None) -> pd.DataFrame:
+    with db() as c:
+        if lote_id:
+            return pd.read_sql_query(
+                """
+                SELECT r.created_at, r.scope, r.block_index, r.item_id, r.cantidad, r.motivo, r.usuario,
+                       i.codigo_ml, i.sku, i.descripcion
+                FROM reimpresiones r
+                LEFT JOIN items i ON i.id=r.item_id
+                WHERE r.lote_id=?
+                ORDER BY r.id DESC
+                """,
+                c,
+                params=(int(lote_id),),
+            )
+        return pd.read_sql_query("SELECT * FROM reimpresiones ORDER BY id DESC", c)
+
+
+def get_label_blocks_df(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM label_blocks
+            WHERE lote_id=?
+            ORDER BY block_index ASC
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+
+
+def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, usuario: str):
+    motivo = clean_text(motivo)
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    if len(motivo) < 5:
+        return False, "Debes ingresar un motivo claro de reimpresión."
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as c:
+        rec = c.execute(
+            "SELECT * FROM label_blocks WHERE lote_id=? AND block_index=? AND block_key=?",
+            (int(lote_id), int(block["block_index"]), clean_text(block["block_key"])),
+        ).fetchone()
+        if not rec:
+            return False, "Este bloque aún no está impreso. Debe descargarse primero como impresión normal."
+        c.execute(
+            """
+            UPDATE label_blocks
+            SET status='REIMPRESO', download_count=download_count+1, last_printed_at=?,
+                updated_at=?, last_reprint_reason=?, last_reprint_user=?
+            WHERE lote_id=? AND block_index=? AND block_key=?
+            """,
+            (now, now, motivo, usuario, int(lote_id), int(block["block_index"]), clean_text(block["block_key"])),
+        )
+        c.execute(
+            """
+            INSERT INTO reimpresiones
+            (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
+            VALUES (?, NULL, ?, ?, 'BLOQUE', ?, ?, ?, ?)
+            """,
+            (int(lote_id), int(block["block_index"]), clean_text(block["block_key"]), int(block["total_qty"]), motivo, usuario, now),
+        )
+
+        rows = []
+        for item in block["items"]:
+            rows.append((
+                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
+                int(block["block_index"]), clean_text(block["block_key"]), 1, now,
+            ))
+            rows.append((
+                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
+                int(block["block_index"]), clean_text(block["block_key"]), 1, now,
+            ))
+        c.executemany(
+            """
+            INSERT INTO label_prints
+            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+             block_index, block_key, is_reprint, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        c.commit()
+
+    log_audit_event(lote_id, event_type="REIMPRESION_CONTROLADA", detail=f"Bloque {int(block['block_index'])} · {motivo}", qty=int(block["total_qty"]), mode=usuario)
+    return True, "Reimpresión registrada."
+
+
+def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo: str, usuario: str):
+    motivo = clean_text(motivo)
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    qty = max(1, int(qty or 1))
+    if len(motivo) < 5:
+        return False, "Debes ingresar un motivo claro de reimpresión."
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as c:
+        c.execute(
+            """
+            INSERT INTO reimpresiones
+            (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
+            VALUES (?, ?, NULL, NULL, 'PRODUCTO', ?, ?, ?, ?)
+            """,
+            (int(lote_id), int(item.get("id")), int(qty), motivo, usuario, now),
+        )
+        rows = [
+            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+             clean_text(item.get("descripcion", "")), int(qty), "INDIVIDUAL", "NORMAL", None, None, 1, now),
+            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, 1, now),
+        ]
+        c.executemany(
+            """
+            INSERT INTO label_prints
+            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+             block_index, block_key, is_reprint, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        c.commit()
+    log_audit_event(lote_id, int(item.get("id")), "REIMPRESION_CONTROLADA", f"Producto · {motivo}", qty, item.get("codigo_ml", ""), item.get("sku", ""), usuario)
+    return True, "Reimpresión individual registrada."
+
+
+def supervisor_metrics(lote_id: int) -> dict:
+    items = get_items(lote_id)
+    if items.empty:
+        return {"total": 0, "done": 0, "pending": 0, "incidencias_abiertas": 0, "label_pending": 0}
+    view = items.copy()
+    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+    labels = label_control_view(lote_id)
+    incid = get_incidencias(lote_id, status="ABIERTA")
+    return {
+        "total": int(view["unidades"].sum()),
+        "done": int(view["acopiadas"].sum()),
+        "pending": int(view["pendiente"].sum()),
+        "incidencias_abiertas": int(len(incid)),
+        "label_pending": int(labels["label_pending"].sum()) if not labels.empty else 0,
+    }
+
+
+def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> tuple[bool, list[str], dict]:
+    items = get_items(lote_id)
+    issues = []
+    if items.empty:
+        issues.append("El lote no tiene productos.")
+        return False, issues, {}
+    view = items.copy()
+    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+    pending_units = int(view["pendiente"].sum())
+    if pending_units > 0:
+        issues.append(f"Quedan {pending_units} unidades pendientes de acopio/escaneo.")
+
+    inc_abiertas = get_incidencias(lote_id, status="ABIERTA")
+    if not inc_abiertas.empty:
+        issues.append(f"Hay {len(inc_abiertas)} incidencia(s) abiertas.")
+
+    label_view = label_control_view(lote_id)
+    label_pending = int(label_view["label_pending"].sum()) if not label_view.empty else 0
+    if label_pending > 0:
+        issues.append(f"Quedan {label_pending} etiquetas normales pendientes de impresión.")
+
+    blocks_expected = build_label_blocks(label_view, int(capacity)) if not label_view.empty else []
+    blocks_db = get_label_blocks_df(lote_id)
+    printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
+    missing_blocks = [b for b in blocks_expected if str(b["block_key"]) not in printed_keys]
+    if missing_blocks:
+        issues.append(f"Faltan {len(missing_blocks)} bloque(s) ZPL por descargar/imprimir.")
+
+    return len(issues) == 0, issues, {
+        "pending_units": pending_units,
+        "open_incidents": int(len(inc_abiertas)),
+        "label_pending": label_pending,
+        "expected_blocks": int(len(blocks_expected)),
+        "printed_blocks": int(len(blocks_db)),
+    }
+
+
+def close_lote(lote_id: int, usuario: str, nota: str):
+    ok, issues, _ = cierre_validaciones(lote_id)
+    if not ok:
+        return False, "No se puede cerrar: " + " ".join(issues)
+    now = datetime.now().isoformat(timespec="seconds")
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    with db() as c:
+        c.execute(
+            "UPDATE lotes SET status='CERRADO', closed_at=?, closed_by=?, close_note=? WHERE id=?",
+            (now, usuario, clean_text(nota), int(lote_id)),
+        )
+        c.commit()
+    log_audit_event(lote_id, event_type="LOTE_CERRADO", detail=clean_text(nota), mode=usuario)
+    return True, "Lote cerrado correctamente."
+
+
+def reopen_lote(lote_id: int, usuario: str, motivo: str):
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    with db() as c:
+        c.execute("UPDATE lotes SET status='ACTIVO', closed_at=NULL, closed_by=NULL, close_note=NULL WHERE id=?", (int(lote_id),))
+        c.commit()
+    log_audit_event(lote_id, event_type="LOTE_REABIERTO", detail=clean_text(motivo), mode=usuario)
+    return True, "Lote reabierto."
 
 # ============================================================
 # Exportación
@@ -1276,10 +1727,16 @@ def export_lote(lote_id):
     scans = pd.DataFrame()
     with db() as c:
         scans = pd.read_sql_query("SELECT created_at, item_id, scan_primario, scan_secundario, cantidad, modo FROM scans WHERE lote_id=? ORDER BY id DESC", c, params=(lote_id,))
+    audit = get_audit_events(lote_id, limit=5000)
+    incidencias = get_incidencias(lote_id)
+    reimpresiones = get_reimpresiones(lote_id)
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         items.to_excel(writer, sheet_name="control_full", index=False)
         scans.to_excel(writer, sheet_name="escaneos", index=False)
+        audit.to_excel(writer, sheet_name="auditoria", index=False)
+        incidencias.to_excel(writer, sheet_name="incidencias", index=False)
+        reimpresiones.to_excel(writer, sheet_name="reimpresiones", index=False)
     return out.getvalue()
 
 
@@ -1315,7 +1772,8 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Control", "Etiquetas"], label_visibility="collapsed")
+    st.text_input("Usuario / operador", key="operator_name", placeholder="Ej: supervisor, p1, p2")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Incidencias", "Reimpresión", "Cierre de lote", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -1558,19 +2016,276 @@ elif page == "Escaneo":
                 elif qty > pendiente:
                     st.error(f"No puedes agregar {qty}. Solo quedan {pendiente} pendientes.")
                 else:
-                    ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
-                    if ok:
-                        reset_scan_state()
-                        st.success(msg)
-                        st.rerun()
+                    submit_sig = f"{active_lote}:{int(candidate['id'])}:{qty}:{norm_code(st.session_state.get('scan_primary', ''))}:{norm_code(st.session_state.get('scan_secondary', ''))}:{modo}"
+                    if st.session_state.get("_last_scan_submit_sig") == submit_sig:
+                        st.warning("Este escaneo ya fue procesado. Limpia o escanea el siguiente producto.")
                     else:
-                        st.error(msg)
+                        st.session_state["_last_scan_submit_sig"] = submit_sig
+                        ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
+                        if ok:
+                            reset_scan_state()
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
 
         st.divider()
         if st.button("Deshacer último escaneo"):
             ok, msg = undo_last_scan(active_lote)
             st.success(msg) if ok else st.warning(msg)
             if ok: st.rerun()
+
+        recientes = get_recent_scans(active_lote, limit=8)
+        if not recientes.empty:
+            st.subheader("Últimos escaneos")
+            recientes = recientes.rename(columns={
+                "created_at": "Fecha",
+                "descripcion": "Producto",
+                "codigo_ml": "Código ML",
+                "sku": "SKU",
+                "cantidad": "Cantidad",
+                "modo": "Modo",
+            })
+            st.dataframe(recientes, use_container_width=True, hide_index=True, height=260)
+
+elif page == "Supervisor":
+    st.subheader("Panel supervisor")
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        lote = get_lote(active_lote)
+        items = get_items(active_lote)
+        capacity_sup = st.number_input("Capacidad de rollo para validar bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="supervisor_capacity")
+        ok_cierre, issues, cierre_data = cierre_validaciones(active_lote, int(capacity_sup))
+        metrics = supervisor_metrics(active_lote)
+        total = metrics["total"]
+        done = metrics["done"]
+        avance = (done / total * 100) if total else 0
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Estado lote", clean_text(lote.get("status", "ACTIVO")))
+        s2.metric("Avance", f"{avance:.1f}%")
+        s3.metric("Pendientes", metrics["pending"])
+        s4.metric("Incidencias abiertas", metrics["incidencias_abiertas"])
+        s5.metric("Etiquetas pendientes", metrics["label_pending"])
+
+        st.progress(done / total if total else 0)
+        st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Creado: {fmt_dt(lote.get('created_at',''))}")
+
+        if ok_cierre:
+            st.success("El lote está apto para cierre formal.")
+        else:
+            st.warning("El lote aún no está apto para cierre.")
+            for issue in issues:
+                st.write(f"• {issue}")
+
+        tab_resumen, tab_pendientes, tab_incid, tab_bloques = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques"])
+
+        with tab_resumen:
+            view = items.copy()
+            if not view.empty:
+                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+                resumen = pd.DataFrame([{
+                    "Unidades solicitadas": int(view["unidades"].sum()),
+                    "Unidades acopiadas": int(view["acopiadas"].sum()),
+                    "Unidades pendientes": int(view["pendiente"].sum()),
+                    "Líneas totales": int(len(view)),
+                    "Líneas pendientes": int((view["pendiente"] > 0).sum()),
+                    "Bloques impresos": cierre_data.get("printed_blocks", 0),
+                    "Bloques esperados": cierre_data.get("expected_blocks", 0),
+                    "Incidencias abiertas": cierre_data.get("open_incidents", 0),
+                }])
+                st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+        with tab_pendientes:
+            view = items.copy()
+            if not view.empty:
+                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+                pend = view[view["pendiente"] > 0].copy()
+                if pend.empty:
+                    st.success("No hay productos pendientes.")
+                else:
+                    out = pend.rename(columns={"codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto", "unidades": "Solicitadas", "acopiadas": "Acopiadas", "pendiente": "Pendiente", "identificacion": "Identificación", "vence": "Vence"})
+                    cols = ["Código ML", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence"]
+                    st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
+
+        with tab_incid:
+            inc = get_incidencias(active_lote)
+            if inc.empty:
+                st.success("Sin incidencias registradas.")
+            else:
+                out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
+                cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "SKU", "Producto", "Comentario", "Usuario"]
+                st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
+
+        with tab_bloques:
+            labels = label_control_view(active_lote)
+            expected = build_label_blocks(labels, int(capacity_sup)) if not labels.empty else []
+            blocks_db = get_label_blocks_df(active_lote)
+            printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
+            rows = []
+            for b in expected:
+                rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if str(b["block_key"]) in printed_keys else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=520)
+
+
+elif page == "Incidencias":
+    st.subheader("Incidencias operativas")
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        items = get_items(active_lote)
+        tab_new, tab_open, tab_all = st.tabs(["Nueva incidencia", "Abiertas", "Historial"])
+        with tab_new:
+            st.info("Registra problemas reales del lote: faltantes, daños, códigos que no coinciden o problemas de impresión.")
+            options = ["General del lote"]
+            option_map = {"General del lote": None}
+            for _, r in items.iterrows():
+                label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
+                options.append(label)
+                option_map[label] = int(r["id"])
+            selected_inc = st.selectbox("Producto afectado", options, index=0)
+            tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS)
+            qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=99999, value=1, step=1)
+            comentario_inc = st.text_area("Comentario", placeholder="Describe qué ocurrió y qué evidencia existe.")
+            usuario_inc = st.text_input("Usuario responsable del registro", value=get_operator_name(), key="inc_usuario")
+            if st.button("Registrar incidencia", type="primary"):
+                if len(clean_text(comentario_inc)) < 3:
+                    st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
+                else:
+                    create_incidencia(active_lote, option_map.get(selected_inc), tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
+                    st.success("Incidencia registrada.")
+                    st.rerun()
+        with tab_open:
+            inc = get_incidencias(active_lote, status="ABIERTA")
+            if inc.empty:
+                st.success("No hay incidencias abiertas.")
+            else:
+                for _, r in inc.iterrows():
+                    st.markdown(f"""
+                    <div class='control-card'>
+                        <div class='control-title'>{esc(r.get('tipo',''))} · {esc(r.get('descripcion','') or 'General del lote')}</div>
+                        <div class='control-meta'><b>Estado:</b> {esc(r.get('status',''))} · <b>Cantidad:</b> {int(r.get('cantidad') or 0)} · <b>Usuario:</b> {esc(r.get('usuario',''))} · <b>Fecha:</b> {esc(fmt_dt(r.get('created_at','')))}</div>
+                        <div>{esc(r.get('comentario',''))}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    with st.expander(f"Resolver incidencia #{int(r['id'])}"):
+                        res_user = st.text_input("Resuelto por", value=get_operator_name(), key=f"res_user_{int(r['id'])}")
+                        res_comment = st.text_area("Comentario de resolución", key=f"res_comment_{int(r['id'])}")
+                        if st.button("Marcar como resuelta", key=f"resolve_{int(r['id'])}", type="primary"):
+                            ok_res, msg_res = resolve_incidencia(int(r["id"]), res_user, res_comment)
+                            st.success(msg_res) if ok_res else st.error(msg_res)
+                            if ok_res:
+                                st.rerun()
+        with tab_all:
+            inc = get_incidencias(active_lote)
+            if inc.empty:
+                st.info("Sin incidencias.")
+            else:
+                out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "resolved_at": "Fecha resolución", "resolved_by": "Resuelto por", "resolution_comment": "Comentario resolución", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
+                st.dataframe(out, use_container_width=True, hide_index=True, height=620)
+
+
+elif page == "Reimpresión":
+    st.subheader("Reimpresión controlada")
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
+        mode_rep = st.radio("Tipo de reimpresión", ["Bloque completo", "Producto individual"], horizontal=True)
+        usuario_rep = st.text_input("Usuario que reimprime", value=get_operator_name(), key="rep_usuario")
+        motivo_rep = st.text_area("Motivo obligatorio", placeholder="Ej: rollo se cortó a mitad de bloque, etiqueta dañada, impresora pausada, etc.")
+        if mode_rep == "Bloque completo":
+            view = label_control_view(active_lote)
+            capacity_rep = st.number_input("Capacidad de rollo usada para reconstruir bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="rep_capacity")
+            expected = build_label_blocks(view, int(capacity_rep)) if not view.empty else []
+            blocks_db = get_label_blocks_df(active_lote)
+            printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
+            printed_blocks = [b for b in expected if str(b["block_key"]) in printed_keys]
+            if not printed_blocks:
+                st.warning("Aún no hay bloques impresos para reimprimir.")
+            else:
+                labels = [f"Bloque {int(b['block_index'])} · {int(b['products_count'])} productos · {int(b['total_qty'])} etiquetas" for b in printed_blocks]
+                map_blocks = {labels[i]: printed_blocks[i] for i in range(len(labels))}
+                selected_block_label = st.selectbox("Bloque a reimprimir", labels)
+                block = map_blocks[selected_block_label]
+                zpl_data = zpl_for_block(block).encode("utf-8")
+                fname = f"reimpresion_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
+                if clean_text(motivo_rep):
+                    st.download_button("Descargar ZPL y registrar reimpresión", data=zpl_data, file_name=fname, mime="text/plain", key=f"reprint_block_{active_lote}_{block['block_index']}_{block['block_key']}_{hashlib.sha1(clean_text(motivo_rep).encode()).hexdigest()[:8]}", on_click=register_controlled_block_reprint, args=(active_lote, block, motivo_rep, usuario_rep))
+                else:
+                    st.warning("Ingresa motivo para habilitar descarga.")
+                with st.expander("Productos del bloque"):
+                    bdf = pd.DataFrame(block["items"])
+                    st.dataframe(bdf[[c for c in ["codigo_ml", "sku", "descripcion", "unidades"] if c in bdf.columns]], use_container_width=True, hide_index=True)
+        else:
+            view = label_control_view(active_lote)
+            options = []
+            option_map = {}
+            for _, r in view.iterrows():
+                label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
+                options.append(label)
+                option_map[label] = int(r["id"])
+            if not options:
+                st.warning("No hay productos.")
+            else:
+                selected_item_label = st.selectbox("Producto a reimprimir", options)
+                item_id = option_map[selected_item_label]
+                row = view[view["id"].astype(int) == int(item_id)].iloc[0].to_dict()
+                qty_rep = st.number_input("Cantidad de etiquetas normales", min_value=1, max_value=9999, value=1, step=1)
+                zpl_ind = zpl_for_item_with_separators(row, int(qty_rep)).encode("utf-8")
+                fname_ind = f"reimpresion_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
+                if clean_text(motivo_rep):
+                    st.download_button("Descargar ZPL individual y registrar reimpresión", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"reprint_item_{active_lote}_{item_id}_{qty_rep}_{hashlib.sha1(clean_text(motivo_rep).encode()).hexdigest()[:8]}", on_click=register_controlled_item_reprint, args=(active_lote, row, int(qty_rep), motivo_rep, usuario_rep))
+                else:
+                    st.warning("Ingresa motivo para habilitar descarga.")
+        hist = get_reimpresiones(active_lote)
+        if not hist.empty:
+            st.divider()
+            st.subheader("Historial de reimpresiones")
+            out = hist.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
+            st.dataframe(out, use_container_width=True, hide_index=True, height=360)
+
+
+elif page == "Cierre de lote":
+    st.subheader("Cierre formal de lote")
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        lote = get_lote(active_lote)
+        capacity_close = st.number_input("Capacidad de rollo para validar bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="close_capacity")
+        ok_close, issues, data_close = cierre_validaciones(active_lote, int(capacity_close))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Estado actual", clean_text(lote.get("status", "ACTIVO")))
+        c2.metric("Unidades pendientes", data_close.get("pending_units", 0))
+        c3.metric("Incidencias abiertas", data_close.get("open_incidents", 0))
+        c4.metric("Bloques", f"{data_close.get('printed_blocks',0)}/{data_close.get('expected_blocks',0)}")
+        if clean_text(lote.get("status")) == "CERRADO":
+            st.success(f"Lote cerrado por {clean_text(lote.get('closed_by',''))} el {fmt_dt(lote.get('closed_at',''))}.")
+            st.caption(clean_text(lote.get("close_note", "")))
+            with st.expander("Reabrir lote"):
+                reopen_user = st.text_input("Usuario", value=get_operator_name(), key="reopen_user")
+                reopen_reason = st.text_area("Motivo de reapertura", key="reopen_reason")
+                if st.button("Reabrir lote", type="primary"):
+                    ok_reopen, msg_reopen = reopen_lote(active_lote, reopen_user, reopen_reason)
+                    st.success(msg_reopen) if ok_reopen else st.error(msg_reopen)
+                    if ok_reopen:
+                        st.rerun()
+        else:
+            if ok_close:
+                st.success("Validación correcta. El lote puede cerrarse.")
+            else:
+                st.error("El lote no se puede cerrar todavía.")
+                for issue in issues:
+                    st.write(f"• {issue}")
+            close_user = st.text_input("Cerrado por", value=get_operator_name(), key="close_user")
+            close_note = st.text_area("Nota de cierre", placeholder="Ej: lote revisado completo, sin diferencias abiertas.", key="close_note")
+            if st.button("Cerrar lote", type="primary", disabled=not ok_close):
+                ok_final, msg_final = close_lote(active_lote, close_user, close_note)
+                st.success(msg_final) if ok_final else st.error(msg_final)
+                if ok_final:
+                    st.rerun()
+
 
 elif page == "Etiquetas":
     st.subheader("Etiquetas Zebra 50x30")
@@ -1627,11 +2342,10 @@ elif page == "Etiquetas":
                     zpl_data = zpl_for_block(block).encode("utf-8")
                     fname = f"etiquetas_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
                     if printed:
-                        st.warning(f"Bloque {int(block['block_index'])} ya fue marcado como impreso. Si descargas nuevamente, quedará registrado como REIMPRESIÓN.")
-                        label = f"Reimprimir bloque {int(block['block_index'])} y registrar reimpresión"
+                        st.warning(f"Bloque {int(block['block_index'])} ya fue marcado como impreso. Para volver a imprimirlo usa la vista Reimpresión y registra motivo obligatorio.")
                     else:
                         label = f"Descargar ZPL bloque {int(block['block_index'])} y marcar como impreso"
-                    st.download_button(label, data=zpl_data, file_name=fname, mime="text/plain", key=f"download_block_{active_lote}_{block['block_index']}_{block['block_key']}", on_click=register_block_download, args=(active_lote, block))
+                        st.download_button(label, data=zpl_data, file_name=fname, mime="text/plain", key=f"download_block_{active_lote}_{block['block_index']}_{block['block_key']}", on_click=register_block_download, args=(active_lote, block))
                     with st.expander(f"Ver productos del bloque {int(block['block_index'])}"):
                         bdf = pd.DataFrame(block["items"])
                         show_cols = ["codigo_ml", "sku", "descripcion", "unidades", "printed_normal", "label_pending", "label_status"]
@@ -1689,6 +2403,33 @@ elif page == "Etiquetas":
                 })
                 cols = ["Código ML", "SKU", "Producto", "Unidades requeridas", "Etiquetas impresas", "Pendientes", "Estado etiquetas", "Inicio/Fin impresos", "Última impresión"]
                 st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
+
+elif page == "Auditoría":
+    st.subheader("Auditoría operacional")
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        eventos = get_audit_events(active_lote, limit=500)
+        if eventos.empty:
+            st.info("Aún no hay eventos de auditoría para este lote.")
+        else:
+            f_eventos = ["Todos"] + sorted([x for x in eventos["event_type"].dropna().unique().tolist()])
+            filtro_evento = st.selectbox("Filtrar evento", f_eventos)
+            show = eventos.copy()
+            if filtro_evento != "Todos":
+                show = show[show["event_type"] == filtro_evento]
+            show = show.rename(columns={
+                "created_at": "Fecha",
+                "event_type": "Evento",
+                "detail": "Detalle",
+                "qty": "Cantidad",
+                "codigo_ml": "Código ML",
+                "sku": "SKU",
+                "mode": "Modo",
+                "item_id": "Item ID",
+            })
+            st.dataframe(show, use_container_width=True, hide_index=True, height=650)
+            st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
 
 elif page == "Control":
     st.subheader("Control de lote")
