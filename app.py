@@ -1772,8 +1772,8 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    st.text_input("Usuario / operador", key="operator_name", placeholder="Ej: supervisor, p1, p2")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Incidencias", "Reimpresión", "Cierre de lote", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
+    # Usuario se solicita solo donde realmente corresponde: incidencia, reimpresión o cierre.
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -2079,7 +2079,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_pendientes, tab_incid, tab_bloques = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques"])
+        tab_resumen, tab_pendientes, tab_incid, tab_bloques, tab_reg_inc, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques", "Registrar incidencia", "Reimpresión", "Cierre"])
 
         with tab_resumen:
             view = items.copy()
@@ -2127,6 +2127,152 @@ elif page == "Supervisor":
             for b in expected:
                 rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if str(b["block_key"]) in printed_keys else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=520)
+
+        with tab_reg_inc:
+            st.caption("Registra y resuelve problemas operativos del lote sin salir del panel supervisor.")
+            view_inc = get_items(active_lote)
+            item_options = ["Incidencia general del lote"]
+            option_map = {"Incidencia general del lote": None}
+            if not view_inc.empty:
+                for _, r in view_inc.iterrows():
+                    label = f"{clean_text(r.get('descripcion',''))[:90]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
+                    item_options.append(label)
+                    option_map[label] = int(r["id"])
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                selected_inc = st.selectbox("Producto asociado", item_options, key="sup_inc_item")
+                tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="sup_inc_tipo")
+            with col_b:
+                qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="sup_inc_qty")
+                usuario_inc = st.text_input("Usuario responsable", key="sup_inc_usuario", placeholder="Ej: p1, p2, supervisor")
+            comentario_inc = st.text_area("Comentario", key="sup_inc_comentario", placeholder="Describe qué ocurrió y qué evidencia existe.")
+            if st.button("Registrar incidencia", type="primary", key="sup_registrar_inc"):
+                if not clean_text(usuario_inc):
+                    st.error("Ingresa el usuario responsable.")
+                elif len(clean_text(comentario_inc)) < 3:
+                    st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
+                else:
+                    create_incidencia(active_lote, option_map.get(selected_inc), tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
+                    st.success("Incidencia registrada.")
+                    st.rerun()
+
+            st.divider()
+            st.subheader("Incidencias abiertas")
+            inc_open = get_incidencias(active_lote, status="ABIERTA")
+            if inc_open.empty:
+                st.success("No hay incidencias abiertas.")
+            else:
+                for _, r in inc_open.iterrows():
+                    st.markdown(f"""
+                    <div class='control-card'>
+                        <div class='control-title'>{esc(r.get('tipo',''))} · {esc(r.get('descripcion','') or 'General del lote')}</div>
+                        <div class='control-meta'><b>Cantidad:</b> {int(r.get('cantidad') or 0)} · <b>Usuario:</b> {esc(r.get('usuario',''))} · <b>Fecha:</b> {esc(fmt_dt(r.get('created_at','')))}</div>
+                        <div>{esc(r.get('comentario',''))}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    with st.expander(f"Resolver incidencia #{int(r['id'])}"):
+                        res_user = st.text_input("Resuelto por", key=f"sup_res_user_{int(r['id'])}", placeholder="Ej: supervisor")
+                        res_comment = st.text_area("Comentario de resolución", key=f"sup_res_comment_{int(r['id'])}")
+                        if st.button("Marcar como resuelta", key=f"sup_resolve_{int(r['id'])}", type="primary"):
+                            if not clean_text(res_user):
+                                st.error("Ingresa quién resolvió la incidencia.")
+                            else:
+                                ok_res, msg_res = resolve_incidencia(int(r["id"]), res_user, res_comment)
+                                st.success(msg_res) if ok_res else st.error(msg_res)
+                                if ok_res:
+                                    st.rerun()
+
+        with tab_reimp:
+            st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
+            mode_rep = st.radio("Tipo de reimpresión", ["Bloque completo", "Producto individual"], horizontal=True, key="sup_rep_mode")
+            usuario_rep = st.text_input("Usuario que reimprime", key="sup_rep_usuario", placeholder="Ej: p1, p2, supervisor")
+            motivo_rep = st.text_area("Motivo obligatorio", key="sup_rep_motivo", placeholder="Ej: rollo se cortó a mitad de bloque, etiqueta dañada, impresora pausada, etc.")
+            if mode_rep == "Bloque completo":
+                view_rep = label_control_view(active_lote)
+                expected_rep = build_label_blocks(view_rep, int(capacity_sup)) if not view_rep.empty else []
+                blocks_db_rep = get_label_blocks_df(active_lote)
+                printed_keys_rep = set(blocks_db_rep["block_key"].astype(str).tolist()) if not blocks_db_rep.empty else set()
+                printed_blocks = [b for b in expected_rep if str(b["block_key"]) in printed_keys_rep]
+                if not printed_blocks:
+                    st.warning("Aún no hay bloques impresos para reimprimir.")
+                else:
+                    labels_rep = [f"Bloque {int(b['block_index'])} · {int(b['products_count'])} productos · {int(b['total_qty'])} etiquetas" for b in printed_blocks]
+                    map_blocks = {labels_rep[i]: printed_blocks[i] for i in range(len(labels_rep))}
+                    selected_block_label = st.selectbox("Bloque a reimprimir", labels_rep, key="sup_rep_block")
+                    block = map_blocks[selected_block_label]
+                    zpl_data = zpl_for_block(block).encode("utf-8")
+                    fname = f"reimpresion_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
+                    if clean_text(motivo_rep) and clean_text(usuario_rep):
+                        st.download_button("Descargar ZPL y registrar reimpresión", data=zpl_data, file_name=fname, mime="text/plain", key=f"sup_reprint_block_{active_lote}_{block['block_index']}_{block['block_key']}_{hashlib.sha1((clean_text(motivo_rep)+clean_text(usuario_rep)).encode()).hexdigest()[:8]}", on_click=register_controlled_block_reprint, args=(active_lote, block, motivo_rep, usuario_rep))
+                    else:
+                        st.warning("Ingresa usuario y motivo para habilitar descarga.")
+            else:
+                view_rep = label_control_view(active_lote)
+                options_rep = []
+                option_map_rep = {}
+                for _, r in view_rep.iterrows():
+                    label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
+                    options_rep.append(label)
+                    option_map_rep[label] = int(r["id"])
+                if not options_rep:
+                    st.warning("No hay productos.")
+                else:
+                    selected_item_label = st.selectbox("Producto a reimprimir", options_rep, key="sup_rep_item")
+                    item_id = option_map_rep[selected_item_label]
+                    row = view_rep[view_rep["id"].astype(int) == int(item_id)].iloc[0].to_dict()
+                    qty_rep = st.number_input("Cantidad de etiquetas normales", min_value=1, max_value=9999, value=1, step=1, key="sup_rep_qty")
+                    zpl_ind = zpl_for_item_with_separators(row, int(qty_rep)).encode("utf-8")
+                    fname_ind = f"reimpresion_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
+                    if clean_text(motivo_rep) and clean_text(usuario_rep):
+                        st.download_button("Descargar ZPL individual y registrar reimpresión", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"sup_reprint_item_{active_lote}_{item_id}_{qty_rep}_{hashlib.sha1((clean_text(motivo_rep)+clean_text(usuario_rep)).encode()).hexdigest()[:8]}", on_click=register_controlled_item_reprint, args=(active_lote, row, int(qty_rep), motivo_rep, usuario_rep))
+                    else:
+                        st.warning("Ingresa usuario y motivo para habilitar descarga.")
+            hist_rep = get_reimpresiones(active_lote)
+            if not hist_rep.empty:
+                st.divider()
+                st.subheader("Historial de reimpresiones")
+                out_rep = hist_rep.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
+                st.dataframe(out_rep, use_container_width=True, hide_index=True, height=320)
+
+        with tab_cierre:
+            lote_close = get_lote(active_lote)
+            ok_close2, issues2, data_close2 = cierre_validaciones(active_lote, int(capacity_sup))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Estado actual", clean_text(lote_close.get("status", "ACTIVO")))
+            c2.metric("Unidades pendientes", data_close2.get("pending_units", 0))
+            c3.metric("Incidencias abiertas", data_close2.get("open_incidents", 0))
+            c4.metric("Bloques", f"{data_close2.get('printed_blocks',0)}/{data_close2.get('expected_blocks',0)}")
+            if clean_text(lote_close.get("status")) == "CERRADO":
+                st.success(f"Lote cerrado por {clean_text(lote_close.get('closed_by',''))} el {fmt_dt(lote_close.get('closed_at',''))}.")
+                st.caption(clean_text(lote_close.get("close_note", "")))
+                with st.expander("Reabrir lote"):
+                    reopen_user = st.text_input("Usuario", key="sup_reopen_user", placeholder="Ej: supervisor")
+                    reopen_reason = st.text_area("Motivo de reapertura", key="sup_reopen_reason")
+                    if st.button("Reabrir lote", type="primary", key="sup_reopen_btn"):
+                        if not clean_text(reopen_user):
+                            st.error("Ingresa el usuario.")
+                        else:
+                            ok_reopen, msg_reopen = reopen_lote(active_lote, reopen_user, reopen_reason)
+                            st.success(msg_reopen) if ok_reopen else st.error(msg_reopen)
+                            if ok_reopen:
+                                st.rerun()
+            else:
+                if ok_close2:
+                    st.success("Validación correcta. El lote puede cerrarse.")
+                else:
+                    st.error("El lote no se puede cerrar todavía.")
+                    for issue in issues2:
+                        st.write(f"• {issue}")
+                close_user = st.text_input("Cerrado por", key="sup_close_user", placeholder="Ej: supervisor")
+                close_note = st.text_area("Nota de cierre", placeholder="Ej: lote revisado completo, sin diferencias abiertas.", key="sup_close_note")
+                if st.button("Cerrar lote", type="primary", disabled=not ok_close2, key="sup_close_btn"):
+                    if not clean_text(close_user):
+                        st.error("Ingresa quién cierra el lote.")
+                    else:
+                        ok_final, msg_final = close_lote(active_lote, close_user, close_note)
+                        st.success(msg_final) if ok_final else st.error(msg_final)
+                        if ok_final:
+                            st.rerun()
 
 
 elif page == "Incidencias":
