@@ -18,7 +18,7 @@ APP_TITLE = "Control FULL Aurora"
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "aurora_full_v3.db"
 MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
-DEFAULT_SHEETS_WEBHOOK_URL = https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec
+DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
