@@ -338,36 +338,18 @@ def init_db():
 # ============================================================
 
 def get_backup_webhook_url() -> str:
-    """URL de respaldo externo.
-    Prioridad real:
-    1) Streamlit Secrets: SHEETS_WEBHOOK_URL
-    2) Variable de entorno: SHEETS_WEBHOOK_URL
-    3) DEFAULT_SHEETS_WEBHOOK_URL del archivo
+    """URL definitiva de respaldo externo.
 
-    OJO: si no actualizas SHEETS_WEBHOOK_URL en Streamlit Cloud, la app puede seguir pegándole
-    a un Apps Script viejo aunque el código de Apps Script nuevo esté correcto.
+    Se usa solo la URL fija definida en DEFAULT_SHEETS_WEBHOOK_URL.
+    No se toman URLs desde Streamlit Secrets ni variables de entorno para evitar
+    que la app envíe eventos a un Apps Script antiguo por error.
     """
-    try:
-        url = st.secrets.get("SHEETS_WEBHOOK_URL", "")
-    except Exception:
-        url = ""
-    if not url:
-        url = os.environ.get("SHEETS_WEBHOOK_URL", "")
-    if not url:
-        url = DEFAULT_SHEETS_WEBHOOK_URL
-    return clean_text(url)
+    return clean_text(DEFAULT_SHEETS_WEBHOOK_URL)
 
 
 def get_backup_webhook_source() -> str:
-    try:
-        if clean_text(st.secrets.get("SHEETS_WEBHOOK_URL", "")):
-            return "Streamlit Secrets: SHEETS_WEBHOOK_URL"
-    except Exception:
-        pass
-    if clean_text(os.environ.get("SHEETS_WEBHOOK_URL", "")):
-        return "Variable de entorno: SHEETS_WEBHOOK_URL"
     if clean_text(DEFAULT_SHEETS_WEBHOOK_URL):
-        return "DEFAULT_SHEETS_WEBHOOK_URL dentro de app.py"
+        return "URL fija dentro de app.py"
     return "SIN URL CONFIGURADA"
 
 
