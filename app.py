@@ -339,7 +339,13 @@ def init_db():
 
 def get_backup_webhook_url() -> str:
     """URL de respaldo externo.
-    Prioridad: Streamlit Secrets, variable de entorno y URL integrada en este app.py.
+    Prioridad real:
+    1) Streamlit Secrets: SHEETS_WEBHOOK_URL
+    2) Variable de entorno: SHEETS_WEBHOOK_URL
+    3) DEFAULT_SHEETS_WEBHOOK_URL del archivo
+
+    OJO: si no actualizas SHEETS_WEBHOOK_URL en Streamlit Cloud, la app puede seguir pegándole
+    a un Apps Script viejo aunque el código de Apps Script nuevo esté correcto.
     """
     try:
         url = st.secrets.get("SHEETS_WEBHOOK_URL", "")
@@ -350,6 +356,28 @@ def get_backup_webhook_url() -> str:
     if not url:
         url = DEFAULT_SHEETS_WEBHOOK_URL
     return clean_text(url)
+
+
+def get_backup_webhook_source() -> str:
+    try:
+        if clean_text(st.secrets.get("SHEETS_WEBHOOK_URL", "")):
+            return "Streamlit Secrets: SHEETS_WEBHOOK_URL"
+    except Exception:
+        pass
+    if clean_text(os.environ.get("SHEETS_WEBHOOK_URL", "")):
+        return "Variable de entorno: SHEETS_WEBHOOK_URL"
+    if clean_text(DEFAULT_SHEETS_WEBHOOK_URL):
+        return "DEFAULT_SHEETS_WEBHOOK_URL dentro de app.py"
+    return "SIN URL CONFIGURADA"
+
+
+def mask_url(url: str) -> str:
+    url = clean_text(url)
+    if not url:
+        return ""
+    if len(url) <= 32:
+        return url
+    return url[:28] + "..." + url[-12:]
 
 
 def enqueue_backup_event(event_type: str, payload: dict):
@@ -646,6 +674,8 @@ def test_backup_webhook() -> tuple[bool, str]:
         "descripcion": "Evento de prueba de respaldo externo",
         "cantidad": 1,
         "modo": "TEST",
+        "tipo": "TEST",
+        "comentario": "Prueba manual desde botón Probar respaldo Sheets",
         "scan_primario": "TEST",
         "scan_secundario": "TEST",
         "operador": "",
@@ -1582,6 +1612,23 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
         )
         c.commit()
 
+    # Respaldo externo: antes las incidencias solo quedaban en SQLite/auditoría local.
+    # Este evento es el que el Apps Script usa para escribir en la hoja "incidencias".
+    enqueue_backup_event("incidencia_creada", {
+        **build_lote_payload(lote_id),
+        "item_id": int(item_id) if item_id else "",
+        "codigo_ml": norm_code(item.get("codigo_ml", "")),
+        "codigo_universal": norm_code(item.get("codigo_universal", "")),
+        "sku": norm_code(item.get("sku", "")),
+        "descripcion": clean_text(item.get("descripcion", "")),
+        "tipo": clean_text(tipo),
+        "cantidad": max(0, int(cantidad or 0)),
+        "comentario": clean_text(comentario),
+        "usuario": clean_text(usuario) or "SIN_USUARIO",
+        "status": "ABIERTA",
+        "created_at": now,
+    })
+
     log_audit_event(
         lote_id,
         int(item_id) if item_id else None,
@@ -1903,6 +1950,9 @@ with st.sidebar:
         active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
 
     st.divider()
+    current_webhook_url = get_backup_webhook_url()
+    st.caption(f"Webhook: {get_backup_webhook_source()}")
+    st.caption(f"URL activa: {mask_url(current_webhook_url)}")
     bs = backup_status()
     pending_backup = int(bs.get("pending") or 0)
     sent_backup = int(bs.get("sent") or 0)
@@ -1911,7 +1961,7 @@ with st.sidebar:
         if bs.get("last_error"):
             st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
         if st.button("Reintentar respaldo"):
-            flush_backup_queue(limit=100)
+            flush_backup_queue(limit=1000)
             st.rerun()
     else:
         st.success(f"Respaldo externo activo · enviados: {sent_backup}")
