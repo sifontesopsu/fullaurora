@@ -293,6 +293,11 @@ def init_db():
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
         ensure_column(c, "lotes", "close_note", "TEXT")
+        # Incidencias por código: se conserva lote_id para control/cierre, pero el operador registra por ML/EAN/SKU.
+        ensure_column(c, "incidencias", "codigo_ml", "TEXT")
+        ensure_column(c, "incidencias", "codigo_universal", "TEXT")
+        ensure_column(c, "incidencias", "sku", "TEXT")
+        ensure_column(c, "incidencias", "descripcion", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_reason", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_user", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
@@ -1406,67 +1411,47 @@ def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
 
 
 def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=None):
-    """Incidencias creadas desde terreno.
-    El operador reporta el problema en el mismo flujo de escaneo; supervisor solo gestiona/resuelve.
+    """Incidencias creadas desde Escaneo por código real del producto.
+    No se crean incidencias generales por lote: el operador debe indicar Etiqueta ML, Código Universal o SKU.
     """
-    current_item_id = None
-    current_label = ""
+    default_code = ""
     if current_item is not None:
         try:
-            current_item_id = int(current_item.get("id"))
-            current_label = f"Producto actual: {clean_text(current_item.get('descripcion',''))[:80]} | ML {clean_text(current_item.get('codigo_ml',''))} | SKU {clean_text(current_item.get('sku',''))}"
+            default_code = norm_code(current_item.get("codigo_ml", "")) or norm_code(current_item.get("codigo_universal", "")) or norm_code(current_item.get("sku", ""))
         except Exception:
-            current_item_id = None
-            current_label = ""
+            default_code = ""
 
-    with st.expander("Reportar incidencia", expanded=False):
-        st.caption("Usa esto en el momento exacto del problema. Queda registrado para que Supervisor lo resuelva antes del cierre.")
-        source_options = []
-        option_map = {}
-        if current_item_id:
-            source_options.append(current_label)
-            option_map[current_label] = current_item_id
-        source_options.append("Incidencia general del lote")
-        option_map["Incidencia general del lote"] = None
-
-        if items is not None and not items.empty:
-            source_options.append("Seleccionar otro producto")
-
+    with st.expander("Reportar incidencia por código", expanded=False):
+        st.caption("Escanea o ingresa Etiqueta ML, Código Universal/EAN o SKU. La incidencia quedará asociada al producto encontrado en el lote activo.")
         with st.form("scan_incident_form", clear_on_submit=True):
-            selected_source = st.radio("Asociar incidencia a", source_options, horizontal=False, key="scan_inc_source")
-            selected_item_id = option_map.get(selected_source)
-
-            if selected_source == "Seleccionar otro producto":
-                choices = []
-                choice_map = {}
-                work = items.copy()
-                work["pendiente"] = (work["unidades"].astype(int) - work["acopiadas"].astype(int)).clip(lower=0)
-                work = work.sort_values(["pendiente", "descripcion"], ascending=[False, True])
-                for _, r in work.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:75]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))} | Pend: {int(r.get('pendiente') or 0)}"
-                    choices.append(label)
-                    choice_map[label] = int(r["id"])
-                picked = st.selectbox("Producto", choices, key="scan_inc_item_select") if choices else None
-                selected_item_id = choice_map.get(picked) if picked else None
-
+            codigo_inc = st.text_input(
+                "Etiqueta ML / Código Universal / SKU",
+                value=default_code,
+                key="scan_inc_codigo",
+                placeholder="Escanea o escribe el código afectado",
+            )
             c1, c2 = st.columns([2, 1])
             with c1:
                 tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="scan_inc_tipo")
             with c2:
                 qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="scan_inc_qty")
-            usuario_inc = st.text_input("Usuario que reporta", key="scan_inc_usuario", placeholder="Ej: p1, p2, supervisor")
-            comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, etc.")
+            comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, mal embalaje, etc.")
             submit_inc = st.form_submit_button("Guardar incidencia", type="primary")
 
         if submit_inc:
-            if not clean_text(usuario_inc):
-                st.error("Ingresa el usuario que reporta la incidencia.")
-            elif len(clean_text(comentario_inc)) < 3:
-                st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
-            else:
-                create_incidencia(lote_id, selected_item_id, tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
-                st.success("Incidencia registrada para revisión de Supervisor.")
+            ok_inc, msg_inc = create_incidencia_por_codigo(
+                lote_id,
+                codigo_inc,
+                tipo_inc,
+                int(qty_inc),
+                comentario_inc,
+                "SIN_USUARIO",
+            )
+            if ok_inc:
+                st.success(msg_inc)
                 st.rerun()
+            else:
+                st.error(msg_inc)
 
 
 # ============================================================
@@ -1476,11 +1461,11 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
 INCIDENCIA_TIPOS = [
     "Falta producto",
     "Producto dañado",
+    "Producto mal embalado",
     "Código no coincide",
     "Cantidad menor",
     "Cantidad mayor",
     "Etiqueta dañada",
-    "Problema de impresión",
     "Otro",
 ]
 
@@ -1504,7 +1489,11 @@ def get_incidencias(lote_id=None, status=None) -> pd.DataFrame:
             f"""
             SELECT inc.id, inc.created_at, inc.lote_id, inc.item_id, inc.tipo, inc.cantidad,
                    inc.comentario, inc.usuario, inc.status, inc.resolved_at, inc.resolved_by,
-                   inc.resolution_comment, i.codigo_ml, i.sku, i.descripcion
+                   inc.resolution_comment,
+                   COALESCE(i.codigo_ml, inc.codigo_ml, '') AS codigo_ml,
+                   COALESCE(i.codigo_universal, inc.codigo_universal, '') AS codigo_universal,
+                   COALESCE(i.sku, inc.sku, '') AS sku,
+                   COALESCE(i.descripcion, inc.descripcion, '') AS descripcion
             FROM incidencias inc
             LEFT JOIN items i ON i.id=inc.item_id
             {sql_where}
@@ -1513,6 +1502,32 @@ def get_incidencias(lote_id=None, status=None) -> pd.DataFrame:
             c,
             params=params,
         )
+
+
+def find_item_for_incidencia(lote_id: int, codigo: str) -> dict:
+    """Busca el producto afectado por Etiqueta ML, Código Universal/EAN o SKU."""
+    cn = norm_code(codigo)
+    if not cn:
+        return {}
+    sku_master = norm_code(maestro_lookup(cn))
+    with db() as c:
+        row = c.execute(
+            """
+            SELECT *
+            FROM items
+            WHERE lote_id=?
+              AND (
+                    UPPER(COALESCE(codigo_ml,''))=?
+                 OR UPPER(COALESCE(codigo_universal,''))=?
+                 OR UPPER(COALESCE(sku,''))=?
+                 OR (?<>'' AND UPPER(COALESCE(sku,''))=?)
+              )
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (int(lote_id), cn, cn, cn, sku_master, sku_master),
+        ).fetchone()
+    return dict(row) if row else {}
 
 
 def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentario: str, usuario: str):
@@ -1526,8 +1541,9 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
         c.execute(
             """
             INSERT INTO incidencias
-            (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'ABIERTA', ?)
+            (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
+             codigo_ml, codigo_universal, sku, descripcion)
+            VALUES (?, ?, ?, ?, ?, ?, 'ABIERTA', ?, ?, ?, ?, ?)
             """,
             (
                 int(lote_id),
@@ -1537,6 +1553,10 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
                 clean_text(comentario),
                 clean_text(usuario) or "SIN_USUARIO",
                 now,
+                norm_code(item.get("codigo_ml", "")),
+                norm_code(item.get("codigo_universal", "")),
+                norm_code(item.get("sku", "")),
+                clean_text(item.get("descripcion", "")),
             ),
         )
         c.commit()
@@ -1551,6 +1571,20 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
         item.get("sku", ""),
         clean_text(usuario) or "SIN_USUARIO",
     )
+
+
+def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad: int, comentario: str, usuario: str = "SIN_USUARIO"):
+    """Crea incidencia desde Escaneo usando Etiqueta ML / Código Universal / SKU."""
+    codigo_norm = norm_code(codigo)
+    if not codigo_norm:
+        return False, "Ingresa una Etiqueta ML, Código Universal o SKU."
+    item = find_item_for_incidencia(lote_id, codigo_norm)
+    if not item:
+        return False, "No encontré ese código en el lote activo. Revisa Etiqueta ML, Código Universal o SKU."
+    if len(clean_text(comentario)) < 3:
+        return False, "Agrega un comentario mínimo para que la incidencia sea útil."
+    create_incidencia(lote_id, int(item["id"]), tipo, int(cantidad or 0), comentario, usuario or "SIN_USUARIO")
+    return True, f"Incidencia registrada para SKU {clean_text(item.get('sku',''))}."
 
 
 def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
@@ -1837,7 +1871,6 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    # Usuario se solicita solo donde realmente corresponde: incidencia, reimpresión o cierre.
     page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
@@ -2296,25 +2329,18 @@ elif page == "Incidencias":
         items = get_items(active_lote)
         tab_new, tab_open, tab_all = st.tabs(["Nueva incidencia", "Abiertas", "Historial"])
         with tab_new:
-            st.info("Registra problemas reales del lote: faltantes, daños, códigos que no coinciden o problemas de impresión.")
-            options = ["General del lote"]
-            option_map = {"General del lote": None}
-            for _, r in items.iterrows():
-                label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                options.append(label)
-                option_map[label] = int(r["id"])
-            selected_inc = st.selectbox("Producto afectado", options, index=0)
+            st.info("Registra la incidencia por Etiqueta ML, Código Universal/EAN o SKU. No se crean incidencias generales por lote.")
+            codigo_inc = st.text_input("Etiqueta ML / Código Universal / SKU", key="inc_codigo_manual")
             tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS)
             qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=99999, value=1, step=1)
             comentario_inc = st.text_area("Comentario", placeholder="Describe qué ocurrió y qué evidencia existe.")
-            usuario_inc = st.text_input("Usuario responsable del registro", value=get_operator_name(), key="inc_usuario")
             if st.button("Registrar incidencia", type="primary"):
-                if len(clean_text(comentario_inc)) < 3:
-                    st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
-                else:
-                    create_incidencia(active_lote, option_map.get(selected_inc), tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
-                    st.success("Incidencia registrada.")
+                ok_inc, msg_inc = create_incidencia_por_codigo(active_lote, codigo_inc, tipo_inc, int(qty_inc), comentario_inc, "SIN_USUARIO")
+                if ok_inc:
+                    st.success(msg_inc)
                     st.rerun()
+                else:
+                    st.error(msg_inc)
         with tab_open:
             inc = get_incidencias(active_lote, status="ABIERTA")
             if inc.empty:
