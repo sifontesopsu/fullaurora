@@ -469,6 +469,71 @@ def get_backup_events_from_sheets():
     except Exception as e:
         return False, [], f"No pude leer respaldo externo: {e}"
 
+def get_backup_webhook_json(action: str, extra_params: dict | None = None, timeout: int = 20) -> tuple[bool, dict, str]:
+    """Consulta Apps Script y exige respuesta JSON válida.
+
+    Se usa para diagnóstico de producción: no basta con recibir HTTP 200;
+    necesitamos confirmar que el Web App está leyendo la misma planilla donde escribe.
+    """
+    url = get_backup_webhook_url()
+    if not url:
+        return False, {}, "No hay SHEETS_WEBHOOK_URL configurada."
+    params = {"action": action}
+    if extra_params:
+        params.update(extra_params)
+    sep = "&" if "?" in url else "?"
+    read_url = f"{url}{sep}{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(read_url, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            text = resp.read().decode("utf-8", errors="replace")
+        if status < 200 or status >= 300:
+            return False, {}, f"HTTP {status}: {text[:300]}"
+        try:
+            data = json.loads(text)
+        except Exception:
+            return False, {}, f"Respuesta no JSON desde Apps Script: {text[:300]}"
+        if data.get("ok") is not True:
+            return False, data, f"Apps Script respondió ok=false: {text[:500]}"
+        return True, data, text[:500]
+    except Exception as e:
+        return False, {}, f"No pude conectar con Apps Script: {e}"
+
+
+def confirm_event_in_sheets(event_key: str) -> tuple[bool, str]:
+    """Confirma que un event_key existe en el respaldo permanente.
+
+    Este chequeo evita el falso positivo: 'Prueba enviada' aunque la fila
+    no aparezca en Sheets o el Web App apunte a otra implementación.
+    """
+    ok, data, detail = get_backup_webhook_json("find_event", {"event_key": event_key}, timeout=20)
+    if not ok:
+        return False, detail
+    if data.get("found") is True:
+        sheet_name = clean_text(data.get("sheet_name", "")) or "primera hoja"
+        row_number = data.get("row_number", "")
+        spreadsheet_url = clean_text(data.get("spreadsheet_url", ""))
+        msg = f"Confirmado en Sheets · hoja: {sheet_name} · fila: {row_number}"
+        if spreadsheet_url:
+            msg += f" · {spreadsheet_url}"
+        return True, msg
+    return False, "Apps Script respondió ok, pero el event_key no apareció al releer Sheets. Revisa que hayas implementado la versión nueva del Apps Script y que la URL del Web App sea la misma que usa Streamlit."
+
+
+def get_backup_health() -> tuple[bool, str]:
+    ok, data, detail = get_backup_webhook_json("health", timeout=15)
+    if not ok:
+        return False, detail
+    sheet_name = clean_text(data.get("sheet_name", "")) or "primera hoja"
+    last_row = data.get("last_row", "")
+    spreadsheet_url = clean_text(data.get("spreadsheet_url", ""))
+    msg = f"Conectado a hoja: {sheet_name} · filas actuales: {last_row}"
+    if spreadsheet_url:
+        msg += f" · {spreadsheet_url}"
+    return True, msg
+
+
+
 def local_lotes_count():
     with db() as c:
         row = c.execute("SELECT COUNT(*) AS n FROM lotes").fetchone()
@@ -828,9 +893,15 @@ def test_backup_webhook() -> tuple[bool, str]:
     url = get_backup_webhook_url()
     if not url:
         return False, "No hay SHEETS_WEBHOOK_URL configurada."
+
+    health_ok, health_msg = get_backup_health()
+    if not health_ok:
+        return False, f"El Web App no pasó health check: {health_msg}"
+
     now = datetime.now().isoformat(timespec="seconds")
+    event_key = f"test_webhook:{now}"
     event = {
-        "event_key": f"test_webhook:{now}",
+        "event_key": event_key,
         "event_type": "test_webhook",
         "created_at": now,
         "lote_id": "TEST",
@@ -850,7 +921,15 @@ def test_backup_webhook() -> tuple[bool, str]:
         "dispositivo": "",
     }
     try:
-        return send_webhook_event(url, event)
+        ok, send_detail = send_webhook_event(url, event)
+        if not ok:
+            return False, send_detail
+
+        confirmed, confirm_msg = confirm_event_in_sheets(event_key)
+        if not confirmed:
+            return False, f"Apps Script aceptó el POST, pero no pude confirmar escritura. {confirm_msg}"
+
+        return True, f"{confirm_msg}. Health: {health_msg}"
     except Exception as e:
         return False, f"No pude conectar con Apps Script: {e}"
 
@@ -2166,9 +2245,10 @@ with st.sidebar:
     if st.button("Probar respaldo Sheets"):
         ok_test, detail_test = test_backup_webhook()
         if ok_test:
-            st.success("Prueba enviada a Google Sheets.")
+            st.success("Prueba confirmada en Google Sheets.")
+            st.caption(detail_test[:600])
         else:
-            st.error(f"Falló prueba Sheets: {detail_test[:250]}")
+            st.error(f"Falló prueba Sheets: {detail_test[:600]}")
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
