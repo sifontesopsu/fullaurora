@@ -1892,7 +1892,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 with st.sidebar:
     st.header("Menú")
     # Usuario se solicita solo donde realmente corresponde: incidencia, reimpresión o cierre.
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -2200,7 +2200,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_pendientes, tab_incid, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques", "Reimpresión", "Cierre"])
+        tab_resumen, tab_pendientes, tab_incid, tab_control, tab_auditoria, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Control", "Auditoría", "Bloques", "Reimpresión", "Cierre"])
 
         with tab_resumen:
             view = items.copy()
@@ -2238,6 +2238,129 @@ elif page == "Supervisor":
                 out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
                 cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "SKU", "Producto", "Comentario", "Usuario"]
                 st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
+
+        with tab_control:
+            st.subheader("Control de lote")
+            if items.empty:
+                st.warning("El lote no tiene productos.")
+            else:
+                view = items.copy()
+                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+                view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
+                scans = get_last_scans(active_lote)
+                if not scans.empty:
+                    view = view.merge(scans, left_on="id", right_on="item_id", how="left")
+                else:
+                    view["procesado_at"] = ""
+
+                c1, c2, c3, c4 = st.columns(4)
+                total_control = int(view["unidades"].sum())
+                done_control = int(view["acopiadas"].sum())
+                c1.metric("Unidades", total_control)
+                c2.metric("Acopiadas", done_control)
+                c3.metric("Pendientes", max(total_control - done_control, 0))
+                c4.metric("Avance", f"{(done_control / total_control * 100) if total_control else 0:.1f}%")
+
+                filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"], key="sup_control_filter")
+                show = view
+                if filtro == "Pendientes":
+                    show = view[view["pendiente"] > 0]
+                elif filtro == "Completos":
+                    show = view[view["pendiente"] == 0]
+                elif filtro == "Supermercado":
+                    show = view[view["identificacion"].map(is_supermercado)]
+
+                option_rows = []
+                option_map = {"": None}
+                for _, sr in show.iterrows():
+                    desc = clean_text(sr.get("descripcion", ""))
+                    sku = clean_text(sr.get("sku", ""))
+                    ml = clean_text(sr.get("codigo_ml", ""))
+                    ean = clean_text(sr.get("codigo_universal", ""))
+                    ident = clean_text(sr.get("identificacion", ""))
+                    label = f"{desc} | SKU {sku} | ML {ml} | EAN {ean} | {ident}"[:180]
+                    option_rows.append(label)
+                    option_map[label] = int(sr["id"])
+
+                selected_search = st.selectbox(
+                    "Buscar producto",
+                    [""] + option_rows,
+                    index=0,
+                    placeholder="Escribe nombre, SKU, Código ML, EAN o supermercado",
+                    key="sup_control_search_select",
+                )
+                selected_id = option_map.get(selected_search)
+                if selected_id:
+                    show = show[show["id"].astype(int) == int(selected_id)]
+
+                st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
+                modo_vista = st.radio("Vista control", ["Tarjetas operativas", "Tabla"], horizontal=True, key="sup_control_view_mode")
+                if modo_vista == "Tarjetas operativas":
+                    for _, r in show.iterrows():
+                        ident = clean_text(r.get("identificacion", ""))
+                        vence = clean_text(r.get("vence", ""))
+                        proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
+                        badges_parts = [
+                            f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
+                            f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
+                            f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
+                        ]
+                        if ident:
+                            badges_parts.append(f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>")
+                        if vence:
+                            badges_parts.append(f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>")
+                        badges_parts.append(f"<span class='badge'>Procesado: {esc(proc)}</span>")
+                        st.markdown(
+                            f"""
+                            <div class='control-card'>
+                                <div class='control-title'>{esc(r['descripcion'])}</div>
+                                <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
+                                <div>{''.join(badges_parts)}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    out = show.copy()
+                    out["Procesado"] = out["procesado_at"].map(fmt_dt)
+                    out = out.rename(columns={
+                        "sku": "SKU", "codigo_ml": "Código ML", "codigo_universal": "EAN / Código universal",
+                        "descripcion": "Producto", "unidades": "Unidades", "acopiadas": "Acopiadas", "pendiente": "Pendiente",
+                        "identificacion": "Identificación", "vence": "Vence", "estado": "Estado"
+                    })
+                    cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Identificación", "Vence", "Procesado", "Estado"]
+                    st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
+
+                st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="sup_export_control_excel")
+                st.divider()
+                if st.button("Eliminar lote activo", key="sup_delete_lote"):
+                    delete_lote(active_lote)
+                    st.success("Lote eliminado.")
+                    st.rerun()
+
+        with tab_auditoria:
+            st.subheader("Auditoría operacional")
+            eventos = get_audit_events(active_lote, limit=500)
+            if eventos.empty:
+                st.info("Aún no hay eventos de auditoría para este lote.")
+            else:
+                f_eventos = ["Todos"] + sorted([x for x in eventos["event_type"].dropna().unique().tolist()])
+                filtro_evento = st.selectbox("Filtrar evento", f_eventos, key="sup_audit_filter")
+                show_audit = eventos.copy()
+                if filtro_evento != "Todos":
+                    show_audit = show_audit[show_audit["event_type"] == filtro_evento]
+                show_audit = show_audit.rename(columns={
+                    "created_at": "Fecha",
+                    "event_type": "Evento",
+                    "detail": "Detalle",
+                    "qty": "Cantidad",
+                    "codigo_ml": "Código ML",
+                    "sku": "SKU",
+                    "mode": "Modo",
+                    "item_id": "Item ID",
+                })
+                st.dataframe(show_audit, use_container_width=True, hide_index=True, height=650)
+                st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
 
         with tab_bloques:
             labels = label_control_view(active_lote)
