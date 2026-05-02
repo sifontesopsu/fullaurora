@@ -142,10 +142,31 @@ def is_supermercado(v) -> bool:
 # ============================================================
 
 def ensure_column(conn, table: str, column: str, definition: str):
-    """Agrega una columna si no existe. Evita romper bases SQLite antiguas."""
-    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in cols:
+    """Agrega una columna si no existe.
+
+    Migración defensiva para Streamlit Cloud:
+    - si la columna ya existe, no hace nada;
+    - si SQLite igual responde "duplicate column name" por una base parcial/antigua, lo ignora;
+    - si el error es otro, lo vuelve a levantar para no esconder problemas reales.
+    """
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        cols = set()
+        for r in rows:
+            try:
+                cols.add(str(r["name"]))
+            except Exception:
+                cols.add(str(r[1]))
+
+        if column in cols:
+            return
+
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "duplicate column name" in msg or "already exists" in msg:
+            return
+        raise
 
 
 def init_db():
