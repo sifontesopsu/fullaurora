@@ -3,12 +3,13 @@ import re
 import html
 import hashlib
 import json
+import hashlib
 import os
 import sqlite3
 import threading
 import urllib.request
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -290,13 +291,6 @@ def init_db():
             )
         """)
         ensure_column(c, "backup_queue", "event_key", "TEXT")
-        ensure_column(c, "backup_queue", "claimed_at", "TEXT")
-        ensure_column(c, "audit_events", "event_key", "TEXT")
-        ensure_column(c, "audit_events", "usuario", "TEXT")
-        ensure_column(c, "audit_events", "source_module", "TEXT")
-        ensure_column(c, "audit_events", "before_json", "TEXT")
-        ensure_column(c, "audit_events", "after_json", "TEXT")
-        ensure_column(c, "audit_events", "synced_to_sheets", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -309,7 +303,6 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_sku ON items (lote_id, sku)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_scans_lote ON scans (lote_id, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_audit_lote ON audit_events (lote_id, created_at)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_event_key ON audit_events (event_key) WHERE event_key IS NOT NULL AND event_key != ''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_incidencias_lote ON incidencias (lote_id, status, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_reimpresiones_lote ON reimpresiones (lote_id, created_at)")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_queue_event_key ON backup_queue (event_key) WHERE event_key IS NOT NULL AND event_key != ''")
@@ -350,11 +343,6 @@ def backup_event_key(event_type: str, payload: dict) -> str:
     if event_type in {"scan_agregado", "scan_deshacer"}:
         # Estos eventos sí pueden repetirse operativamente, por eso llevan timestamp + datos del movimiento.
         return f"{event_type}:{payload.get('lote_id')}:{payload.get('item_id')}:{payload.get('created_at')}:{payload.get('cantidad')}:{payload.get('scan_primario')}:{payload.get('scan_secundario')}"
-    if event_type == "audit_event":
-        # La auditoría tiene su propia clave única; si llega duplicada por rerun, no entra dos veces.
-        key = clean_text(payload.get("event_key", ""))
-        if key:
-            return key
     base = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return f"{event_type}:{hashlib.sha1(base.encode('utf-8')).hexdigest()}"
 
@@ -444,94 +432,9 @@ def get_backup_events_from_sheets():
         data = json.loads(text)
         if data.get("ok") is not True:
             return False, [], f"Apps Script respondió error: {text[:500]}"
-
-        # Compatibilidad: Apps Script nuevo puede devolver columnas planas;
-        # versiones anteriores devuelven raw_json/payload_json. Siempre normalizamos
-        # a un evento operativo completo para reconstruir SQLite correctamente.
-        normalized = []
-        for ev in data.get("events") or []:
-            if not isinstance(ev, dict):
-                continue
-            merged = dict(ev)
-            for raw_field in ("payload_json", "raw_json"):
-                raw = clean_text(merged.get(raw_field, ""))
-                if not raw:
-                    continue
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        # El JSON original manda; las columnas quedan como respaldo.
-                        merged.update(parsed)
-                except Exception:
-                    pass
-            normalized.append(merged)
-        return True, normalized, f"Eventos leídos: {len(normalized)}"
+        return True, data.get("events") or [], f"Eventos leídos: {len(data.get('events') or [])}"
     except Exception as e:
         return False, [], f"No pude leer respaldo externo: {e}"
-
-def get_backup_webhook_json(action: str, extra_params: dict | None = None, timeout: int = 20) -> tuple[bool, dict, str]:
-    """Consulta Apps Script y exige respuesta JSON válida.
-
-    Se usa para diagnóstico de producción: no basta con recibir HTTP 200;
-    necesitamos confirmar que el Web App está leyendo la misma planilla donde escribe.
-    """
-    url = get_backup_webhook_url()
-    if not url:
-        return False, {}, "No hay SHEETS_WEBHOOK_URL configurada."
-    params = {"action": action}
-    if extra_params:
-        params.update(extra_params)
-    sep = "&" if "?" in url else "?"
-    read_url = f"{url}{sep}{urllib.parse.urlencode(params)}"
-    try:
-        with urllib.request.urlopen(read_url, timeout=timeout) as resp:
-            status = getattr(resp, "status", None) or resp.getcode()
-            text = resp.read().decode("utf-8", errors="replace")
-        if status < 200 or status >= 300:
-            return False, {}, f"HTTP {status}: {text[:300]}"
-        try:
-            data = json.loads(text)
-        except Exception:
-            return False, {}, f"Respuesta no JSON desde Apps Script: {text[:300]}"
-        if data.get("ok") is not True:
-            return False, data, f"Apps Script respondió ok=false: {text[:500]}"
-        return True, data, text[:500]
-    except Exception as e:
-        return False, {}, f"No pude conectar con Apps Script: {e}"
-
-
-def confirm_event_in_sheets(event_key: str) -> tuple[bool, str]:
-    """Confirma que un event_key existe en el respaldo permanente.
-
-    Este chequeo evita el falso positivo: 'Prueba enviada' aunque la fila
-    no aparezca en Sheets o el Web App apunte a otra implementación.
-    """
-    ok, data, detail = get_backup_webhook_json("find_event", {"event_key": event_key}, timeout=20)
-    if not ok:
-        return False, detail
-    if data.get("found") is True:
-        sheet_name = clean_text(data.get("sheet_name", "")) or "primera hoja"
-        row_number = data.get("row_number", "")
-        spreadsheet_url = clean_text(data.get("spreadsheet_url", ""))
-        msg = f"Confirmado en Sheets · hoja: {sheet_name} · fila: {row_number}"
-        if spreadsheet_url:
-            msg += f" · {spreadsheet_url}"
-        return True, msg
-    return False, "Apps Script respondió ok, pero el event_key no apareció al releer Sheets. Revisa que hayas implementado la versión nueva del Apps Script y que la URL del Web App sea la misma que usa Streamlit."
-
-
-def get_backup_health() -> tuple[bool, str]:
-    ok, data, detail = get_backup_webhook_json("health", timeout=15)
-    if not ok:
-        return False, detail
-    sheet_name = clean_text(data.get("sheet_name", "")) or "primera hoja"
-    last_row = data.get("last_row", "")
-    spreadsheet_url = clean_text(data.get("spreadsheet_url", ""))
-    msg = f"Conectado a hoja: {sheet_name} · filas actuales: {last_row}"
-    if spreadsheet_url:
-        msg += f" · {spreadsheet_url}"
-    return True, msg
-
 
 
 def local_lotes_count():
@@ -541,11 +444,6 @@ def local_lotes_count():
 
 
 def restore_from_backup_if_empty():
-    """Reconstruye SQLite desde Sheets cuando Streamlit despierta sin base local.
-
-    Sheets se trata como memoria permanente/event log. La reconstrucción es idempotente:
-    ignora eventos repetidos por event_key o por una firma estable del movimiento.
-    """
     if local_lotes_count() > 0:
         return False, "Base local con datos; no se restaura."
     ok, events, msg = get_backup_events_from_sheets()
@@ -559,44 +457,12 @@ def restore_from_backup_if_empty():
     deleted_lotes = set()
     movement_by_item = {}
     scan_rows = []
-    audit_rows = []
-    incidencias_rows = []
-    lote_status_events = []
-    seen = set()
-    seen_scans = set()
-    seen_audit = set()
-    seen_incid = set()
-
-    def event_signature(ev: dict) -> str:
-        ek = clean_text(ev.get("event_key", ""))
-        if ek:
-            return ek
-        # Firma estable para proteger restauración contra duplicados históricos en Sheets.
-        base = json.dumps(ev, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()
-
-    def split_incident_detail(detail: str) -> tuple[str, str]:
-        txt = clean_text(detail)
-        if "·" in txt:
-            a, b = txt.split("·", 1)
-            return clean_text(a), clean_text(b)
-        return txt or "Incidencia", ""
 
     for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        sig = event_signature(ev)
-        if sig in seen:
-            continue
-        seen.add(sig)
-
         et = clean_text(ev.get("event_type", ""))
         try:
             lote_id = int(ev.get("lote_id"))
         except Exception:
-            lote_id = None
-
-        if lote_id is None and et not in {"test_webhook"}:
             continue
 
         if et == "lote_creado":
@@ -606,7 +472,6 @@ def restore_from_backup_if_empty():
                 "archivo": clean_text(ev.get("archivo", "")),
                 "hoja": clean_text(ev.get("hoja", "")),
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                "status": "ACTIVO",
             }
         elif et == "lote_item":
             try:
@@ -632,7 +497,6 @@ def restore_from_backup_if_empty():
                 "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
             }
         elif et == "lote_snapshot_chunk":
-            # Compatibilidad con respaldos viejos.
             items = ev.get("items") or []
             for item_ev in items:
                 try:
@@ -663,10 +527,6 @@ def restore_from_backup_if_empty():
                 qty = int(ev.get("cantidad") or 0)
             except Exception:
                 continue
-            scan_sig = clean_text(ev.get("event_key", "")) or f"scan_agregado:{lote_id}:{item_id}:{clean_text(ev.get('created_at',''))}:{qty}:{norm_code(ev.get('scan_primario',''))}:{norm_code(ev.get('scan_secundario',''))}"
-            if scan_sig in seen_scans:
-                continue
-            seen_scans.add(scan_sig)
             movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
             scan_rows.append((lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")), qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds")))
         elif et == "scan_deshacer":
@@ -675,49 +535,9 @@ def restore_from_backup_if_empty():
                 qty = int(ev.get("cantidad") or 0)
             except Exception:
                 continue
-            undo_sig = clean_text(ev.get("event_key", "")) or f"scan_deshacer:{lote_id}:{item_id}:{clean_text(ev.get('created_at',''))}:{qty}:{norm_code(ev.get('scan_primario',''))}:{norm_code(ev.get('scan_secundario',''))}"
-            if undo_sig in seen_scans:
-                continue
-            seen_scans.add(undo_sig)
             movement_by_item[item_id] = movement_by_item.get(item_id, 0) - qty
         elif et == "lote_eliminado":
             deleted_lotes.add(lote_id)
-        elif et == "audit_event":
-            audit_key = clean_text(ev.get("event_key", "")) or sig
-            if audit_key in seen_audit:
-                continue
-            seen_audit.add(audit_key)
-            audit_type = clean_text(ev.get("audit_type", "")) or clean_text(ev.get("audit_event_type", "")) or "AUDIT_EVENT"
-            created = clean_text(ev.get("created_at", "")) or clean_text(ev.get("audit_created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds")
-            item_id_val = None
-            try:
-                if clean_text(ev.get("item_id", "")):
-                    item_id_val = int(ev.get("item_id"))
-            except Exception:
-                item_id_val = None
-            qty_val = None
-            try:
-                if clean_text(ev.get("qty", "")):
-                    qty_val = int(float(ev.get("qty")))
-            except Exception:
-                qty_val = None
-            audit_rows.append((
-                lote_id, item_id_val, audit_type, clean_text(ev.get("detail", "")), qty_val,
-                norm_code(ev.get("codigo_ml", "")), norm_code(ev.get("sku", "")), clean_text(ev.get("mode", "")), created,
-                audit_key, clean_text(ev.get("usuario", "")), clean_text(ev.get("source_module", "")),
-                clean_text(ev.get("before_json", "")), clean_text(ev.get("after_json", "")), 1,
-            ))
-            if audit_type == "INCIDENCIA_ABIERTA":
-                inc_sig = audit_key
-                if inc_sig not in seen_incid:
-                    seen_incid.add(inc_sig)
-                    tipo, comentario = split_incident_detail(clean_text(ev.get("detail", "")))
-                    incidencias_rows.append((lote_id, item_id_val, tipo, qty_val or 0, comentario, clean_text(ev.get("usuario", "")) or clean_text(ev.get("mode", "")) or "SIN_USUARIO", "ABIERTA", created, None, None, None))
-            elif audit_type == "INCIDENCIA_RESUELTA":
-                # Se refleja de forma conservadora: deja un registro de resolución en auditoría.
-                pass
-            elif audit_type in {"LOTE_CERRADO", "LOTE_REABIERTO"}:
-                lote_status_events.append((created, lote_id, audit_type, clean_text(ev.get("usuario", "")) or clean_text(ev.get("mode", "")), clean_text(ev.get("detail", ""))))
 
     active_lote_ids = [lid for lid in lotes if lid not in deleted_lotes and items_by_lote.get(lid)]
     if not active_lote_ids:
@@ -729,11 +549,7 @@ def restore_from_backup_if_empty():
     with db() as c:
         for lid in sorted(active_lote_ids):
             lote = lotes[lid]
-            c.execute("""
-                INSERT OR REPLACE INTO lotes
-                (id, nombre, archivo, hoja, created_at, status, closed_at, closed_by, close_note)
-                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT status FROM lotes WHERE id=?), 'ACTIVO'), NULL, NULL, NULL)
-            """, (lote["id"], lote["nombre"], lote["archivo"], lote["hoja"], lote["created_at"], lote["id"]))
+            c.execute("INSERT OR REPLACE INTO lotes (id, nombre, archivo, hoja, created_at) VALUES (?, ?, ?, ?, ?)", (lote["id"], lote["nombre"], lote["archivo"], lote["hoja"], lote["created_at"]))
             restored_lotes += 1
             for item in items_by_lote[lid].values():
                 qty = max(0, min(int(item["unidades"]), int(movement_by_item.get(int(item["id"]), 0))))
@@ -749,62 +565,24 @@ def restore_from_backup_if_empty():
         for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at in scan_rows:
             if lote_id in active_lote_ids and cantidad > 0:
                 c.execute("INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at))
-        for row in audit_rows:
-            if row[0] in active_lote_ids:
-                c.execute("""
-                    INSERT OR IGNORE INTO audit_events
-                    (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at,
-                     event_key, usuario, source_module, before_json, after_json, synced_to_sheets)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, row)
-        for row in incidencias_rows:
-            if row[0] in active_lote_ids:
-                c.execute("""
-                    INSERT INTO incidencias
-                    (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at, resolved_at, resolved_by, resolution_comment)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, row)
-        for created, lid, typ, user, note in sorted(lote_status_events):
-            if lid not in active_lote_ids:
-                continue
-            if typ == "LOTE_CERRADO":
-                c.execute("UPDATE lotes SET status='CERRADO', closed_at=?, closed_by=?, close_note=? WHERE id=?", (created, user or "SIN_USUARIO", note, lid))
-            elif typ == "LOTE_REABIERTO":
-                c.execute("UPDATE lotes SET status='ACTIVO', closed_at=NULL, closed_by=NULL, close_note=NULL WHERE id=?", (lid,))
         c.commit()
-    return True, f"Restauración automática completa: {restored_lotes} lote(s), {restored_items} producto(s), {len(audit_rows)} evento(s) de auditoría."
+    return True, f"Restauración automática completa: {restored_lotes} lote(s), {restored_items} producto(s)."
 
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
-    """Envía pendientes a Sheets con bloqueo lógico y recuperación de cortes.
+    """Envía pendientes a Sheets con bloqueo lógico.
 
-    - Reclama eventos pending -> sending en una transacción IMMEDIATE.
-    - Si Streamlit se reinicia a mitad del envío, los eventos `sending` viejos vuelven a pending.
-    - Nunca marca como enviado si Apps Script no responde JSON con ok=true.
-    Devuelve métricas para poder diagnosticar desde la UI.
+    Antes de llamar al webhook, los eventos pasan de pending -> sending dentro de una
+    transacción IMMEDIATE. Así, aunque Streamlit rerunée o el usuario presione otra vez,
+    otro flush no puede tomar las mismas filas. Si falla el envío, vuelven a pending.
     """
     url = clean_text(webhook_url or get_backup_webhook_url())
-    result = {"claimed": 0, "sent": 0, "failed": 0, "last_error": ""}
     if not url:
-        result["last_error"] = "No hay SHEETS_WEBHOOK_URL configurada."
-        return result
+        return
 
-    now = datetime.now().isoformat(timespec="seconds")
-    stale_before = (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")
-
-    # Reclamo atómico de trabajo pendiente. También recupera eventos que quedaron
-    # en sending por un reinicio/corte anterior.
+    # Reclamo atómico de trabajo pendiente.
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
-        c.execute(
-            """
-            UPDATE backup_queue
-            SET status='pending', last_error=COALESCE(last_error, 'Recuperado: envío interrumpido'), claimed_at=NULL
-            WHERE status='sending'
-              AND (claimed_at IS NULL OR claimed_at < ?)
-            """,
-            (stale_before,),
-        )
         ids = [int(r["id"]) for r in c.execute(
             """
             SELECT id
@@ -817,15 +595,12 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
         ).fetchall()]
         if not ids:
             c.commit()
-            return result
+            return
         placeholders = ",".join(["?"] * len(ids))
-        c.execute(
-            f"UPDATE backup_queue SET status='sending', claimed_at=? WHERE id IN ({placeholders}) AND status='pending'",
-            [now] + ids,
-        )
+        c.execute(f"UPDATE backup_queue SET status='sending' WHERE id IN ({placeholders}) AND status='pending'", ids)
         rows = c.execute(
             f"""
-            SELECT id, event_type, payload_json, attempts, created_at, event_key
+            SELECT id, event_type, payload_json, attempts, created_at
             FROM backup_queue
             WHERE id IN ({placeholders}) AND status='sending'
             ORDER BY id ASC
@@ -834,8 +609,6 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
         ).fetchall()
         c.commit()
 
-    result["claimed"] = len(rows)
-
     for row in rows:
         event = {
             "event_type": row["event_type"],
@@ -843,9 +616,6 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
             "queued_at": row["created_at"],
             **json.loads(row["payload_json"]),
         }
-        # Garantiza que Sheets reciba la misma clave que SQLite usa para idempotencia.
-        if clean_text(row["event_key"]):
-            event["event_key"] = clean_text(row["event_key"])
         try:
             ok, detail = send_webhook_event(url, event)
             if not ok:
@@ -858,20 +628,15 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
                     (sent_at, int(row["id"])),
                 )
                 c.commit()
-            result["sent"] += 1
 
         except Exception as e:
-            err = str(e)[:500]
             with db() as c:
                 c.execute(
-                    "UPDATE backup_queue SET status='pending', attempts=attempts+1, last_error=?, claimed_at=NULL WHERE id=? AND status='sending'",
-                    (err, int(row["id"])),
+                    "UPDATE backup_queue SET status='pending', attempts=attempts+1, last_error=? WHERE id=? AND status='sending'",
+                    (str(e)[:500], int(row["id"])),
                 )
                 c.commit()
-            result["failed"] += 1
-            result["last_error"] = err
 
-    return result
 
 def backup_status():
     with db() as c:
@@ -879,31 +644,22 @@ def backup_status():
             """
             SELECT
                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
-                SUM(CASE WHEN status='sending' THEN 1 ELSE 0 END) AS sending,
                 SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
                 MAX(sent_at) AS last_sent,
                 MAX(last_error) AS last_error
             FROM backup_queue
             """
         ).fetchone()
-    return dict(row) if row else {"pending": 0, "sending": 0, "sent": 0, "last_sent": "", "last_error": ""}
+    return dict(row) if row else {"pending": 0, "sent": 0, "last_sent": "", "last_error": ""}
 
 
 def test_backup_webhook() -> tuple[bool, str]:
     url = get_backup_webhook_url()
     if not url:
         return False, "No hay SHEETS_WEBHOOK_URL configurada."
-
-    health_ok, health_msg = get_backup_health()
-    if not health_ok:
-        return False, f"El Web App no pasó health check: {health_msg}"
-
-    now = datetime.now().isoformat(timespec="seconds")
-    event_key = f"test_webhook:{now}"
     event = {
-        "event_key": event_key,
         "event_type": "test_webhook",
-        "created_at": now,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
         "lote_id": "TEST",
         "lote_nombre": "Prueba manual desde Streamlit",
         "archivo": "test",
@@ -920,18 +676,8 @@ def test_backup_webhook() -> tuple[bool, str]:
         "operador": "",
         "dispositivo": "",
     }
-    try:
-        ok, send_detail = send_webhook_event(url, event)
-        if not ok:
-            return False, send_detail
+    return send_webhook_event(url, event)
 
-        confirmed, confirm_msg = confirm_event_in_sheets(event_key)
-        if not confirmed:
-            return False, f"Apps Script aceptó el POST, pero no pude confirmar escritura. {confirm_msg}"
-
-        return True, f"{confirm_msg}. Health: {health_msg}"
-    except Exception as e:
-        return False, f"No pude conectar con Apps Script: {e}"
 
 def build_lote_payload(lote_id: int) -> dict:
     lote = get_lote(lote_id)
@@ -1647,39 +1393,16 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
 # Auditoría operacional Fase 1
 # ============================================================
 
-def log_audit_event(lote_id=None, item_id=None, event_type="", detail="", qty=None, codigo_ml="", sku="", mode="", usuario="", source_module="", before=None, after=None, sync=True):
-    """Registra una acción operacional en SQLite y la deja en cola para Sheets.
-
-    Regla de arquitectura:
-    - SQLite = memoria rápida temporal.
-    - Sheets = memoria permanente oficial.
-    Por eso cada auditoría local genera también un evento audit_event idempotente para Sheets.
-    """
+def log_audit_event(lote_id=None, item_id=None, event_type="", detail="", qty=None, codigo_ml="", sku="", mode=""):
+    """Registra una acción operacional local. No bloquea la operación si falla."""
     try:
         now = datetime.now().isoformat(timespec="seconds")
-        usuario_final = clean_text(usuario) or clean_text(mode) or "SIN_USUARIO"
-        before_json = json.dumps(before, ensure_ascii=False, default=str) if before is not None else ""
-        after_json = json.dumps(after, ensure_ascii=False, default=str) if after is not None else ""
-        base_key = {
-            "lote_id": int(lote_id) if lote_id is not None else None,
-            "item_id": int(item_id) if item_id is not None else None,
-            "event_type": clean_text(event_type),
-            "detail": clean_text(detail),
-            "qty": int(qty) if qty is not None else None,
-            "codigo_ml": norm_code(codigo_ml),
-            "sku": norm_code(sku),
-            "mode": clean_text(mode),
-            "usuario": usuario_final,
-            "created_at": now,
-        }
-        event_key = "audit:" + hashlib.sha1(json.dumps(base_key, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         with db() as c:
             c.execute(
                 """
-                INSERT OR IGNORE INTO audit_events
-                (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at,
-                 event_key, usuario, source_module, before_json, after_json, synced_to_sheets)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT INTO audit_events
+                (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(lote_id) if lote_id is not None else None,
@@ -1687,40 +1410,10 @@ def log_audit_event(lote_id=None, item_id=None, event_type="", detail="", qty=No
                     clean_text(event_type), clean_text(detail),
                     int(qty) if qty is not None else None,
                     norm_code(codigo_ml), norm_code(sku), clean_text(mode), now,
-                    event_key, usuario_final, clean_text(source_module), before_json, after_json,
                 ),
             )
             c.commit()
-
-        if sync:
-            enqueue_backup_event("audit_event", {
-                "event_key": event_key,
-                "audit_type": clean_text(event_type),
-                "lote_id": int(lote_id) if lote_id is not None else None,
-                "item_id": int(item_id) if item_id is not None else None,
-                "detail": clean_text(detail),
-                "qty": int(qty) if qty is not None else None,
-                "codigo_ml": norm_code(codigo_ml),
-                "sku": norm_code(sku),
-                "mode": clean_text(mode),
-                "usuario": usuario_final,
-                "source_module": clean_text(source_module),
-                "before_json": before_json,
-                "after_json": after_json,
-                "created_at": now,
-            })
-            # Flush pequeño y controlado: evita que la auditoría quede solo local hasta el próximo click.
-            flush_backup_queue(limit=20)
-            try:
-                with db() as c:
-                    row = c.execute("SELECT status FROM backup_queue WHERE event_key=? ORDER BY id DESC LIMIT 1", (event_key,)).fetchone()
-                    if row and clean_text(row["status"]) == "sent":
-                        c.execute("UPDATE audit_events SET synced_to_sheets=1 WHERE event_key=?", (event_key,))
-                        c.commit()
-            except Exception:
-                pass
     except Exception:
-        # La auditoría nunca debe botar el flujo operativo.
         pass
 
 
@@ -1729,7 +1422,7 @@ def get_audit_events(lote_id=None, limit=300) -> pd.DataFrame:
         if lote_id:
             return pd.read_sql_query(
                 """
-                SELECT created_at, event_type, detail, qty, codigo_ml, sku, mode, usuario, source_module, item_id
+                SELECT created_at, event_type, detail, qty, codigo_ml, sku, mode, item_id
                 FROM audit_events
                 WHERE lote_id=?
                 ORDER BY id DESC
@@ -1740,7 +1433,7 @@ def get_audit_events(lote_id=None, limit=300) -> pd.DataFrame:
             )
         return pd.read_sql_query(
             """
-            SELECT created_at, lote_id, event_type, detail, qty, codigo_ml, sku, mode, usuario, source_module, item_id
+            SELECT created_at, lote_id, event_type, detail, qty, codigo_ml, sku, mode, item_id
             FROM audit_events
             ORDER BY id DESC
             LIMIT ?
@@ -2212,10 +1905,9 @@ with st.sidebar:
     st.divider()
     bs = backup_status()
     pending_backup = int(bs.get("pending") or 0)
-    sending_backup = int(bs.get("sending") or 0)
     sent_backup = int(bs.get("sent") or 0)
-    if pending_backup or sending_backup:
-        st.warning(f"Respaldo externo: {pending_backup} pendientes · {sending_backup} enviando")
+    if pending_backup:
+        st.warning(f"Respaldo externo: {pending_backup} eventos pendientes")
         if bs.get("last_error"):
             st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
         if st.button("Reintentar respaldo"):
@@ -2245,10 +1937,9 @@ with st.sidebar:
     if st.button("Probar respaldo Sheets"):
         ok_test, detail_test = test_backup_webhook()
         if ok_test:
-            st.success("Prueba confirmada en Google Sheets.")
-            st.caption(detail_test[:600])
+            st.success("Prueba enviada a Google Sheets.")
         else:
-            st.error(f"Falló prueba Sheets: {detail_test[:600]}")
+            st.error(f"Falló prueba Sheets: {detail_test[:250]}")
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
@@ -2669,7 +2360,7 @@ elif page == "Supervisor":
                     "item_id": "Item ID",
                 })
                 st.dataframe(show_audit, use_container_width=True, hide_index=True, height=650)
-                st.caption("La auditoría queda guardada en SQLite, se respalda en Sheets y también se incluye en el Excel de control exportado.")
+                st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
 
         with tab_bloques:
             labels = label_control_view(active_lote)
@@ -3074,7 +2765,7 @@ elif page == "Auditoría":
                 "item_id": "Item ID",
             })
             st.dataframe(show, use_container_width=True, hide_index=True, height=650)
-            st.caption("La auditoría queda guardada en SQLite, se respalda en Sheets y también se incluye en el Excel de control exportado.")
+            st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
 
 elif page == "Control":
     st.subheader("Control de lote")
