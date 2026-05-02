@@ -3,7 +3,6 @@ import re
 import html
 import hashlib
 import json
-import hashlib
 import os
 import sqlite3
 import threading
@@ -290,7 +289,6 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        ensure_column(c, "backup_queue", "event_key", "TEXT")
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -305,8 +303,6 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_audit_lote ON audit_events (lote_id, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_incidencias_lote ON incidencias (lote_id, status, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_reimpresiones_lote ON reimpresiones (lote_id, created_at)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_queue_event_key ON backup_queue (event_key) WHERE event_key IS NOT NULL AND event_key != ''")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_backup_queue_status ON backup_queue (status, id)")
         c.commit()
 
 
@@ -330,41 +326,22 @@ def get_backup_webhook_url() -> str:
     return clean_text(url)
 
 
-def backup_event_key(event_type: str, payload: dict) -> str:
-    """Clave idempotente para que un mismo evento operativo no pueda entrar dos veces a la cola.
-    Esto protege contra doble click, rerun de Streamlit y reintentos de sincronización.
-    """
-    if event_type == "lote_creado":
-        return f"lote_creado:{payload.get('lote_id')}"
-    if event_type == "lote_item":
-        return f"lote_item:{payload.get('lote_id')}:{payload.get('item_id')}"
-    if event_type == "lote_eliminado":
-        return f"lote_eliminado:{payload.get('lote_id')}:{payload.get('deleted_at')}"
-    if event_type in {"scan_agregado", "scan_deshacer"}:
-        # Estos eventos sí pueden repetirse operativamente, por eso llevan timestamp + datos del movimiento.
-        return f"{event_type}:{payload.get('lote_id')}:{payload.get('item_id')}:{payload.get('created_at')}:{payload.get('cantidad')}:{payload.get('scan_primario')}:{payload.get('scan_secundario')}"
-    base = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return f"{event_type}:{hashlib.sha1(base.encode('utf-8')).hexdigest()}"
-
-
 def enqueue_backup_event(event_type: str, payload: dict):
-    """Guarda un evento en cola local de forma idempotente.
-    Importante: NO dispara envío en segundo plano; el envío se hace mediante flush_backup_queue()
-    para evitar carreras donde dos hilos mandan los mismos pendientes a Sheets.
+    """Guarda el evento en cola local y dispara envío en segundo plano.
+    La operación principal nunca queda bloqueada por Google Sheets.
     """
     now = datetime.now().isoformat(timespec="seconds")
     safe_payload = json.dumps(payload, ensure_ascii=False, default=str)
-    event_key = backup_event_key(event_type, payload)
     with db() as c:
         c.execute(
-            """
-            INSERT OR IGNORE INTO backup_queue
-            (event_type, payload_json, status, attempts, created_at, event_key)
-            VALUES (?, ?, 'pending', 0, ?, ?)
-            """,
-            (event_type, safe_payload, now, event_key),
+            "INSERT INTO backup_queue (event_type, payload_json, status, attempts, created_at) VALUES (?, ?, 'pending', 0, ?)",
+            (event_type, safe_payload, now),
         )
         c.commit()
+
+    webhook_url = get_backup_webhook_url()
+    if webhook_url:
+        threading.Thread(target=flush_backup_queue, args=(webhook_url,), daemon=True).start()
 
 
 def send_webhook_event(url: str, event: dict) -> tuple[bool, str]:
@@ -399,25 +376,20 @@ def send_webhook_event(url: str, event: dict) -> tuple[bool, str]:
 
 
 def enqueue_backup_events_batch(events):
-    """Inserta muchos eventos en cola local, sin duplicar claves operativas.
-    No dispara threads: la sincronización se ejecuta de forma controlada con flush_backup_queue().
-    """
+    """Inserta muchos eventos en la cola local y dispara un solo envío."""
     if not events:
         return
     now = datetime.now().isoformat(timespec="seconds")
-    rows = []
-    for et, payload in events:
-        rows.append((et, json.dumps(payload, ensure_ascii=False, default=str), now, backup_event_key(et, payload)))
+    rows = [(et, json.dumps(payload, ensure_ascii=False, default=str), now) for et, payload in events]
     with db() as c:
         c.executemany(
-            """
-            INSERT OR IGNORE INTO backup_queue
-            (event_type, payload_json, status, attempts, created_at, event_key)
-            VALUES (?, ?, 'pending', 0, ?, ?)
-            """,
+            "INSERT INTO backup_queue (event_type, payload_json, status, attempts, created_at) VALUES (?, ?, 'pending', 0, ?)",
             rows,
         )
         c.commit()
+    url = get_backup_webhook_url()
+    if url:
+        threading.Thread(target=flush_backup_queue, args=(url, 1000), daemon=True).start()
 
 
 def get_backup_events_from_sheets():
@@ -570,44 +542,21 @@ def restore_from_backup_if_empty():
 
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
-    """Envía pendientes a Sheets con bloqueo lógico.
-
-    Antes de llamar al webhook, los eventos pasan de pending -> sending dentro de una
-    transacción IMMEDIATE. Así, aunque Streamlit rerunée o el usuario presione otra vez,
-    otro flush no puede tomar las mismas filas. Si falla el envío, vuelven a pending.
-    """
     url = clean_text(webhook_url or get_backup_webhook_url())
     if not url:
         return
 
-    # Reclamo atómico de trabajo pendiente.
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-        ids = [int(r["id"]) for r in c.execute(
+        rows = c.execute(
             """
-            SELECT id
+            SELECT id, event_type, payload_json, attempts, created_at
             FROM backup_queue
             WHERE status='pending'
             ORDER BY id ASC
             LIMIT ?
             """,
-            (int(limit),),
-        ).fetchall()]
-        if not ids:
-            c.commit()
-            return
-        placeholders = ",".join(["?"] * len(ids))
-        c.execute(f"UPDATE backup_queue SET status='sending' WHERE id IN ({placeholders}) AND status='pending'", ids)
-        rows = c.execute(
-            f"""
-            SELECT id, event_type, payload_json, attempts, created_at
-            FROM backup_queue
-            WHERE id IN ({placeholders}) AND status='sending'
-            ORDER BY id ASC
-            """,
-            ids,
+            (limit,),
         ).fetchall()
-        c.commit()
 
     for row in rows:
         event = {
@@ -624,7 +573,7 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
             sent_at = datetime.now().isoformat(timespec="seconds")
             with db() as c:
                 c.execute(
-                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=? AND status='sending'",
+                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
                     (sent_at, int(row["id"])),
                 )
                 c.commit()
@@ -632,7 +581,7 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
         except Exception as e:
             with db() as c:
                 c.execute(
-                    "UPDATE backup_queue SET status='pending', attempts=attempts+1, last_error=? WHERE id=? AND status='sending'",
+                    "UPDATE backup_queue SET attempts=attempts+1, last_error=? WHERE id=?",
                     (str(e)[:500], int(row["id"])),
                 )
                 c.commit()
@@ -822,7 +771,6 @@ def delete_lote(lote_id):
         "items_eliminados": int(items_count),
         "deleted_at": datetime.now().isoformat(timespec="seconds"),
     })
-    flush_backup_queue(limit=50)
     log_audit_event(lote_id, event_type="LOTE_ELIMINADO", detail="Lote eliminado", qty=int(items_count))
 
 
@@ -859,7 +807,6 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo)
         "scan_secundario": norm_code(scan_secundario),
         "created_at": now,
     })
-    flush_backup_queue(limit=50)
     log_audit_event(lote_id, item_id, "SKU_ESCANEADO", clean_text(item["descripcion"]), int(cantidad), item["codigo_ml"], item["sku"], modo)
     return True, "Cantidad agregada."
 
@@ -889,7 +836,6 @@ def undo_last_scan(lote_id):
         "scan_secundario": norm_code(row["scan_secundario"]),
         "created_at": now,
     })
-    flush_backup_queue(limit=50)
     log_audit_event(lote_id, int(row["item_id"]), "SCAN_DESHECHO", clean_text(item_payload.get("descripcion", "")), int(row["cantidad"]), item_payload.get("codigo_ml", ""), item_payload.get("sku", ""), row["modo"])
     return True, "Último escaneo deshecho."
 
@@ -1892,7 +1838,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 with st.sidebar:
     st.header("Menú")
     # Usuario se solicita solo donde realmente corresponde: incidencia, reimpresión o cierre.
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Etiquetas"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -2200,7 +2146,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_pendientes, tab_incid, tab_control, tab_auditoria, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Control", "Auditoría", "Bloques", "Reimpresión", "Cierre"])
+        tab_resumen, tab_pendientes, tab_incid, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques", "Reimpresión", "Cierre"])
 
         with tab_resumen:
             view = items.copy()
@@ -2238,129 +2184,6 @@ elif page == "Supervisor":
                 out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
                 cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "SKU", "Producto", "Comentario", "Usuario"]
                 st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
-
-        with tab_control:
-            st.subheader("Control de lote")
-            if items.empty:
-                st.warning("El lote no tiene productos.")
-            else:
-                view = items.copy()
-                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-                view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
-                scans = get_last_scans(active_lote)
-                if not scans.empty:
-                    view = view.merge(scans, left_on="id", right_on="item_id", how="left")
-                else:
-                    view["procesado_at"] = ""
-
-                c1, c2, c3, c4 = st.columns(4)
-                total_control = int(view["unidades"].sum())
-                done_control = int(view["acopiadas"].sum())
-                c1.metric("Unidades", total_control)
-                c2.metric("Acopiadas", done_control)
-                c3.metric("Pendientes", max(total_control - done_control, 0))
-                c4.metric("Avance", f"{(done_control / total_control * 100) if total_control else 0:.1f}%")
-
-                filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"], key="sup_control_filter")
-                show = view
-                if filtro == "Pendientes":
-                    show = view[view["pendiente"] > 0]
-                elif filtro == "Completos":
-                    show = view[view["pendiente"] == 0]
-                elif filtro == "Supermercado":
-                    show = view[view["identificacion"].map(is_supermercado)]
-
-                option_rows = []
-                option_map = {"": None}
-                for _, sr in show.iterrows():
-                    desc = clean_text(sr.get("descripcion", ""))
-                    sku = clean_text(sr.get("sku", ""))
-                    ml = clean_text(sr.get("codigo_ml", ""))
-                    ean = clean_text(sr.get("codigo_universal", ""))
-                    ident = clean_text(sr.get("identificacion", ""))
-                    label = f"{desc} | SKU {sku} | ML {ml} | EAN {ean} | {ident}"[:180]
-                    option_rows.append(label)
-                    option_map[label] = int(sr["id"])
-
-                selected_search = st.selectbox(
-                    "Buscar producto",
-                    [""] + option_rows,
-                    index=0,
-                    placeholder="Escribe nombre, SKU, Código ML, EAN o supermercado",
-                    key="sup_control_search_select",
-                )
-                selected_id = option_map.get(selected_search)
-                if selected_id:
-                    show = show[show["id"].astype(int) == int(selected_id)]
-
-                st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
-                modo_vista = st.radio("Vista control", ["Tarjetas operativas", "Tabla"], horizontal=True, key="sup_control_view_mode")
-                if modo_vista == "Tarjetas operativas":
-                    for _, r in show.iterrows():
-                        ident = clean_text(r.get("identificacion", ""))
-                        vence = clean_text(r.get("vence", ""))
-                        proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
-                        badges_parts = [
-                            f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
-                            f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
-                            f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
-                        ]
-                        if ident:
-                            badges_parts.append(f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>")
-                        if vence:
-                            badges_parts.append(f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>")
-                        badges_parts.append(f"<span class='badge'>Procesado: {esc(proc)}</span>")
-                        st.markdown(
-                            f"""
-                            <div class='control-card'>
-                                <div class='control-title'>{esc(r['descripcion'])}</div>
-                                <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
-                                <div>{''.join(badges_parts)}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    out = show.copy()
-                    out["Procesado"] = out["procesado_at"].map(fmt_dt)
-                    out = out.rename(columns={
-                        "sku": "SKU", "codigo_ml": "Código ML", "codigo_universal": "EAN / Código universal",
-                        "descripcion": "Producto", "unidades": "Unidades", "acopiadas": "Acopiadas", "pendiente": "Pendiente",
-                        "identificacion": "Identificación", "vence": "Vence", "estado": "Estado"
-                    })
-                    cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Identificación", "Vence", "Procesado", "Estado"]
-                    st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
-
-                st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="sup_export_control_excel")
-                st.divider()
-                if st.button("Eliminar lote activo", key="sup_delete_lote"):
-                    delete_lote(active_lote)
-                    st.success("Lote eliminado.")
-                    st.rerun()
-
-        with tab_auditoria:
-            st.subheader("Auditoría operacional")
-            eventos = get_audit_events(active_lote, limit=500)
-            if eventos.empty:
-                st.info("Aún no hay eventos de auditoría para este lote.")
-            else:
-                f_eventos = ["Todos"] + sorted([x for x in eventos["event_type"].dropna().unique().tolist()])
-                filtro_evento = st.selectbox("Filtrar evento", f_eventos, key="sup_audit_filter")
-                show_audit = eventos.copy()
-                if filtro_evento != "Todos":
-                    show_audit = show_audit[show_audit["event_type"] == filtro_evento]
-                show_audit = show_audit.rename(columns={
-                    "created_at": "Fecha",
-                    "event_type": "Evento",
-                    "detail": "Detalle",
-                    "qty": "Cantidad",
-                    "codigo_ml": "Código ML",
-                    "sku": "SKU",
-                    "mode": "Modo",
-                    "item_id": "Item ID",
-                })
-                st.dataframe(show_audit, use_container_width=True, hide_index=True, height=650)
-                st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
 
         with tab_bloques:
             labels = label_control_view(active_lote)
