@@ -2268,6 +2268,35 @@ elif page == "Escaneo":
     div[data-testid="stMetricValue"] {font-size:2.35rem!important;font-weight:900!important;}
     .product-title {font-size:1.8rem!important;font-weight:900!important;line-height:1.25;margin:12px 0;}
     div[data-testid="stAlert"] {font-size:1.35rem!important;font-weight:800!important;}
+
+    /* El formulario de incidencia NO debe heredar el tamaño gigante del PDA. */
+    div[data-testid="stExpander"] div[data-testid="stTextInput"] label,
+    div[data-testid="stExpander"] div[data-testid="stNumberInput"] label,
+    div[data-testid="stExpander"] div[data-testid="stSelectbox"] label,
+    div[data-testid="stExpander"] div[data-testid="stTextArea"] label {
+        font-size:0.95rem!important;
+        font-weight:650!important;
+        margin-bottom:0.25rem!important;
+    }
+    div[data-testid="stExpander"] div[data-testid="stTextInput"] input,
+    div[data-testid="stExpander"] div[data-testid="stNumberInput"] input {
+        font-size:1.05rem!important;
+        min-height:2.6rem!important;
+        font-weight:500!important;
+    }
+    div[data-testid="stExpander"] textarea {
+        font-size:1.05rem!important;
+        min-height:5.5rem!important;
+        font-weight:500!important;
+    }
+    div[data-testid="stExpander"] .stButton > button,
+    div[data-testid="stExpander"] div[data-testid="stFormSubmitButton"] button {
+        font-size:1rem!important;
+        min-height:2.6rem!important;
+        width:auto!important;
+        font-weight:800!important;
+        border-radius:10px!important;
+    }
     </style>
     """, unsafe_allow_html=True)
     if not active_lote:
