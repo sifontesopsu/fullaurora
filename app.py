@@ -9,6 +9,7 @@ import threading
 import urllib.request
 import urllib.parse
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -96,12 +97,27 @@ def esc(v) -> str:
     return html.escape(clean_text(v), quote=True)
 
 
+CHILE_TZ = ZoneInfo("America/Santiago")
+
+
+def now_cl() -> datetime:
+    """Hora oficial de Chile para guardar eventos operativos."""
+    return datetime.now(CHILE_TZ)
+
+
 def fmt_dt(v) -> str:
     s = clean_text(v)
     if not s:
         return ""
     try:
-        return datetime.fromisoformat(s).strftime("%d-%m-%Y %H:%M:%S")
+        raw = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            # Registros antiguos sin zona horaria: se asumen ya en hora Chile.
+            dt = dt.replace(tzinfo=CHILE_TZ)
+        else:
+            dt = dt.astimezone(CHILE_TZ)
+        return dt.strftime("%d-%m-%Y %H:%M:%S")
     except Exception:
         return s
 
@@ -368,7 +384,7 @@ def enqueue_backup_event(event_type: str, payload: dict):
     """Guarda el evento en cola local y dispara envío en segundo plano.
     La operación principal nunca queda bloqueada por Google Sheets.
     """
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     safe_payload = json.dumps(payload, ensure_ascii=False, default=str)
     with db() as c:
         c.execute(
@@ -417,7 +433,7 @@ def enqueue_backup_events_batch(events):
     """Inserta muchos eventos en la cola local y dispara un solo envío."""
     if not events:
         return
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     rows = [(et, json.dumps(payload, ensure_ascii=False, default=str), now) for et, payload in events]
     with db() as c:
         c.executemany(
@@ -525,7 +541,7 @@ def restore_from_backup_if_empty():
                 "nombre": clean_text(ev.get("lote_nombre", "")) or f"Lote {lote_id}",
                 "archivo": clean_text(ev.get("archivo", "")),
                 "hoja": clean_text(ev.get("hoja", "")),
-                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
                 "status": clean_text(ev.get("status", "ACTIVO")) or "ACTIVO",
                 "closed_at": clean_text(ev.get("closed_at", "")),
                 "closed_by": clean_text(ev.get("closed_by", "")),
@@ -551,8 +567,8 @@ def restore_from_backup_if_empty():
                 "vence": clean_text(ev.get("vence", "")),
                 "dia": clean_text(ev.get("dia", "")),
                 "hora": clean_text(ev.get("hora", "")),
-                "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+                "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
             }
         elif et == "lote_snapshot_chunk":
             items = ev.get("items") or []
@@ -576,8 +592,8 @@ def restore_from_backup_if_empty():
                     "vence": clean_text(item_ev.get("vence", "")),
                     "dia": clean_text(item_ev.get("dia", "")),
                     "hora": clean_text(item_ev.get("hora", "")),
-                    "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                    "updated_at": clean_text(item_ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                    "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "updated_at": clean_text(item_ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
                 }
         elif et == "scan_agregado":
             try:
@@ -586,7 +602,7 @@ def restore_from_backup_if_empty():
             except Exception:
                 continue
             movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
-            scan_rows.append((lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")), qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds")))
+            scan_rows.append((lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")), qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds")))
         elif et == "scan_deshacer":
             try:
                 item_id = int(ev.get("item_id"))
@@ -608,7 +624,7 @@ def restore_from_backup_if_empty():
                 "comentario": clean_text(ev.get("comentario", "")),
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                 "status": clean_text(ev.get("status", "ABIERTA")) or "ABIERTA",
-                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
                 "codigo_universal": norm_code(ev.get("codigo_universal", "")),
                 "sku": norm_code(ev.get("sku", "")),
@@ -632,12 +648,12 @@ def restore_from_backup_if_empty():
                 "cantidad": max(1, to_int(ev.get("cantidad", 1))),
                 "motivo": clean_text(ev.get("motivo", "")) or clean_text(ev.get("comentario", "")) or "Restaurado desde respaldo",
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
-                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
         elif et == "lote_cerrado":
             lote_status_updates[lote_id] = {
                 "status": "CERRADO",
-                "closed_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "closed_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
                 "closed_by": clean_text(ev.get("usuario", "")) or clean_text(ev.get("closed_by", "")) or "SIN_USUARIO",
                 "close_note": clean_text(ev.get("comentario", "")) or clean_text(ev.get("close_note", "")),
             }
@@ -655,7 +671,7 @@ def restore_from_backup_if_empty():
     if not active_lote_ids:
         return False, "No encontré lotes activos con snapshot completo en Sheets. Crea el lote una vez con esta nueva versión para activar restauración automática."
 
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     restored_lotes = 0
     restored_items = 0
     restored_scans = 0
@@ -761,7 +777,7 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
             if not ok:
                 raise RuntimeError(detail)
 
-            sent_at = datetime.now().isoformat(timespec="seconds")
+            sent_at = now_cl().isoformat(timespec="seconds")
             with db() as c:
                 c.execute(
                     "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
@@ -827,7 +843,7 @@ def test_backup_webhook() -> tuple[bool, str]:
         return False, "No hay SHEETS_WEBHOOK_URL configurada."
     event = {
         "event_type": "test_webhook",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": now_cl().isoformat(timespec="seconds"),
         "lote_id": "TEST",
         "lote_nombre": "Prueba manual desde Streamlit",
         "archivo": "test",
@@ -900,7 +916,7 @@ def get_last_scans(lote_id):
 
 
 def create_lote(nombre, archivo, hoja, df):
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         cur = c.execute(
             "INSERT INTO lotes (nombre, archivo, hoja, created_at) VALUES (?, ?, ?, ?)",
@@ -990,7 +1006,7 @@ def delete_lote(lote_id):
     enqueue_backup_event("lote_eliminado", {
         **lote_payload,
         "items_eliminados": int(items_count),
-        "deleted_at": datetime.now().isoformat(timespec="seconds"),
+        "deleted_at": now_cl().isoformat(timespec="seconds"),
     })
     log_audit_event(lote_id, event_type="LOTE_ELIMINADO", detail="Lote eliminado", qty=int(items_count))
 
@@ -998,7 +1014,7 @@ def delete_lote(lote_id):
 def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
     if is_lote_closed(lote_id):
         return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de escanear."
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lote_id)).fetchone()
         if not item:
@@ -1039,7 +1055,7 @@ def undo_last_scan(lote_id):
         row = c.execute("SELECT * FROM scans WHERE lote_id=? ORDER BY id DESC LIMIT 1", (lote_id,)).fetchone()
         if not row:
             return False, "No hay escaneos para deshacer."
-        now = datetime.now().isoformat(timespec="seconds")
+        now = now_cl().isoformat(timespec="seconds")
         item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(row["item_id"]), lote_id)).fetchone()
         c.execute("UPDATE items SET acopiadas=MAX(acopiadas-?,0), updated_at=? WHERE id=?", (int(row["cantidad"]), now, int(row["item_id"])))
         c.execute("DELETE FROM scans WHERE id=?", (int(row["id"]),))
@@ -1175,7 +1191,7 @@ def load_maestro_from_repo():
     df = parse_maestro(MAESTRO_PATH)
     if df.empty:
         return 0
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         c.execute("DELETE FROM maestro")
         c.executemany("INSERT OR REPLACE INTO maestro (code, sku, descripcion, updated_at) VALUES (?, ?, ?, ?)",
@@ -1519,7 +1535,7 @@ def register_block_download(lote_id: int, block: dict):
     if is_lote_closed(lote_id):
         st.error("Este lote está cerrado. Reabre el lote desde Supervisor antes de imprimir etiquetas.")
         return
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     existing = get_label_block_record(lote_id, block["block_index"], block["block_key"])
     is_reprint = 1 if existing else 0
     status = "REIMPRESO" if is_reprint else "IMPRESO"
@@ -1576,7 +1592,7 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
     if is_lote_closed(lote_id):
         st.error("Este lote está cerrado. Reabre el lote desde Supervisor antes de imprimir etiquetas.")
         return
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     qty = max(1, int(qty or 1))
     summary = get_label_print_summary(lote_id)
     already = 0
@@ -1611,7 +1627,7 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
 def log_audit_event(lote_id=None, item_id=None, event_type="", detail="", qty=None, codigo_ml="", sku="", mode=""):
     """Registra una acción operacional local. No bloquea la operación si falla."""
     try:
-        now = datetime.now().isoformat(timespec="seconds")
+        now = now_cl().isoformat(timespec="seconds")
         with db() as c:
             c.execute(
                 """
@@ -1821,7 +1837,7 @@ def find_item_for_incidencia(lote_id: int, codigo: str) -> dict:
 
 
 def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentario: str, usuario: str):
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     item = {}
     if item_id:
         with db() as c:
@@ -1897,7 +1913,7 @@ def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad:
 
 
 def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         inc = c.execute("SELECT * FROM incidencias WHERE id=?", (int(incidencia_id),)).fetchone()
         if not inc:
@@ -1957,7 +1973,7 @@ def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, us
     if len(motivo) < 5:
         return False, "Debes ingresar un motivo claro de reimpresión."
 
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         rec = c.execute(
             "SELECT * FROM label_blocks WHERE lote_id=? AND block_index=? AND block_key=?",
@@ -2030,7 +2046,7 @@ def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo:
     if len(motivo) < 5:
         return False, "Debes ingresar un motivo claro de reimpresión."
 
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         c.execute(
             """
@@ -2135,7 +2151,7 @@ def close_lote(lote_id: int, usuario: str, nota: str):
     ok, issues, _ = cierre_validaciones(lote_id)
     if not ok:
         return False, "No se puede cerrar: " + " ".join(issues)
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_cl().isoformat(timespec="seconds")
     usuario = clean_text(usuario) or "SIN_USUARIO"
     with db() as c:
         c.execute(
@@ -2161,7 +2177,7 @@ def reopen_lote(lote_id: int, usuario: str, motivo: str):
         c.commit()
     enqueue_backup_event("lote_reabierto", {
         **build_lote_payload(lote_id),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": now_cl().isoformat(timespec="seconds"),
         "usuario": usuario,
         "comentario": clean_text(motivo),
         "status": "ACTIVO",
@@ -2444,7 +2460,7 @@ if page == "Cargar lote FULL":
                 c4.metric("SKUs únicos", int(df["sku"].nunique()))
                 with st.expander("Revisión rápida de columnas leídas", expanded=True):
                     st.dataframe(df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20), use_container_width=True, hide_index=True)
-                nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+                nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {now_cl().strftime('%d-%m-%Y %H:%M')}")
                 if st.button("Crear lote", type="primary"):
                     create_lote(nombre, full_file.name, selected_sheet, df)
                     reset_scan_state()
