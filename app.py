@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 APP_TITLE = "Control FULL Aurora"
 DATA_DIR = Path("data")
@@ -453,6 +454,15 @@ def local_lotes_count():
 
 
 def restore_from_backup_if_empty():
+    """Restaura base local desde Sheets cuando SQLite está vacío.
+
+    Refuerzos producción:
+    - deduplica eventos por queue_id;
+    - soporta eventos que vengan con raw_json plano desde Apps Script;
+    - restaura incidencias;
+    - restaura reimpresiones controladas;
+    - restaura estado de lote cerrado/reabierto.
+    """
     if local_lotes_count() > 0:
         return False, "Base local con datos; no se restaura."
     ok, events, msg = get_backup_events_from_sheets()
@@ -461,13 +471,48 @@ def restore_from_backup_if_empty():
     if not events:
         return False, "No hay eventos en el respaldo externo."
 
+    def normalize_event(ev: dict) -> dict:
+        base = dict(ev or {})
+        raw = base.get("raw_json")
+        if raw:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, dict):
+                    base.update(parsed)
+            except Exception:
+                pass
+        return base
+
+    normalized_events = []
+    seen_queue_ids = set()
+    for raw_ev in events:
+        ev = normalize_event(raw_ev)
+        qid = clean_text(ev.get("queue_id", ""))
+        if qid:
+            if qid in seen_queue_ids:
+                continue
+            seen_queue_ids.add(qid)
+        normalized_events.append(ev)
+
+    def event_order_key(ev):
+        qid = clean_text(ev.get("queue_id", ""))
+        try:
+            return (0, int(qid))
+        except Exception:
+            return (1, clean_text(ev.get("queued_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("received_at", "")))
+
+    normalized_events.sort(key=event_order_key)
+
     lotes = {}
     items_by_lote = {}
     deleted_lotes = set()
     movement_by_item = {}
     scan_rows = []
+    incidencias_rows = []
+    reimpresiones_rows = []
+    lote_status_updates = {}
 
-    for ev in events:
+    for ev in normalized_events:
         et = clean_text(ev.get("event_type", ""))
         try:
             lote_id = int(ev.get("lote_id"))
@@ -481,6 +526,10 @@ def restore_from_backup_if_empty():
                 "archivo": clean_text(ev.get("archivo", "")),
                 "hoja": clean_text(ev.get("hoja", "")),
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "status": clean_text(ev.get("status", "ACTIVO")) or "ACTIVO",
+                "closed_at": clean_text(ev.get("closed_at", "")),
+                "closed_by": clean_text(ev.get("closed_by", "")),
+                "close_note": clean_text(ev.get("close_note", "")),
             }
         elif et == "lote_item":
             try:
@@ -545,6 +594,60 @@ def restore_from_backup_if_empty():
             except Exception:
                 continue
             movement_by_item[item_id] = movement_by_item.get(item_id, 0) - qty
+        elif et == "incidencia_creada" or et == "INCIDENCIA_ABIERTA":
+            try:
+                item_id_raw = ev.get("item_id", "")
+                item_id = int(item_id_raw) if clean_text(item_id_raw) else None
+            except Exception:
+                item_id = None
+            incidencias_rows.append({
+                "lote_id": lote_id,
+                "item_id": item_id,
+                "tipo": clean_text(ev.get("tipo", "")) or "Otro",
+                "cantidad": max(0, to_int(ev.get("cantidad", 0))),
+                "comentario": clean_text(ev.get("comentario", "")),
+                "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "status": clean_text(ev.get("status", "ABIERTA")) or "ABIERTA",
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion", "")),
+            })
+        elif et == "incidencia_resuelta" or et == "INCIDENCIA_RESUELTA":
+            # Se deja listo para futuros eventos de resolución; si no existe id estable, se resuelve por producto/tipo/comentario.
+            pass
+        elif et == "reimpresion_controlada" or et == "REIMPRESION_CONTROLADA":
+            try:
+                item_id_raw = ev.get("item_id", "")
+                item_id = int(item_id_raw) if clean_text(item_id_raw) else None
+            except Exception:
+                item_id = None
+            reimpresiones_rows.append({
+                "lote_id": lote_id,
+                "item_id": item_id,
+                "block_index": to_int(ev.get("block_index", 0)) or None,
+                "block_key": clean_text(ev.get("block_key", "")),
+                "scope": clean_text(ev.get("scope", "")) or ("BLOQUE" if clean_text(ev.get("block_key", "")) else "PRODUCTO"),
+                "cantidad": max(1, to_int(ev.get("cantidad", 1))),
+                "motivo": clean_text(ev.get("motivo", "")) or clean_text(ev.get("comentario", "")) or "Restaurado desde respaldo",
+                "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+            })
+        elif et == "lote_cerrado":
+            lote_status_updates[lote_id] = {
+                "status": "CERRADO",
+                "closed_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
+                "closed_by": clean_text(ev.get("usuario", "")) or clean_text(ev.get("closed_by", "")) or "SIN_USUARIO",
+                "close_note": clean_text(ev.get("comentario", "")) or clean_text(ev.get("close_note", "")),
+            }
+        elif et == "lote_reabierto":
+            lote_status_updates[lote_id] = {
+                "status": "ACTIVO",
+                "closed_at": "",
+                "closed_by": "",
+                "close_note": "",
+            }
         elif et == "lote_eliminado":
             deleted_lotes.add(lote_id)
 
@@ -555,28 +658,71 @@ def restore_from_backup_if_empty():
     now = datetime.now().isoformat(timespec="seconds")
     restored_lotes = 0
     restored_items = 0
+    restored_scans = 0
+    restored_incidencias = 0
+    restored_reimpresiones = 0
+
     with db() as c:
         for lid in sorted(active_lote_ids):
             lote = lotes[lid]
-            c.execute("INSERT OR REPLACE INTO lotes (id, nombre, archivo, hoja, created_at) VALUES (?, ?, ?, ?, ?)", (lote["id"], lote["nombre"], lote["archivo"], lote["hoja"], lote["created_at"]))
+            status_update = lote_status_updates.get(lid, {})
+            status = clean_text(status_update.get("status", lote.get("status", "ACTIVO"))) or "ACTIVO"
+            closed_at = clean_text(status_update.get("closed_at", lote.get("closed_at", "")))
+            closed_by = clean_text(status_update.get("closed_by", lote.get("closed_by", "")))
+            close_note = clean_text(status_update.get("close_note", lote.get("close_note", "")))
+            c.execute(
+                """
+                INSERT OR REPLACE INTO lotes
+                (id, nombre, archivo, hoja, created_at, status, closed_at, closed_by, close_note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (lote["id"], lote["nombre"], lote["archivo"], lote["hoja"], lote["created_at"], status, closed_at, closed_by, close_note),
+            )
             restored_lotes += 1
             for item in items_by_lote[lid].values():
                 qty = max(0, min(int(item["unidades"]), int(movement_by_item.get(int(item["id"]), 0))))
                 item["acopiadas"] = qty
                 item["updated_at"] = now if qty else item["updated_at"]
-                c.execute("""
+                c.execute(
+                    """
                     INSERT OR REPLACE INTO items
                     (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
                      identificacion, vence, dia, hora, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item["dia"], item["hora"], item["created_at"], item["updated_at"]))
+                    """,
+                    (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item["dia"], item["hora"], item["created_at"], item["updated_at"]),
+                )
                 restored_items += 1
         for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at in scan_rows:
             if lote_id in active_lote_ids and cantidad > 0:
                 c.execute("INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at))
+                restored_scans += 1
+        for inc in incidencias_rows:
+            if inc["lote_id"] in active_lote_ids:
+                c.execute(
+                    """
+                    INSERT INTO incidencias
+                    (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
+                     codigo_ml, codigo_universal, sku, descripcion)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (inc["lote_id"], inc["item_id"], inc["tipo"], inc["cantidad"], inc["comentario"], inc["usuario"], inc["status"], inc["created_at"], inc["codigo_ml"], inc["codigo_universal"], inc["sku"], inc["descripcion"]),
+                )
+                restored_incidencias += 1
+        for rep in reimpresiones_rows:
+            if rep["lote_id"] in active_lote_ids:
+                c.execute(
+                    """
+                    INSERT INTO reimpresiones
+                    (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (rep["lote_id"], rep["item_id"], rep["block_index"], rep["block_key"], rep["scope"], rep["cantidad"], rep["motivo"], rep["usuario"], rep["created_at"]),
+                )
+                restored_reimpresiones += 1
         c.commit()
-    return True, f"Restauración automática completa: {restored_lotes} lote(s), {restored_items} producto(s)."
 
+    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es)."
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
     """Envía eventos pendientes a Google Sheets.
@@ -1090,12 +1236,52 @@ def best_match(df):
 
 
 def reset_scan_state():
-    """Limpia el flujo de escaneo sin modificar directamente widgets ya creados."""
+    """Limpia solo el flujo activo de escaneo.
+
+Mantiene métricas/tablas intactas y deja preparado el foco para el próximo código.
+"""
     st.session_state["primary_validated"] = False
     st.session_state["primary_code"] = ""
     st.session_state["candidate_id"] = None
     st.session_state["candidate_mode"] = ""
+    st.session_state["_last_scan_submit_sig"] = ""
     st.session_state["_clear_scan_inputs_next_run"] = True
+    st.session_state["_focus_scan_primary_next_run"] = True
+
+
+def focus_scan_primary_once():
+    """Best-effort: intenta devolver el foco al primer input del escaneo PDA.
+
+Streamlit no expone autofocus nativo para text_input; este script es defensivo
+para PDA/navegador y no rompe si el navegador bloquea el foco.
+"""
+    if not st.session_state.get("_focus_scan_primary_next_run", True):
+        return
+    st.session_state["_focus_scan_primary_next_run"] = False
+    components.html(
+        """
+        <script>
+        const tryFocus = () => {
+          try {
+            const parentDoc = window.parent.document;
+            const inputs = parentDoc.querySelectorAll('input');
+            for (const input of inputs) {
+              const aria = (input.getAttribute('aria-label') || '').toLowerCase();
+              const ph = (input.getAttribute('placeholder') || '').toLowerCase();
+              if (aria.includes('código ml') || aria.includes('codigo ml') || ph.includes('código') || ph.includes('codigo')) {
+                input.focus();
+                input.select();
+                break;
+              }
+            }
+          } catch(e) {}
+        };
+        setTimeout(tryFocus, 250);
+        setTimeout(tryFocus, 750);
+        </script>
+        """,
+        height=0,
+    )
 
 
 def clear_scan_inputs_if_needed():
@@ -1820,6 +2006,17 @@ def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, us
         )
         c.commit()
 
+    enqueue_backup_event("reimpresion_controlada", {
+        **build_lote_payload(lote_id),
+        "item_id": "",
+        "block_index": int(block["block_index"]),
+        "block_key": clean_text(block["block_key"]),
+        "scope": "BLOQUE",
+        "cantidad": int(block["total_qty"]),
+        "motivo": motivo,
+        "usuario": usuario,
+        "created_at": now,
+    })
     log_audit_event(lote_id, event_type="REIMPRESION_CONTROLADA", detail=f"Bloque {int(block['block_index'])} · {motivo}", qty=int(block["total_qty"]), mode=usuario)
     return True, "Reimpresión registrada."
 
@@ -1859,6 +2056,21 @@ def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo:
             rows,
         )
         c.commit()
+    enqueue_backup_event("reimpresion_controlada", {
+        **build_lote_payload(lote_id),
+        "item_id": int(item.get("id")),
+        "codigo_ml": norm_code(item.get("codigo_ml", "")),
+        "codigo_universal": norm_code(item.get("codigo_universal", "")),
+        "sku": norm_code(item.get("sku", "")),
+        "descripcion": clean_text(item.get("descripcion", "")),
+        "block_index": "",
+        "block_key": "",
+        "scope": "PRODUCTO",
+        "cantidad": int(qty),
+        "motivo": motivo,
+        "usuario": usuario,
+        "created_at": now,
+    })
     log_audit_event(lote_id, int(item.get("id")), "REIMPRESION_CONTROLADA", f"Producto · {motivo}", qty, item.get("codigo_ml", ""), item.get("sku", ""), usuario)
     return True, "Reimpresión individual registrada."
 
@@ -2328,8 +2540,9 @@ elif page == "Escaneo":
 
         clear_scan_inputs_if_needed()
 
-        st.text_input("Código ML o EAN supermercado", key="scan_primary")
-        cv, cl = st.columns([2, 1])
+        st.text_input("Código ML o EAN supermercado", key="scan_primary", placeholder="Escanea código")
+        focus_scan_primary_once()
+        cv, cl = st.columns([3, 1])
         with cv:
             validar_primario = st.button("Validar código", type="primary")
         with cl:
