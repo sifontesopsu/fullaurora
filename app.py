@@ -19,6 +19,7 @@ DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "aurora_full_v3.db"
 MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
 DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
+MAX_BACKUP_ATTEMPTS = 5
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
@@ -577,17 +578,25 @@ def restore_from_backup_if_empty():
     return True, f"Restauración automática completa: {restored_lotes} lote(s), {restored_items} producto(s)."
 
 
-def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
+def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
+    """Envía eventos pendientes a Google Sheets.
+
+    Producción:
+    - no borra eventos si falla;
+    - después de MAX_BACKUP_ATTEMPTS deja el evento como failed;
+    - include_failed permite reintentar fallidos manualmente desde la UI.
+    """
     url = clean_text(webhook_url or get_backup_webhook_url())
     if not url:
         return
 
+    statuses = ("'pending','failed'" if include_failed else "'pending'")
     with db() as c:
         rows = c.execute(
-            """
+            f"""
             SELECT id, event_type, payload_json, attempts, created_at
             FROM backup_queue
-            WHERE status='pending'
+            WHERE status IN ({statuses})
             ORDER BY id ASC
             LIMIT ?
             """,
@@ -615,13 +624,41 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
                 c.commit()
 
         except Exception as e:
+            attempts_next = int(row["attempts"] or 0) + 1
+            new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
             with db() as c:
                 c.execute(
-                    "UPDATE backup_queue SET attempts=attempts+1, last_error=? WHERE id=?",
-                    (str(e)[:500], int(row["id"])),
+                    """
+                    UPDATE backup_queue
+                    SET attempts=?, status=?, last_error=?
+                    WHERE id=?
+                    """,
+                    (attempts_next, new_status, str(e)[:500], int(row["id"])),
                 )
                 c.commit()
 
+
+def retry_failed_backups(limit: int = 1000):
+    """Reintenta eventos fallidos sin perder su queue_id original."""
+    with db() as c:
+        c.execute("UPDATE backup_queue SET status='pending' WHERE status='failed'")
+        c.commit()
+    flush_backup_queue(limit=limit, include_failed=True)
+
+
+def get_backup_error_rows(limit: int = 20) -> pd.DataFrame:
+    with db() as c:
+        return pd.read_sql_query(
+            """
+            SELECT id, event_type, status, attempts, last_error, created_at, sent_at
+            FROM backup_queue
+            WHERE COALESCE(last_error,'') <> '' OR status='failed'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            c,
+            params=(int(limit),),
+        )
 
 def backup_status():
     with db() as c:
@@ -630,13 +667,13 @@ def backup_status():
             SELECT
                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
                 MAX(sent_at) AS last_sent,
                 MAX(last_error) AS last_error
             FROM backup_queue
             """
         ).fetchone()
-    return dict(row) if row else {"pending": 0, "sent": 0, "last_sent": "", "last_error": ""}
-
+    return dict(row) if row else {"pending": 0, "sent": 0, "failed": 0, "last_sent": "", "last_error": ""}
 
 def test_backup_webhook() -> tuple[bool, str]:
     url = get_backup_webhook_url()
@@ -813,6 +850,8 @@ def delete_lote(lote_id):
 
 
 def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
+    if is_lote_closed(lote_id):
+        return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de escanear."
     now = datetime.now().isoformat(timespec="seconds")
     with db() as c:
         item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lote_id)).fetchone()
@@ -1291,6 +1330,9 @@ def get_label_block_record(lote_id: int, block_index: int, block_key: str) -> di
 
 
 def register_block_download(lote_id: int, block: dict):
+    if is_lote_closed(lote_id):
+        st.error("Este lote está cerrado. Reabre el lote desde Supervisor antes de imprimir etiquetas.")
+        return
     now = datetime.now().isoformat(timespec="seconds")
     existing = get_label_block_record(lote_id, block["block_index"], block["block_key"])
     is_reprint = 1 if existing else 0
@@ -1345,6 +1387,9 @@ def register_block_download(lote_id: int, block: dict):
 
 
 def register_individual_download(lote_id: int, item: dict, qty: int):
+    if is_lote_closed(lote_id):
+        st.error("Este lote está cerrado. Reabre el lote desde Supervisor antes de imprimir etiquetas.")
+        return
     now = datetime.now().isoformat(timespec="seconds")
     qty = max(1, int(qty or 1))
     summary = get_label_print_summary(lote_id)
@@ -1507,6 +1552,32 @@ def get_operator_name() -> str:
     return clean_text(st.session_state.get("operator_name", "")) or "SIN_USUARIO"
 
 
+def get_lote_status(lote_id: int) -> str:
+    lote = get_lote(lote_id)
+    return clean_text(lote.get("status", "ACTIVO")) or "ACTIVO"
+
+
+def is_lote_closed(lote_id: int) -> bool:
+    return get_lote_status(lote_id).upper() == "CERRADO"
+
+
+def item_tiene_incidencia_abierta(lote_id: int, item_id) -> bool:
+    try:
+        iid = int(item_id)
+    except Exception:
+        return False
+    with db() as c:
+        row = c.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM incidencias
+            WHERE lote_id=? AND item_id=? AND status='ABIERTA'
+            """,
+            (int(lote_id), iid),
+        ).fetchone()
+    return int(row["n"] or 0) > 0 if row else False
+
+
 def get_incidencias(lote_id=None, status=None) -> pd.DataFrame:
     with db() as c:
         where = []
@@ -1625,6 +1696,8 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
 
 def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad: int, comentario: str, usuario: str = "SIN_USUARIO"):
     """Crea incidencia desde Escaneo usando Etiqueta ML / Código Universal / SKU."""
+    if is_lote_closed(lote_id):
+        return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de registrar incidencias."
     codigo_norm = norm_code(codigo)
     if not codigo_norm:
         return False, "Ingresa una Etiqueta ML, Código Universal o SKU."
@@ -1691,6 +1764,8 @@ def get_label_blocks_df(lote_id: int) -> pd.DataFrame:
 
 
 def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, usuario: str):
+    if is_lote_closed(lote_id):
+        return False, "Este lote está cerrado. Reabre el lote antes de reimprimir."
     motivo = clean_text(motivo)
     usuario = clean_text(usuario) or "SIN_USUARIO"
     if len(motivo) < 5:
@@ -1750,6 +1825,8 @@ def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, us
 
 
 def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo: str, usuario: str):
+    if is_lote_closed(lote_id):
+        return False, "Este lote está cerrado. Reabre el lote antes de reimprimir."
     motivo = clean_text(motivo)
     usuario = clean_text(usuario) or "SIN_USUARIO"
     qty = max(1, int(qty or 1))
@@ -1841,6 +1918,8 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
 
 
 def close_lote(lote_id: int, usuario: str, nota: str):
+    if is_lote_closed(lote_id):
+        return False, "Este lote ya está cerrado."
     ok, issues, _ = cierre_validaciones(lote_id)
     if not ok:
         return False, "No se puede cerrar: " + " ".join(issues)
@@ -1852,6 +1931,13 @@ def close_lote(lote_id: int, usuario: str, nota: str):
             (now, usuario, clean_text(nota), int(lote_id)),
         )
         c.commit()
+    enqueue_backup_event("lote_cerrado", {
+        **build_lote_payload(lote_id),
+        "created_at": now,
+        "usuario": usuario,
+        "comentario": clean_text(nota),
+        "status": "CERRADO",
+    })
     log_audit_event(lote_id, event_type="LOTE_CERRADO", detail=clean_text(nota), mode=usuario)
     return True, "Lote cerrado correctamente."
 
@@ -1861,6 +1947,13 @@ def reopen_lote(lote_id: int, usuario: str, motivo: str):
     with db() as c:
         c.execute("UPDATE lotes SET status='ACTIVO', closed_at=NULL, closed_by=NULL, close_note=NULL WHERE id=?", (int(lote_id),))
         c.commit()
+    enqueue_backup_event("lote_reabierto", {
+        **build_lote_payload(lote_id),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "usuario": usuario,
+        "comentario": clean_text(motivo),
+        "status": "ACTIVO",
+    })
     log_audit_event(lote_id, event_type="LOTE_REABIERTO", detail=clean_text(motivo), mode=usuario)
     return True, "Lote reabierto."
 
@@ -1937,11 +2030,23 @@ with st.sidebar:
     st.caption(f"URL activa: {mask_url(current_webhook_url)}")
     bs = backup_status()
     pending_backup = int(bs.get("pending") or 0)
+    failed_backup = int(bs.get("failed") or 0)
     sent_backup = int(bs.get("sent") or 0)
+    if failed_backup:
+        st.error(f"Respaldo externo: {failed_backup} eventos fallidos")
+        if st.button("Reintentar fallidos"):
+            retry_failed_backups(limit=1000)
+            st.rerun()
     if pending_backup:
         st.warning(f"Respaldo externo: {pending_backup} eventos pendientes")
         if bs.get("last_error"):
             st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
+        with st.expander("Últimos errores respaldo", expanded=False):
+            err_df = get_backup_error_rows(limit=20)
+            if err_df.empty:
+                st.caption("Sin errores registrados.")
+            else:
+                st.dataframe(err_df, use_container_width=True, hide_index=True, height=220)
         if st.button("Reintentar respaldo"):
             flush_backup_queue(limit=1000)
             st.rerun()
@@ -2035,6 +2140,8 @@ elif page == "Escaneo":
     if not active_lote:
         st.warning("Primero crea un lote FULL.")
     else:
+        lote_scan = get_lote(active_lote)
+        lote_cerrado = clean_text(lote_scan.get("status", "ACTIVO")).upper() == "CERRADO"
         items = get_items(active_lote)
         total = int(items["unidades"].sum()) if not items.empty else 0
         done = int(items["acopiadas"].sum()) if not items.empty else 0
@@ -2044,6 +2151,14 @@ elif page == "Escaneo":
         b.metric("Acopiado", done)
         c.metric("Pendiente", max(total - done, 0))
         st.divider()
+
+        if lote_cerrado:
+            st.error(f"Lote cerrado por {clean_text(lote_scan.get('closed_by',''))} el {fmt_dt(lote_scan.get('closed_at',''))}. No se permiten escaneos ni incidencias nuevas.")
+            recientes = get_recent_scans(active_lote, limit=8)
+            if not recientes.empty:
+                st.subheader("Últimos escaneos")
+                st.dataframe(recientes, use_container_width=True, hide_index=True, height=260)
+            st.stop()
 
         for k, v in {"primary_validated": False, "primary_code": "", "candidate_id": None, "candidate_mode": "", "_clear_scan_inputs_next_run": False}.items():
             if k not in st.session_state:
@@ -2143,6 +2258,9 @@ elif page == "Escaneo":
 
             # Si el producto se acaba de validar en esta misma corrida, ya mostramos arriba
             # nombre y cantidades. No los duplicamos para evitar parpadeos y confusión en PDA.
+            if item_tiene_incidencia_abierta(active_lote, int(candidate["id"])):
+                st.warning("⚠️ ESTE PRODUCTO TIENE INCIDENCIAS ABIERTAS. Revisa Supervisor antes de cerrar el lote.")
+
             if not candidate_from_preview_this_run:
                 st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
                 x1, x2, x3, x4 = st.columns(4)
@@ -2533,6 +2651,9 @@ elif page == "Etiquetas":
         st.warning("Primero crea o selecciona un lote FULL.")
     else:
         lote = get_lote(active_lote)
+        if clean_text(lote.get("status", "ACTIVO")).upper() == "CERRADO":
+            st.error(f"Lote cerrado por {clean_text(lote.get('closed_by',''))} el {fmt_dt(lote.get('closed_at',''))}. No se permite impresión normal ni reimpresión sin reapertura.")
+            st.stop()
         view = label_control_view(active_lote)
         if view.empty:
             st.warning("El lote activo no tiene productos.")
