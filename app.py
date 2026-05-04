@@ -1982,6 +1982,142 @@ def export_lote(lote_id):
     return out.getvalue()
 
 
+
+# ============================================================
+# Vistas integradas de Supervisor
+# ============================================================
+
+def render_control_integrado(active_lote: int):
+    """Control operativo integrado al panel Supervisor."""
+    lote = get_lote(active_lote)
+    items = get_items(active_lote)
+    if items.empty:
+        st.warning("El lote no tiene productos.")
+        return
+
+    view = items.copy()
+    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+    view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
+    scans = get_last_scans(active_lote)
+    if not scans.empty:
+        view = view.merge(scans, left_on="id", right_on="item_id", how="left")
+    else:
+        view["procesado_at"] = ""
+
+    c1, c2, c3, c4 = st.columns(4)
+    total = int(view["unidades"].sum())
+    done = int(view["acopiadas"].sum())
+    c1.metric("Unidades", total)
+    c2.metric("Acopiadas", done)
+    c3.metric("Pendientes", max(total - done, 0))
+    c4.metric("Avance", f"{(done / total * 100) if total else 0:.1f}%")
+    st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
+
+    filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"], key="sup_control_filtro")
+    show = view
+    if filtro == "Pendientes":
+        show = view[view["pendiente"] > 0]
+    elif filtro == "Completos":
+        show = view[view["pendiente"] == 0]
+    elif filtro == "Supermercado":
+        show = view[view["identificacion"].map(is_supermercado)]
+
+    option_rows = []
+    option_map = {"": None}
+    for _, sr in show.iterrows():
+        desc = clean_text(sr.get("descripcion", ""))
+        sku = clean_text(sr.get("sku", ""))
+        ml = clean_text(sr.get("codigo_ml", ""))
+        ean = clean_text(sr.get("codigo_universal", ""))
+        ident = clean_text(sr.get("identificacion", ""))
+        label = f"{desc} | SKU {sku} | ML {ml} | EAN {ean} | {ident}"[:180]
+        option_rows.append(label)
+        option_map[label] = int(sr["id"])
+
+    selected_search = st.selectbox(
+        "Buscar producto",
+        [""] + option_rows,
+        index=0,
+        placeholder="Escribe nombre, SKU, Código ML, EAN o supermercado",
+        key="sup_control_search_select",
+    )
+    selected_id = option_map.get(selected_search)
+    if selected_id:
+        show = show[show["id"].astype(int) == int(selected_id)]
+
+    st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
+    modo_vista = st.radio("Vista", ["Tarjetas operativas", "Tabla"], horizontal=True, key="sup_control_modo_vista")
+
+    if modo_vista == "Tabla":
+        out = show.rename(columns={
+            "codigo_ml": "Código ML",
+            "codigo_universal": "Código Universal",
+            "sku": "SKU",
+            "descripcion": "Producto",
+            "unidades": "Solicitadas",
+            "acopiadas": "Acopiadas",
+            "pendiente": "Pendiente",
+            "estado": "Estado",
+            "identificacion": "Identificación",
+            "vence": "Vence",
+            "procesado_at": "Último escaneo",
+        })
+        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo"]
+        st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
+        return
+
+    for _, r in show.iterrows():
+        ident = clean_text(r.get("identificacion", ""))
+        vence = clean_text(r.get("vence", ""))
+        proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
+        badges_parts = [
+            f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
+            f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
+            f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
+            f"<span class='badge'>{esc(r['estado'])}</span>",
+        ]
+        if is_supermercado(ident):
+            badges_parts.append("<span class='badge badge-alert'>SUPERMERCADO</span>")
+        if ident:
+            badges_parts.append(f"<span class='badge'>Identificación: {esc(ident)}</span>")
+        if vence:
+            badges_parts.append(f"<span class='badge'>Vence: {esc(vence)}</span>")
+        badges_html = "".join(badges_parts)
+        st.markdown(f"""
+        <div class='control-card'>
+            <div class='control-title'>{esc(r.get('descripcion',''))}</div>
+            <div class='control-meta'><b>ML:</b> {esc(r.get('codigo_ml',''))} · <b>EAN:</b> {esc(r.get('codigo_universal',''))} · <b>SKU:</b> {esc(r.get('sku',''))}</div>
+            <div>{badges_html}</div>
+            <div class='control-meta' style='margin-top:8px;'><b>Último escaneo:</b> {esc(proc)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+def render_auditoria_integrada(active_lote: int):
+    """Auditoría integrada al panel Supervisor."""
+    eventos = get_audit_events(active_lote, limit=500)
+    if eventos.empty:
+        st.info("Aún no hay eventos de auditoría para este lote.")
+        return
+
+    f_eventos = ["Todos"] + sorted([x for x in eventos["event_type"].dropna().unique().tolist()])
+    filtro_evento = st.selectbox("Filtrar evento", f_eventos, key="sup_audit_filtro_evento")
+    show = eventos.copy()
+    if filtro_evento != "Todos":
+        show = show[show["event_type"] == filtro_evento]
+    show = show.rename(columns={
+        "created_at": "Fecha",
+        "event_type": "Evento",
+        "detail": "Detalle",
+        "qty": "Cantidad",
+        "codigo_ml": "Código ML",
+        "sku": "SKU",
+        "mode": "Modo",
+        "item_id": "Item ID",
+    })
+    st.dataframe(show, use_container_width=True, hide_index=True, height=650)
+    st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
+
 # ============================================================
 # UI
 # ============================================================
@@ -2014,7 +2150,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Control", "Etiquetas", "Auditoría"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -2025,9 +2161,6 @@ with st.sidebar:
         active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
 
     st.divider()
-    current_webhook_url = get_backup_webhook_url()
-    st.caption(f"Webhook: {get_backup_webhook_source()}")
-    st.caption(f"URL activa: {mask_url(current_webhook_url)}")
     bs = backup_status()
     pending_backup = int(bs.get("pending") or 0)
     failed_backup = int(bs.get("failed") or 0)
@@ -2350,7 +2483,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_pendientes, tab_incid, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Bloques", "Reimpresión", "Cierre"])
+        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Bloques", "Reimpresión", "Cierre", "Auditoría"])
 
         with tab_resumen:
             view = items.copy()
@@ -2367,6 +2500,9 @@ elif page == "Supervisor":
                     "Incidencias abiertas": cierre_data.get("open_incidents", 0),
                 }])
                 st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+        with tab_control:
+            render_control_integrado(active_lote)
 
         with tab_pendientes:
             view = items.copy()
@@ -2491,6 +2627,10 @@ elif page == "Supervisor":
                         if ok_final:
                             st.rerun()
 
+
+
+        with tab_auditoria:
+            render_auditoria_integrada(active_lote)
 
 elif page == "Incidencias":
     st.subheader("Incidencias operativas")
