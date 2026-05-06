@@ -3068,6 +3068,8 @@ elif page == "Escaneo":
         candidate = None
         modo = st.session_state.get("candidate_mode", "")
         candidate_from_preview_this_run = False
+        aviso_prevalidacion_item_id = None
+        aviso_bloqueante_prevalidacion = False
 
         if st.session_state.get("candidate_id"):
             candidate = get_item_row(items, st.session_state["candidate_id"])
@@ -3082,14 +3084,21 @@ elif page == "Escaneo":
                 q1.metric("Solicitadas", int(preview["unidades"]))
                 q2.metric("Acopiadas", int(preview["acopiadas"]))
                 q3.metric("Pendientes", max(pendiente_preview, 0))
-                st.text_input("SKU / EAN / Código Universal", key="scan_secondary")
+                # Aviso operacional temprano: se muestra apenas se valida el Código ML,
+                # antes de pedir/validar SKU, EAN o Código Universal.
+                aviso_prevalidacion_item_id = int(preview["id"])
+                aviso_bloqueante_prevalidacion = render_avisos_operacionales_scan(active_lote, aviso_prevalidacion_item_id)
+                if aviso_bloqueante_prevalidacion:
+                    st.error("Este producto tiene un aviso operacional bloqueante. No continúes con SKU/EAN ni agregues cantidad hasta que Supervisor lo resuelva.")
+
+                st.text_input("SKU / EAN / Código Universal", key="scan_secondary", disabled=aviso_bloqueante_prevalidacion)
                 b1, b2 = st.columns(2)
                 with b1:
-                    validar_sec = st.button("Validar SKU/EAN", type="primary")
+                    validar_sec = st.button("Validar SKU/EAN", type="primary", disabled=aviso_bloqueante_prevalidacion)
                 with b2:
-                    sin_ean = st.button("Sin EAN")
+                    sin_ean = st.button("Sin EAN", disabled=aviso_bloqueante_prevalidacion)
 
-                if sin_ean:
+                if sin_ean and not aviso_bloqueante_prevalidacion:
                     m_no_super = m1[~m1["identificacion"].map(is_supermercado)]
                     if m_no_super.empty:
                         st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
@@ -3101,7 +3110,7 @@ elif page == "Escaneo":
                         modo = "SIN_EAN"
                         candidate_from_preview_this_run = True
 
-                if validar_sec and candidate is None:
+                if validar_sec and candidate is None and not aviso_bloqueante_prevalidacion:
                     sec = st.session_state.get("scan_secondary", "")
                     if not norm_code(sec):
                         st.error("Escanea o ingresa el SKU/EAN.")
@@ -3126,7 +3135,12 @@ elif page == "Escaneo":
             if item_tiene_incidencia_abierta(active_lote, int(candidate["id"])):
                 st.warning("⚠️ ESTE PRODUCTO TIENE INCIDENCIAS ABIERTAS. Revisa Supervisor antes de cerrar el lote.")
 
-            aviso_bloqueante = render_avisos_operacionales_scan(active_lote, int(candidate["id"]))
+            # Si ya mostramos el aviso al validar Código ML, no lo duplicamos después
+            # de validar SKU/EAN. Si el candidato viene de otro flujo, lo mostramos aquí.
+            if aviso_prevalidacion_item_id == int(candidate["id"]):
+                aviso_bloqueante = aviso_bloqueante_prevalidacion
+            else:
+                aviso_bloqueante = render_avisos_operacionales_scan(active_lote, int(candidate["id"]))
 
             if not candidate_from_preview_this_run:
                 st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
