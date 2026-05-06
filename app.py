@@ -355,6 +355,40 @@ def init_db():
                 resolution_comment TEXT
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS picking_lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                codigo_lista TEXT NOT NULL,
+                asignado_a TEXT NOT NULL,
+                estado TEXT NOT NULL DEFAULT 'CREADA',
+                created_by TEXT,
+                comentario TEXT,
+                created_at TEXT NOT NULL,
+                printed_at TEXT,
+                completed_at TEXT,
+                anulada_at TEXT,
+                anulada_by TEXT,
+                anulada_motivo TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS picking_list_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                picking_list_id INTEGER NOT NULL,
+                lote_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                codigo_ml TEXT,
+                codigo_universal TEXT,
+                sku TEXT,
+                descripcion TEXT,
+                cantidad INTEGER NOT NULL DEFAULT 0,
+                area TEXT,
+                nro TEXT,
+                estado TEXT NOT NULL DEFAULT 'PENDIENTE',
+                created_at TEXT NOT NULL
+            )
+        """)
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -366,6 +400,11 @@ def init_db():
         ensure_column(c, "incidencias", "descripcion", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_reason", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_user", "TEXT")
+        ensure_column(c, "scans", "operador_validador", "TEXT")
+        ensure_column(c, "scans", "picking_list_id", "INTEGER")
+        ensure_column(c, "scans", "picking_code", "TEXT")
+        ensure_column(c, "scans", "picker_asignado", "TEXT")
+
         # Confirmaciones externas de avisos operacionales: ML y Kame se pueden marcar después de crear el aviso.
         ensure_column(c, "avisos_operacionales", "confirmado_ml_at", "TEXT")
         ensure_column(c, "avisos_operacionales", "confirmado_ml_by", "TEXT")
@@ -381,6 +420,11 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_reimpresiones_lote ON reimpresiones (lote_id, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_avisos_lote ON avisos_operacionales (lote_id, estado, item_id, visible_operador, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_avisos_item ON avisos_operacionales (lote_id, item_id, estado)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_picking_lists_lote ON picking_lists (lote_id, estado, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_picking_items_list ON picking_list_items (picking_list_id, item_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_picking_items_lote ON picking_list_items (lote_id, item_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scans_picking ON scans (picking_list_id, item_id, created_at)")
+
         c.commit()
 
 
@@ -562,6 +606,8 @@ def restore_from_backup_if_empty():
     reimpresiones_rows = []
     avisos_rows = {}
     avisos_status_updates = {}
+    picking_rows = {}
+    picking_status_updates = {}
     lote_status_updates = {}
 
     for ev in normalized_events:
@@ -638,7 +684,14 @@ def restore_from_backup_if_empty():
             except Exception:
                 continue
             movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
-            scan_rows.append((lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")), qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds")))
+            scan_rows.append((
+                lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")),
+                qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+                clean_text(ev.get("operador_validador", "")) or "SIN_USUARIO",
+                to_int(ev.get("picking_list_id", 0)) or None,
+                clean_text(ev.get("picking_code", "")),
+                clean_text(ev.get("picker_asignado", "")),
+            ))
         elif et == "scan_deshacer":
             try:
                 item_id = int(ev.get("item_id"))
@@ -765,6 +818,45 @@ def restore_from_backup_if_empty():
                     "resolved_by": clean_text(ev.get("resolved_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                     "resolution_comment": clean_text(ev.get("resolution_comment", "")) or clean_text(ev.get("comentario", "")),
                 })
+        elif et == "picking_lista_creada" or et == "PICKING_LISTA_CREADA":
+            try:
+                plid_raw = ev.get("picking_list_id", "")
+                plid = int(plid_raw) if clean_text(plid_raw) else None
+            except Exception:
+                plid = None
+            key = plid or clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", ""))
+            if key:
+                picking_rows[key] = {
+                    "id": plid,
+                    "lote_id": lote_id,
+                    "codigo_lista": clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+                    "asignado_a": clean_text(ev.get("asignado_a", "")) or "SIN_ASIGNAR",
+                    "estado": clean_text(ev.get("estado", "CREADA")) or "CREADA",
+                    "created_by": clean_text(ev.get("created_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "comentario": clean_text(ev.get("comentario", "")),
+                    "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "items": ev.get("items") or [],
+                }
+        elif et in {"picking_lista_impresa", "PICKING_LISTA_IMPRESA", "picking_lista_completada", "PICKING_LISTA_COMPLETADA", "picking_lista_anulada", "PICKING_LISTA_ANULADA"}:
+            try:
+                plid_raw = ev.get("picking_list_id", "")
+                plid = int(plid_raw) if clean_text(plid_raw) else None
+            except Exception:
+                plid = None
+            key = plid or clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", ""))
+            if key:
+                upd = picking_status_updates.setdefault(key, {})
+                if "impresa" in et.lower():
+                    upd["estado"] = "IMPRESA"
+                    upd["printed_at"] = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds")
+                elif "completada" in et.lower():
+                    upd["estado"] = "COMPLETADA"
+                    upd["completed_at"] = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds")
+                elif "anulada" in et.lower():
+                    upd["estado"] = "ANULADA"
+                    upd["anulada_at"] = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds")
+                    upd["anulada_by"] = clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
+                    upd["anulada_motivo"] = clean_text(ev.get("comentario", ""))
         elif et == "lote_cerrado":
             lote_status_updates[lote_id] = {
                 "status": "CERRADO",
@@ -793,6 +885,7 @@ def restore_from_backup_if_empty():
     restored_incidencias = 0
     restored_reimpresiones = 0
     restored_avisos = 0
+    restored_picking = 0
 
     with db() as c:
         for lid in sorted(active_lote_ids):
@@ -825,9 +918,18 @@ def restore_from_backup_if_empty():
                     (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item["dia"], item["hora"], item["created_at"], item["updated_at"]),
                 )
                 restored_items += 1
-        for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at in scan_rows:
+        for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at, operador_validador, picking_list_id, picking_code, picker_asignado in scan_rows:
             if lote_id in active_lote_ids and cantidad > 0:
-                c.execute("INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at))
+                c.execute(
+                    """
+                    INSERT INTO scans
+                    (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
+                     operador_validador, picking_list_id, picking_code, picker_asignado)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
+                     operador_validador, picking_list_id, picking_code, picker_asignado),
+                )
                 restored_scans += 1
         for inc in incidencias_rows:
             if inc["lote_id"] in active_lote_ids:
@@ -905,9 +1007,56 @@ def restore_from_backup_if_empty():
                          aviso_resolved_at, aviso_resolved_by, aviso_resolution_comment),
                     )
                 restored_avisos += 1
+        for key, plist in picking_rows.items():
+            if plist["lote_id"] in active_lote_ids:
+                upd = picking_status_updates.get(plist.get("id"), {}) or picking_status_updates.get(plist.get("codigo_lista"), {}) or {}
+                estado = clean_text(upd.get("estado", plist.get("estado", "CREADA"))) or "CREADA"
+                printed_at = clean_text(upd.get("printed_at", ""))
+                completed_at = clean_text(upd.get("completed_at", ""))
+                anulada_at = clean_text(upd.get("anulada_at", ""))
+                anulada_by = clean_text(upd.get("anulada_by", ""))
+                anulada_motivo = clean_text(upd.get("anulada_motivo", ""))
+                if plist.get("id"):
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO picking_lists
+                        (id, lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at,
+                         printed_at, completed_at, anulada_at, anulada_by, anulada_motivo)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (plist["id"], plist["lote_id"], plist["codigo_lista"], plist["asignado_a"], estado, plist["created_by"], plist["comentario"], plist["created_at"], printed_at, completed_at, anulada_at, anulada_by, anulada_motivo),
+                    )
+                    list_id_db = int(plist["id"])
+                else:
+                    cur = c.execute(
+                        """
+                        INSERT INTO picking_lists
+                        (lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at,
+                         printed_at, completed_at, anulada_at, anulada_by, anulada_motivo)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (plist["lote_id"], plist["codigo_lista"], plist["asignado_a"], estado, plist["created_by"], plist["comentario"], plist["created_at"], printed_at, completed_at, anulada_at, anulada_by, anulada_motivo),
+                    )
+                    list_id_db = int(cur.lastrowid)
+                c.execute("DELETE FROM picking_list_items WHERE picking_list_id=?", (list_id_db,))
+                for pit in plist.get("items", []):
+                    try:
+                        item_id = int(pit.get("item_id"))
+                    except Exception:
+                        continue
+                    c.execute(
+                        """
+                        INSERT INTO picking_list_items
+                        (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                         cantidad, area, nro, estado, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
+                        """,
+                        (list_id_db, plist["lote_id"], item_id, norm_code(pit.get("codigo_ml", "")), norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion", "")), to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")), plist["created_at"]),
+                    )
+                restored_picking += 1
         c.commit()
 
-    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es)."
+    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking."
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
     """Envía eventos pendientes a Google Sheets.
@@ -1180,7 +1329,7 @@ def delete_lote(lote_id):
     log_audit_event(lote_id, event_type="LOTE_ELIMINADO", detail="Lote eliminado", qty=int(items_count))
 
 
-def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
+def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo, operador_validador='', picking_list_id=None):
     if is_lote_closed(lote_id):
         return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de escanear."
     now = now_cl().isoformat(timespec="seconds")
@@ -1196,10 +1345,19 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo)
         if cantidad > pendiente:
             return False, f"No puedes agregar {cantidad}. Solo quedan {pendiente} pendientes."
         c.execute("UPDATE items SET acopiadas=acopiadas+?, updated_at=? WHERE id=?", (cantidad, now, item_id))
+        picking_meta = get_picking_list_meta(picking_list_id) if picking_list_id else {}
         c.execute("""
-            INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now))
+            INSERT INTO scans
+            (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
+             operador_validador, picking_list_id, picking_code, picker_asignado)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now,
+            clean_text(operador_validador) or "SIN_USUARIO",
+            int(picking_list_id) if picking_list_id else None,
+            clean_text(picking_meta.get("codigo_lista", "")),
+            clean_text(picking_meta.get("asignado_a", "")),
+        ))
         c.commit()
 
     enqueue_backup_event("scan_agregado", {
@@ -1214,6 +1372,10 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo)
         "scan_primario": norm_code(scan_primario),
         "scan_secundario": norm_code(scan_secundario),
         "created_at": now,
+        "operador_validador": clean_text(operador_validador) or "SIN_USUARIO",
+        "picking_list_id": int(picking_list_id) if picking_list_id else "",
+        "picking_code": clean_text(picking_meta.get("codigo_lista", "")) if picking_list_id else "",
+        "picker_asignado": clean_text(picking_meta.get("asignado_a", "")) if picking_list_id else "",
     })
     log_audit_event(lote_id, item_id, "SKU_ESCANEADO", clean_text(item["descripcion"]), int(cantidad), item["codigo_ml"], item["sku"], modo)
     return True, "Cantidad agregada."
@@ -1243,6 +1405,10 @@ def undo_last_scan(lote_id):
         "scan_primario": norm_code(row["scan_primario"]),
         "scan_secundario": norm_code(row["scan_secundario"]),
         "created_at": now,
+        "operador_validador": clean_text(row["operador_validador"] if "operador_validador" in row.keys() else ""),
+        "picking_list_id": clean_text(row["picking_list_id"] if "picking_list_id" in row.keys() else ""),
+        "picking_code": clean_text(row["picking_code"] if "picking_code" in row.keys() else ""),
+        "picker_asignado": clean_text(row["picker_asignado"] if "picker_asignado" in row.keys() else ""),
     })
     log_audit_event(lote_id, int(row["item_id"]), "SCAN_DESHECHO", clean_text(item_payload.get("descripcion", "")), int(row["cantidad"]), item_payload.get("codigo_ml", ""), item_payload.get("sku", ""), row["modo"])
     return True, "Último escaneo deshecho."
@@ -1847,7 +2013,8 @@ def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
     with db() as c:
         return pd.read_sql_query(
             """
-            SELECT s.created_at, i.descripcion, i.codigo_ml, i.sku, s.cantidad, s.modo
+            SELECT s.created_at, i.descripcion, i.codigo_ml, i.sku, s.cantidad, s.modo,
+                   s.operador_validador, s.picking_code, s.picker_asignado
             FROM scans s
             LEFT JOIN items i ON i.id=s.item_id
             WHERE s.lote_id=?
@@ -2657,6 +2824,592 @@ def reopen_lote(lote_id: int, usuario: str, motivo: str):
     log_audit_event(lote_id, event_type="LOTE_REABIERTO", detail=clean_text(motivo), mode=usuario)
     return True, "Lote reabierto."
 
+
+# ============================================================
+# Picking: listas imprimibles y trazabilidad de preparación
+# ============================================================
+
+PICKING_ACTIVE_STATES = ("CREADA", "IMPRESA", "EN PREPARACIÓN", "PARCIAL")
+
+
+def next_picking_code(lote_id: int) -> str:
+    with db() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM picking_lists WHERE lote_id=?", (int(lote_id),)).fetchone()
+    n = int(row["n"] or 0) + 1 if row else 1
+    return f"PCK-{int(lote_id):03d}-{n:03d}"
+
+
+def get_picking_list_meta(picking_list_id) -> dict:
+    if not picking_list_id:
+        return {}
+    with db() as c:
+        row = c.execute("SELECT * FROM picking_lists WHERE id=?", (int(picking_list_id),)).fetchone()
+    return dict(row) if row else {}
+
+
+def get_picking_lists(lote_id: int | None = None) -> pd.DataFrame:
+    with db() as c:
+        if lote_id:
+            return pd.read_sql_query(
+                """
+                SELECT *
+                FROM picking_lists
+                WHERE lote_id=?
+                ORDER BY id DESC
+                """,
+                c,
+                params=(int(lote_id),),
+            )
+        return pd.read_sql_query("SELECT * FROM picking_lists ORDER BY id DESC", c)
+
+
+def get_picking_items(picking_list_id: int) -> pd.DataFrame:
+    with db() as c:
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM picking_list_items
+            WHERE picking_list_id=?
+            ORDER BY area, CAST(nro AS INTEGER), id
+            """,
+            c,
+            params=(int(picking_list_id),),
+        )
+
+
+def get_picking_assigned_qty(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT pli.item_id, SUM(pli.cantidad) AS asignado
+            FROM picking_list_items pli
+            JOIN picking_lists pl ON pl.id=pli.picking_list_id
+            WHERE pli.lote_id=? AND pl.estado <> 'ANULADA'
+            GROUP BY pli.item_id
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    if df.empty:
+        return pd.DataFrame(columns=["item_id", "asignado"])
+    df["asignado"] = df["asignado"].fillna(0).astype(int)
+    return df
+
+
+def get_picking_available_items(lote_id: int) -> pd.DataFrame:
+    """Productos disponibles para listas de picking.
+
+    Regla operacional: un producto/SKU se asigna completo a una sola lista activa.
+    No se permite dividir cantidades del mismo producto entre listas, porque eso
+    desordena el papel y la trazabilidad. Si ya tiene cualquier cantidad asignada
+    en una lista no anulada, queda bloqueado para nuevas listas.
+    """
+    items = get_items(lote_id)
+    if items.empty:
+        return items
+    assigned = get_picking_assigned_qty(lote_id)
+    view = items.merge(assigned, left_on="id", right_on="item_id", how="left")
+    view["asignado"] = view["asignado"].fillna(0).astype(int)
+    view["ya_asignado"] = view["asignado"].astype(int) > 0
+    view["disponible_asignar"] = view.apply(
+        lambda r: int(r["unidades"]) if not bool(r["ya_asignado"]) else 0,
+        axis=1,
+    )
+    view["estado_asignacion"] = view["ya_asignado"].map(lambda x: "YA ASIGNADO" if x else "DISPONIBLE")
+    return view
+
+
+def get_picking_validation_summary(picking_list_id: int) -> pd.DataFrame:
+    items = get_picking_items(picking_list_id)
+    if items.empty:
+        return items
+    with db() as c:
+        scans = pd.read_sql_query(
+            """
+            SELECT item_id, SUM(cantidad) AS validado_pda, MAX(created_at) AS ultimo_validado
+            FROM scans
+            WHERE picking_list_id=?
+            GROUP BY item_id
+            """,
+            c,
+            params=(int(picking_list_id),),
+        )
+    if scans.empty:
+        items["validado_pda"] = 0
+        items["ultimo_validado"] = ""
+    else:
+        items = items.merge(scans, on="item_id", how="left")
+        items["validado_pda"] = items["validado_pda"].fillna(0).astype(int)
+        items["ultimo_validado"] = items["ultimo_validado"].fillna("")
+    items["pendiente_picking"] = (items["cantidad"].astype(int) - items["validado_pda"].astype(int)).clip(lower=0)
+    def estado_row(r):
+        req = int(r["cantidad"])
+        val = int(r["validado_pda"])
+        if val == 0:
+            return "SIN VALIDAR"
+        if val < req:
+            return "PARCIAL"
+        if val == req:
+            return "COMPLETO"
+        return "SOBREVALIDADO"
+    items["estado_validacion"] = items.apply(estado_row, axis=1)
+    return items
+
+
+def item_in_picking_list(picking_list_id, item_id) -> bool:
+    if not picking_list_id:
+        return True
+    with db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM picking_list_items WHERE picking_list_id=? AND item_id=?",
+            (int(picking_list_id), int(item_id)),
+        ).fetchone()
+    return int(row["n"] or 0) > 0 if row else False
+
+
+def picking_pending_for_item(picking_list_id, item_id) -> dict:
+    if not picking_list_id:
+        return {"cantidad": None, "validado_pda": 0, "pendiente": None}
+    with db() as c:
+        item = c.execute(
+            "SELECT cantidad FROM picking_list_items WHERE picking_list_id=? AND item_id=?",
+            (int(picking_list_id), int(item_id)),
+        ).fetchone()
+        if not item:
+            return {"cantidad": 0, "validado_pda": 0, "pendiente": 0}
+        val = c.execute(
+            "SELECT COALESCE(SUM(cantidad),0) AS n FROM scans WHERE picking_list_id=? AND item_id=?",
+            (int(picking_list_id), int(item_id)),
+        ).fetchone()
+    cantidad = int(item["cantidad"] or 0)
+    validado = int(val["n"] or 0) if val else 0
+    return {"cantidad": cantidad, "validado_pda": validado, "pendiente": max(cantidad - validado, 0)}
+
+
+def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentario: str, selected_rows: list[dict]):
+    asignado_a = clean_text(asignado_a)
+    created_by = clean_text(created_by) or "SIN_USUARIO"
+    comentario = clean_text(comentario)
+    if not asignado_a:
+        return False, "Debes indicar a quién se asigna la lista."
+    rows_clean = []
+    seen_items = set()
+    for r in selected_rows:
+        item_id = int(r.get("id") or r.get("item_id") or 0)
+        cantidad = int(r.get("unidades") or r.get("cantidad") or 0)
+        ya_asignado = bool(r.get("ya_asignado")) or int(r.get("asignado") or 0) > 0
+        disponible = int(r.get("disponible_asignar") or 0)
+        if item_id and cantidad > 0:
+            if item_id in seen_items:
+                continue
+            if ya_asignado or disponible <= 0:
+                return False, f"El producto item {item_id} ya está asignado en otra lista activa. Anula esa lista si necesitas reasignarlo."
+            # Regla: se asigna el producto completo, nunca una cantidad parcial.
+            rows_clean.append((item_id, cantidad))
+            seen_items.add(item_id)
+    if not rows_clean:
+        return False, "Selecciona al menos un producto disponible."
+
+    # Validación defensiva contra datos desactualizados en pantalla: ningún item
+    # seleccionado puede estar ya asignado a otra lista activa/no anulada.
+    with db() as c:
+        for item_id, _cantidad in rows_clean:
+            row = c.execute(
+                """
+                SELECT COALESCE(SUM(pli.cantidad),0) AS n
+                FROM picking_list_items pli
+                JOIN picking_lists pl ON pl.id=pli.picking_list_id
+                WHERE pli.lote_id=? AND pli.item_id=? AND pl.estado <> 'ANULADA'
+                """,
+                (int(lote_id), int(item_id)),
+            ).fetchone()
+            if int(row["n"] or 0) > 0:
+                return False, f"El producto item {item_id} ya fue asignado a otra lista activa."
+
+    now = now_cl().isoformat(timespec="seconds")
+    codigo = next_picking_code(lote_id)
+    with db() as c:
+        cur = c.execute(
+            """
+            INSERT INTO picking_lists
+            (lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at)
+            VALUES (?, ?, ?, 'CREADA', ?, ?, ?)
+            """,
+            (int(lote_id), codigo, asignado_a, created_by, comentario, now),
+        )
+        list_id = int(cur.lastrowid)
+        inserted_items = []
+        for item_id, cantidad in rows_clean:
+            item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
+            if not item:
+                continue
+            c.execute(
+                """
+                INSERT INTO picking_list_items
+                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                 cantidad, area, nro, estado, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
+                """,
+                (
+                    list_id, int(lote_id), int(item_id), norm_code(item["codigo_ml"]), norm_code(item["codigo_universal"]),
+                    norm_code(item["sku"]), clean_text(item["descripcion"]), int(cantidad), clean_text(item["area"]),
+                    clean_text(item["nro"]), now,
+                ),
+            )
+            inserted_items.append({
+                "item_id": int(item_id),
+                "codigo_ml": norm_code(item["codigo_ml"]),
+                "codigo_universal": norm_code(item["codigo_universal"]),
+                "sku": norm_code(item["sku"]),
+                "descripcion": clean_text(item["descripcion"]),
+                "cantidad": int(cantidad),
+                "area": clean_text(item["area"]),
+                "nro": clean_text(item["nro"]),
+            })
+        c.commit()
+
+    total_units = sum(int(x["cantidad"]) for x in inserted_items)
+    enqueue_backup_event("picking_lista_creada", {
+        **build_lote_payload(lote_id),
+        "picking_list_id": list_id,
+        "picking_code": codigo,
+        "codigo_lista": codigo,
+        "asignado_a": asignado_a,
+        "estado": "CREADA",
+        "created_by": created_by,
+        "comentario": comentario,
+        "created_at": now,
+        "productos": len(inserted_items),
+        "cantidad": total_units,
+        "items": inserted_items,
+        "tipo": "PICKING",
+        "modo": "PICKING",
+    })
+    log_audit_event(lote_id, event_type="PICKING_LISTA_CREADA", detail=f"{codigo} asignada a {asignado_a}", qty=total_units, mode=created_by)
+    return True, f"Lista {codigo} creada para {asignado_a}."
+
+
+def mark_picking_printed(picking_list_id: int, usuario: str = ""):
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    now = now_cl().isoformat(timespec="seconds")
+    meta = get_picking_list_meta(picking_list_id)
+    if not meta:
+        return
+    with db() as c:
+        c.execute(
+            "UPDATE picking_lists SET estado=CASE WHEN estado='CREADA' THEN 'IMPRESA' ELSE estado END, printed_at=COALESCE(printed_at, ?) WHERE id=?",
+            (now, int(picking_list_id)),
+        )
+        c.commit()
+    enqueue_backup_event("picking_lista_impresa", {
+        **build_lote_payload(int(meta["lote_id"])),
+        "picking_list_id": int(picking_list_id),
+        "picking_code": clean_text(meta.get("codigo_lista", "")),
+        "codigo_lista": clean_text(meta.get("codigo_lista", "")),
+        "asignado_a": clean_text(meta.get("asignado_a", "")),
+        "created_at": now,
+        "usuario": usuario,
+        "estado": "IMPRESA",
+        "tipo": "PICKING",
+        "modo": "PICKING",
+    })
+    log_audit_event(int(meta["lote_id"]), event_type="PICKING_LISTA_IMPRESA", detail=clean_text(meta.get("codigo_lista", "")), mode=usuario)
+
+
+def complete_picking_list(picking_list_id: int, usuario: str, comentario: str = ""):
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    comentario = clean_text(comentario)
+    meta = get_picking_list_meta(picking_list_id)
+    if not meta:
+        return False, "Lista no encontrada."
+    if clean_text(meta.get("estado")) == "ANULADA":
+        return False, "La lista está anulada."
+    summary = get_picking_validation_summary(picking_list_id)
+    pending = int(summary["pendiente_picking"].sum()) if not summary.empty else 0
+    if pending > 0:
+        return False, f"No puedes completar la lista: quedan {pending} unidades pendientes por validar en PDA."
+    now = now_cl().isoformat(timespec="seconds")
+    with db() as c:
+        c.execute("UPDATE picking_lists SET estado='COMPLETADA', completed_at=? WHERE id=?", (now, int(picking_list_id)))
+        c.commit()
+    enqueue_backup_event("picking_lista_completada", {
+        **build_lote_payload(int(meta["lote_id"])),
+        "picking_list_id": int(picking_list_id),
+        "picking_code": clean_text(meta.get("codigo_lista", "")),
+        "codigo_lista": clean_text(meta.get("codigo_lista", "")),
+        "asignado_a": clean_text(meta.get("asignado_a", "")),
+        "created_at": now,
+        "usuario": usuario,
+        "comentario": comentario,
+        "estado": "COMPLETADA",
+        "tipo": "PICKING",
+        "modo": "PICKING",
+    })
+    log_audit_event(int(meta["lote_id"]), event_type="PICKING_LISTA_COMPLETADA", detail=f"{meta.get('codigo_lista','')} · {comentario}", mode=usuario)
+    return True, "Lista de picking completada."
+
+
+def cancel_picking_list(picking_list_id: int, usuario: str, motivo: str):
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    motivo = clean_text(motivo)
+    if len(motivo) < 3:
+        return False, "Ingresa motivo de anulación."
+    meta = get_picking_list_meta(picking_list_id)
+    if not meta:
+        return False, "Lista no encontrada."
+    now = now_cl().isoformat(timespec="seconds")
+    with db() as c:
+        c.execute(
+            "UPDATE picking_lists SET estado='ANULADA', anulada_at=?, anulada_by=?, anulada_motivo=? WHERE id=?",
+            (now, usuario, motivo, int(picking_list_id)),
+        )
+        c.commit()
+    enqueue_backup_event("picking_lista_anulada", {
+        **build_lote_payload(int(meta["lote_id"])),
+        "picking_list_id": int(picking_list_id),
+        "picking_code": clean_text(meta.get("codigo_lista", "")),
+        "codigo_lista": clean_text(meta.get("codigo_lista", "")),
+        "asignado_a": clean_text(meta.get("asignado_a", "")),
+        "created_at": now,
+        "usuario": usuario,
+        "comentario": motivo,
+        "estado": "ANULADA",
+        "tipo": "PICKING",
+        "modo": "PICKING",
+    })
+    log_audit_event(int(meta["lote_id"]), event_type="PICKING_LISTA_ANULADA", detail=f"{meta.get('codigo_lista','')} · {motivo}", mode=usuario)
+    return True, "Lista de picking anulada."
+
+
+def picking_lists_with_progress(lote_id: int) -> pd.DataFrame:
+    lists = get_picking_lists(lote_id)
+    if lists.empty:
+        return lists
+    rows = []
+    for r in lists.itertuples(index=False):
+        summary = get_picking_validation_summary(int(r.id))
+        productos = len(summary) if not summary.empty else 0
+        unidades = int(summary["cantidad"].sum()) if not summary.empty else 0
+        validado = int(summary["validado_pda"].sum()) if not summary.empty else 0
+        pendiente = max(unidades - validado, 0)
+        estado_calc = clean_text(r.estado)
+        if estado_calc not in {"ANULADA", "COMPLETADA"}:
+            if validado > 0 and pendiente > 0:
+                estado_calc = "PARCIAL"
+            elif unidades > 0 and pendiente == 0:
+                estado_calc = "COMPLETADA"
+        rows.append({
+            "id": int(r.id),
+            "Lista": clean_text(r.codigo_lista),
+            "Asignado a": clean_text(r.asignado_a),
+            "Productos": productos,
+            "Unidades": unidades,
+            "Validado PDA": validado,
+            "Pendiente": pendiente,
+            "Estado": estado_calc,
+            "Creada": fmt_dt(r.created_at),
+            "Impresa": fmt_dt(getattr(r, "printed_at", "")),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_picking_print_html(picking_list_id: int) -> str:
+    meta = get_picking_list_meta(picking_list_id)
+    items = get_picking_items(picking_list_id)
+    lote = get_lote(int(meta.get("lote_id", 0))) if meta else {}
+    rows_html = []
+    for r in items.itertuples(index=False):
+        rows_html.append(f"""
+        <tr>
+          <td class="check">☐</td>
+          <td>{esc(r.area)} / {esc(r.nro)}</td>
+          <td><strong>{esc(r.codigo_ml)}</strong><br><span>{esc(r.codigo_universal)}</span></td>
+          <td>{esc(r.sku)}</td>
+          <td>{esc(r.descripcion)}</td>
+          <td class="qty">{int(r.cantidad)}</td>
+          <td></td>
+        </tr>
+        """)
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{esc(meta.get('codigo_lista','PICKING'))}</title>
+<style>
+  body {{ font-family: Arial, sans-serif; margin: 18px; color: #111; }}
+  .top {{ display:flex; justify-content:space-between; align-items:flex-start; border-bottom:2px solid #111; padding-bottom:10px; margin-bottom:14px; }}
+  .code {{ font-size:34px; font-weight:900; letter-spacing:1px; }}
+  .meta {{ font-size:13px; line-height:1.45; }}
+  h1 {{ font-size:20px; margin:0 0 6px 0; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+  th, td {{ border:1px solid #333; padding:6px; vertical-align:top; }}
+  th {{ background:#eee; }}
+  .check {{ font-size:22px; width:32px; text-align:center; }}
+  .qty {{ font-size:18px; font-weight:900; text-align:center; width:55px; }}
+  .obs {{ min-width:90px; }}
+  @media print {{ body {{ margin: 8mm; }} .no-print {{ display:none; }} }}
+</style>
+</head>
+<body>
+<div class="top">
+  <div>
+    <h1>FERRETERÍA AURORA - LISTA DE PICKING FULL</h1>
+    <div class="meta">
+      <strong>Lote:</strong> {esc(lote.get('nombre',''))}<br>
+      <strong>Asignado a:</strong> {esc(meta.get('asignado_a',''))}<br>
+      <strong>Fecha impresión:</strong> {fmt_dt(now_cl().isoformat(timespec='seconds'))}<br>
+      <strong>Comentario:</strong> {esc(meta.get('comentario',''))}
+    </div>
+  </div>
+  <div class="code">{esc(meta.get('codigo_lista',''))}</div>
+</div>
+<table>
+<thead>
+<tr>
+  <th>OK</th><th>Área/N°</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Obs.</th>
+</tr>
+</thead>
+<tbody>
+{''.join(rows_html)}
+</tbody>
+</table>
+<script>window.onload = function(){{ setTimeout(function(){{ window.print(); }}, 300); }};</script>
+</body>
+</html>"""
+
+
+def render_picking_module(active_lote: int):
+    st.subheader("Listas de Picking")
+    if not active_lote:
+        st.warning("Primero selecciona o crea un lote FULL.")
+        return
+    lote = get_lote(active_lote)
+    items_av = get_picking_available_items(active_lote)
+    lists_progress = picking_lists_with_progress(active_lote)
+    total_units = int(items_av["unidades"].sum()) if not items_av.empty else 0
+    assigned_units = int(items_av["asignado"].sum()) if not items_av.empty and "asignado" in items_av.columns else 0
+    available_units = int(items_av["disponible_asignar"].sum()) if not items_av.empty and "disponible_asignar" in items_av.columns else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Unidades lote", total_units)
+    m2.metric("Unidades asignadas", assigned_units)
+    m3.metric("Unidades sin asignar", available_units)
+    m4.metric("Listas", 0 if lists_progress.empty else len(lists_progress))
+    st.caption(f"Lote: {clean_text(lote.get('nombre',''))}")
+
+    tab_resumen, tab_crear, tab_detalle = st.tabs(["Resumen", "Crear lista", "Detalle / impresión"])
+
+    with tab_resumen:
+        if lists_progress.empty:
+            st.info("Aún no hay listas de picking para este lote.")
+        else:
+            st.dataframe(lists_progress.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True, height=330)
+        if not items_av.empty:
+            sin_asignar = items_av[items_av["disponible_asignar"].astype(int) > 0]
+            with st.expander("Productos sin asignar", expanded=False):
+                show = sin_asignar[["area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "estado_asignacion"]].copy()
+                st.dataframe(show, use_container_width=True, hide_index=True, height=320)
+
+    with tab_crear:
+        if items_av.empty:
+            st.warning("El lote no tiene productos.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                asignado_a = st.text_input("Asignado a", key="pick_asignado_a", placeholder="Nombre del picker")
+            with c2:
+                created_by = st.text_input("Creado por", key="pick_created_by", placeholder="Supervisor/Admin")
+            comentario = st.text_input("Comentario", key="pick_comentario", placeholder="Opcional")
+            q = st.text_input("Buscar producto", key="pick_search", placeholder="SKU, Código ML o descripción")
+            st.info("Regla operativa: cada producto seleccionado se asigna completo a esta lista. No se dividen cantidades del mismo SKU entre listas activas.")
+            solo_disp = st.checkbox("Mostrar solo productos sin asignar", value=True, key="pick_solo_disp")
+            base = items_av.copy()
+            if solo_disp:
+                base = base[base["disponible_asignar"].astype(int) > 0]
+            qn = normalize_header(q)
+            if qn:
+                mask = (
+                    base["sku"].astype(str).map(normalize_header).str.contains(qn, na=False) |
+                    base["codigo_ml"].astype(str).map(normalize_header).str.contains(qn, na=False) |
+                    base["descripcion"].astype(str).map(normalize_header).str.contains(qn, na=False)
+                )
+                base = base[mask]
+            base = base[["id", "area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "asignado", "disponible_asignar", "estado_asignacion", "ya_asignado"]].copy()
+            base.insert(0, "seleccionar", False)
+            edited = st.data_editor(
+                base,
+                use_container_width=True,
+                hide_index=True,
+                height=430,
+                column_config={
+                    "seleccionar": st.column_config.CheckboxColumn("Seleccionar"),
+                    "id": None,
+                    "ya_asignado": None,
+                    "disponible_asignar": None,
+                },
+                disabled=["area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "asignado", "disponible_asignar", "estado_asignacion", "ya_asignado"],
+                key="pick_editor",
+            )
+            selected = edited[(edited["seleccionar"] == True) & (edited["disponible_asignar"].astype(int) > 0)] if not edited.empty else pd.DataFrame()
+            st.caption(f"Seleccionados: {len(selected)} productos · {int(selected['unidades'].sum()) if not selected.empty else 0} unidades completas")
+            if st.button("Crear lista de picking", type="primary", disabled=selected.empty):
+                ok, msg = create_picking_list(active_lote, asignado_a, created_by, comentario, selected.to_dict("records"))
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    with tab_detalle:
+        lists = get_picking_lists(active_lote)
+        if lists.empty:
+            st.info("No hay listas para revisar.")
+        else:
+            options = {f"{r.codigo_lista} · {r.asignado_a} · {r.estado}": int(r.id) for r in lists.itertuples(index=False)}
+            selected_label = st.selectbox("Lista", list(options.keys()), key="pick_detail_select")
+            list_id = options[selected_label]
+            meta = get_picking_list_meta(list_id)
+            summary = get_picking_validation_summary(list_id)
+            d1, d2, d3, d4 = st.columns(4)
+            unidades = int(summary["cantidad"].sum()) if not summary.empty else 0
+            validado = int(summary["validado_pda"].sum()) if not summary.empty else 0
+            d1.metric("Lista", clean_text(meta.get("codigo_lista", "")))
+            d2.metric("Asignado a", clean_text(meta.get("asignado_a", "")))
+            d3.metric("Validado PDA", f"{validado}/{unidades}")
+            d4.metric("Estado", clean_text(meta.get("estado", "")))
+            if not summary.empty:
+                show = summary[["area", "nro", "codigo_ml", "sku", "descripcion", "cantidad", "validado_pda", "pendiente_picking", "estado_validacion"]].copy()
+                st.dataframe(show, use_container_width=True, hide_index=True, height=360)
+            html_print = build_picking_print_html(list_id)
+            fname = f"{clean_text(meta.get('codigo_lista','picking'))}.html"
+            st.download_button(
+                "Imprimir / descargar hoja HTML",
+                data=html_print,
+                file_name=fname,
+                mime="text/html",
+                key=f"print_picking_{list_id}_{clean_text(meta.get('estado',''))}",
+                on_click=mark_picking_printed,
+                args=(list_id, get_operator_name()),
+            )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                comp_user = st.text_input("Usuario cierre lista", key=f"pick_complete_user_{list_id}", value=get_operator_name())
+                comp_comment = st.text_input("Comentario cierre", key=f"pick_complete_comment_{list_id}")
+                if st.button("Marcar lista como completada", key=f"complete_pick_{list_id}"):
+                    ok, msg = complete_picking_list(list_id, comp_user, comp_comment)
+                    if ok:
+                        st.success(msg); st.rerun()
+                    else:
+                        st.error(msg)
+            with col_b:
+                cancel_user = st.text_input("Usuario anulación", key=f"pick_cancel_user_{list_id}", value=get_operator_name())
+                cancel_reason = st.text_input("Motivo anulación", key=f"pick_cancel_reason_{list_id}")
+                if st.button("Anular lista", key=f"cancel_pick_{list_id}"):
+                    ok, msg = cancel_picking_list(list_id, cancel_user, cancel_reason)
+                    if ok:
+                        st.success(msg); st.rerun()
+                    else:
+                        st.error(msg)
+
 # ============================================================
 # Exportación
 # ============================================================
@@ -2668,11 +3421,14 @@ def export_lote(lote_id):
         items["estado"] = items["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
     scans = pd.DataFrame()
     with db() as c:
-        scans = pd.read_sql_query("SELECT created_at, item_id, scan_primario, scan_secundario, cantidad, modo FROM scans WHERE lote_id=? ORDER BY id DESC", c, params=(lote_id,))
+        scans = pd.read_sql_query("SELECT created_at, item_id, scan_primario, scan_secundario, cantidad, modo, operador_validador, picking_list_id, picking_code, picker_asignado FROM scans WHERE lote_id=? ORDER BY id DESC", c, params=(lote_id,))
     audit = get_audit_events(lote_id, limit=5000)
     incidencias = get_incidencias(lote_id)
     reimpresiones = get_reimpresiones(lote_id)
     avisos = get_avisos_operacionales(lote_id)
+    picking_lists = get_picking_lists(lote_id)
+    with db() as c:
+        picking_items = pd.read_sql_query("SELECT * FROM picking_list_items WHERE lote_id=? ORDER BY picking_list_id, id", c, params=(lote_id,))
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         items.to_excel(writer, sheet_name="control_full", index=False)
@@ -2681,6 +3437,8 @@ def export_lote(lote_id):
         incidencias.to_excel(writer, sheet_name="incidencias", index=False)
         reimpresiones.to_excel(writer, sheet_name="reimpresiones", index=False)
         avisos.to_excel(writer, sheet_name="avisos_operacionales", index=False)
+        picking_lists.to_excel(writer, sheet_name="picking_listas", index=False)
+        picking_items.to_excel(writer, sheet_name="picking_items", index=False)
     return out.getvalue()
 
 
@@ -2852,7 +3610,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Etiquetas"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Supervisor", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -3016,6 +3774,40 @@ elif page == "Escaneo":
         c.metric("Pendiente", max(total - done, 0))
         st.divider()
 
+        # Sesión de trazabilidad: se define una vez, no por cada escaneo.
+        if "scan_operator" not in st.session_state:
+            st.session_state["scan_operator"] = ""
+        if "scan_picking_list_id" not in st.session_state:
+            st.session_state["scan_picking_list_id"] = 0
+        with st.container(border=True):
+            st.markdown("**Sesión de escaneo**")
+            sx1, sx2 = st.columns([1, 2])
+            with sx1:
+                st.text_input("Operador validador", key="scan_operator", placeholder="Nombre del operador PDA")
+            picking_options = {"Sin lista de picking": 0}
+            pl_active = get_picking_lists(active_lote)
+            if not pl_active.empty:
+                pl_active = pl_active[pl_active["estado"].astype(str).str.upper() != "ANULADA"]
+                for r in pl_active.itertuples(index=False):
+                    picking_options[f"{r.codigo_lista} · {r.asignado_a} · {r.estado}"] = int(r.id)
+            current_pick_id = int(st.session_state.get("scan_picking_list_id") or 0)
+            labels_pick = list(picking_options.keys())
+            default_idx_pick = 0
+            for idx, label in enumerate(labels_pick):
+                if picking_options[label] == current_pick_id:
+                    default_idx_pick = idx
+                    break
+            with sx2:
+                chosen_pick = st.selectbox("Lista picking activa", labels_pick, index=default_idx_pick, key="scan_picking_select")
+                st.session_state["scan_picking_list_id"] = int(picking_options[chosen_pick])
+            if not clean_text(st.session_state.get("scan_operator", "")):
+                st.warning("Para trazabilidad, define el operador validador una vez al inicio del escaneo.")
+            elif int(st.session_state.get("scan_picking_list_id") or 0):
+                pm = get_picking_list_meta(int(st.session_state.get("scan_picking_list_id") or 0))
+                st.success(f"Escaneando como {clean_text(st.session_state.get('scan_operator'))} · Lista {clean_text(pm.get('codigo_lista',''))} asignada a {clean_text(pm.get('asignado_a',''))}")
+            else:
+                st.info(f"Escaneando como {clean_text(st.session_state.get('scan_operator','SIN_USUARIO')) or 'SIN_USUARIO'} · Sin lista de picking asociada")
+
         if lote_cerrado:
             st.error(f"Lote cerrado por {clean_text(lote_scan.get('closed_by',''))} el {fmt_dt(lote_scan.get('closed_at',''))}. No se permiten escaneos ni incidencias nuevas.")
             recientes = get_recent_scans(active_lote, limit=8)
@@ -3142,6 +3934,17 @@ elif page == "Escaneo":
             else:
                 aviso_bloqueante = render_avisos_operacionales_scan(active_lote, int(candidate["id"]))
 
+            picking_bloqueo = False
+            active_pick_id = int(st.session_state.get("scan_picking_list_id") or 0)
+            if active_pick_id:
+                pm = get_picking_list_meta(active_pick_id)
+                if not item_in_picking_list(active_pick_id, int(candidate["id"])):
+                    picking_bloqueo = True
+                    st.error(f"Este producto no pertenece a la lista activa {clean_text(pm.get('codigo_lista',''))}. Cambia la lista o selecciona 'Sin lista de picking'.")
+                else:
+                    pp = picking_pending_for_item(active_pick_id, int(candidate["id"]))
+                    st.info(f"Picking {clean_text(pm.get('codigo_lista',''))} · Asignado a {clean_text(pm.get('asignado_a',''))} · Validado {int(pp['validado_pda'])}/{int(pp['cantidad'])} · Pendiente lista {int(pp['pendiente'])}")
+
             if not candidate_from_preview_this_run:
                 st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
                 x1, x2, x3, x4 = st.columns(4)
@@ -3157,10 +3960,12 @@ elif page == "Escaneo":
                     key="scan_qty_input",
                     placeholder="Ingresa cantidad",
                 )
-                agregar = st.form_submit_button("Agregar cantidad", type="primary", disabled=aviso_bloqueante)
+                agregar = st.form_submit_button("Agregar cantidad", type="primary", disabled=(aviso_bloqueante or picking_bloqueo))
 
             if aviso_bloqueante:
                 st.error("Este producto tiene un aviso operacional bloqueante. No se permite agregar cantidad hasta que Supervisor lo resuelva.")
+            if picking_bloqueo:
+                st.error("No se puede registrar este escaneo contra la lista picking activa.")
 
             if agregar:
                 qty = to_int(qty_txt)
@@ -3168,13 +3973,25 @@ elif page == "Escaneo":
                     st.error("Ingresa una cantidad válida mayor a cero.")
                 elif qty > pendiente:
                     st.error(f"No puedes agregar {qty}. Solo quedan {pendiente} pendientes.")
+                elif active_pick_id and qty > int(picking_pending_for_item(active_pick_id, int(candidate["id"])).get("pendiente") or 0):
+                    pp_now = picking_pending_for_item(active_pick_id, int(candidate["id"]))
+                    st.error(f"No puedes agregar {qty} en la lista activa. Solo quedan {int(pp_now.get('pendiente') or 0)} pendientes para esta lista.")
                 else:
                     submit_sig = f"{active_lote}:{int(candidate['id'])}:{qty}:{norm_code(st.session_state.get('scan_primary', ''))}:{norm_code(st.session_state.get('scan_secondary', ''))}:{modo}"
                     if st.session_state.get("_last_scan_submit_sig") == submit_sig:
                         st.warning("Este escaneo ya fue procesado. Limpia o escanea el siguiente producto.")
                     else:
                         st.session_state["_last_scan_submit_sig"] = submit_sig
-                        ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
+                        ok, msg = add_acopio(
+                            active_lote,
+                            int(candidate["id"]),
+                            int(qty),
+                            st.session_state.get("scan_primary", ""),
+                            st.session_state.get("scan_secondary", ""),
+                            modo,
+                            clean_text(st.session_state.get("scan_operator", "")) or "SIN_USUARIO",
+                            active_pick_id if active_pick_id else None,
+                        )
                         if ok:
                             reset_scan_state()
                             st.success(msg)
@@ -3200,8 +4017,17 @@ elif page == "Escaneo":
                 "sku": "SKU",
                 "cantidad": "Cantidad",
                 "modo": "Modo",
+                "operador_validador": "Operador",
+                "picking_code": "Lista picking",
+                "picker_asignado": "Picker",
             })
             st.dataframe(recientes, use_container_width=True, hide_index=True, height=260)
+
+elif page == "Picking":
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        render_picking_module(active_lote)
 
 elif page == "Supervisor":
     st.subheader("Panel supervisor")
