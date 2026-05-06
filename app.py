@@ -328,6 +328,33 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS avisos_operacionales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                codigo_ml TEXT,
+                codigo_universal TEXT,
+                sku TEXT,
+                descripcion TEXT,
+                tipo_aviso TEXT NOT NULL,
+                mensaje_operador TEXT,
+                cantidad_original INTEGER,
+                cantidad_nueva INTEGER,
+                requiere_ajuste_ml INTEGER NOT NULL DEFAULT 0,
+                requiere_ajuste_inventario INTEGER NOT NULL DEFAULT 0,
+                confirmado_ml INTEGER NOT NULL DEFAULT 0,
+                confirmado_inventario INTEGER NOT NULL DEFAULT 0,
+                visible_operador INTEGER NOT NULL DEFAULT 1,
+                estado TEXT NOT NULL DEFAULT 'ACTIVO',
+                comentario_interno TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by TEXT,
+                resolution_comment TEXT
+            )
+        """)
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -339,6 +366,11 @@ def init_db():
         ensure_column(c, "incidencias", "descripcion", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_reason", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_user", "TEXT")
+        # Confirmaciones externas de avisos operacionales: ML y Kame se pueden marcar después de crear el aviso.
+        ensure_column(c, "avisos_operacionales", "confirmado_ml_at", "TEXT")
+        ensure_column(c, "avisos_operacionales", "confirmado_ml_by", "TEXT")
+        ensure_column(c, "avisos_operacionales", "confirmado_inventario_at", "TEXT")
+        ensure_column(c, "avisos_operacionales", "confirmado_inventario_by", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
@@ -347,6 +379,8 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_audit_lote ON audit_events (lote_id, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_incidencias_lote ON incidencias (lote_id, status, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_reimpresiones_lote ON reimpresiones (lote_id, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_avisos_lote ON avisos_operacionales (lote_id, estado, item_id, visible_operador, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_avisos_item ON avisos_operacionales (lote_id, item_id, estado)")
         c.commit()
 
 
@@ -526,6 +560,8 @@ def restore_from_backup_if_empty():
     scan_rows = []
     incidencias_rows = []
     reimpresiones_rows = []
+    avisos_rows = {}
+    avisos_status_updates = {}
     lote_status_updates = {}
 
     for ev in normalized_events:
@@ -650,6 +686,85 @@ def restore_from_backup_if_empty():
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
+        elif et == "aviso_operacional_creado" or et == "AVISO_OPERACIONAL_CREADO":
+            try:
+                aviso_id_raw = ev.get("aviso_id", "")
+                aviso_id = int(aviso_id_raw) if clean_text(aviso_id_raw) else None
+            except Exception:
+                aviso_id = None
+            try:
+                item_id_raw = ev.get("item_id", "")
+                item_id = int(item_id_raw) if clean_text(item_id_raw) else None
+            except Exception:
+                item_id = None
+            if item_id:
+                key = aviso_id or f"{lote_id}:{item_id}:{clean_text(ev.get('tipo_aviso',''))}:{clean_text(ev.get('created_at','')) or clean_text(ev.get('queued_at',''))}"
+                avisos_rows[key] = {
+                    "id": aviso_id,
+                    "lote_id": lote_id,
+                    "item_id": item_id,
+                    "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                    "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                    "sku": norm_code(ev.get("sku", "")),
+                    "descripcion": clean_text(ev.get("descripcion", "")),
+                    "tipo_aviso": clean_text(ev.get("tipo_aviso", "")) or "Preparar con observación",
+                    "mensaje_operador": clean_text(ev.get("mensaje_operador", "")),
+                    "cantidad_original": to_int(ev.get("cantidad_original", 0)),
+                    "cantidad_nueva": to_int(ev.get("cantidad_nueva", 0)) if clean_text(ev.get("cantidad_nueva", "")) else None,
+                    "requiere_ajuste_ml": 1 if ev.get("requiere_ajuste_ml") in [1, "1", True, "true", "TRUE", "Sí", "SI"] else 0,
+                    "requiere_ajuste_inventario": 1 if ev.get("requiere_ajuste_inventario") in [1, "1", True, "true", "TRUE", "Sí", "SI"] else 0,
+                    "confirmado_ml": 1 if ev.get("confirmado_ml") in [1, "1", True, "true", "TRUE", "Sí", "SI"] else 0,
+                    "confirmado_inventario": 1 if (ev.get("confirmado_inventario") in [1, "1", True, "true", "TRUE", "Sí", "SI"] or ev.get("confirmado_kame") in [1, "1", True, "true", "TRUE", "Sí", "SI"]) else 0,
+                    "confirmado_ml_at": clean_text(ev.get("confirmado_ml_at", "")),
+                    "confirmado_ml_by": clean_text(ev.get("confirmado_ml_by", "")),
+                    "confirmado_inventario_at": clean_text(ev.get("confirmado_inventario_at", "")) or clean_text(ev.get("confirmado_kame_at", "")),
+                    "confirmado_inventario_by": clean_text(ev.get("confirmado_inventario_by", "")) or clean_text(ev.get("confirmado_kame_by", "")),
+                    "visible_operador": 0 if ev.get("visible_operador") in [0, "0", False, "false", "FALSE", "No", "NO"] else 1,
+                    "estado": clean_text(ev.get("estado", "ACTIVO")) or "ACTIVO",
+                    "comentario_interno": clean_text(ev.get("comentario_interno", "")),
+                    "created_by": clean_text(ev.get("created_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "resolved_at": clean_text(ev.get("resolved_at", "")),
+                    "resolved_by": clean_text(ev.get("resolved_by", "")),
+                    "resolution_comment": clean_text(ev.get("resolution_comment", "")),
+                }
+        elif et == "aviso_operacional_ml_confirmado" or et == "AVISO_OPERACIONAL_ML_CONFIRMADO":
+            try:
+                aviso_id_raw = ev.get("aviso_id", "")
+                aviso_id = int(aviso_id_raw) if clean_text(aviso_id_raw) else None
+            except Exception:
+                aviso_id = None
+            if aviso_id:
+                upd = avisos_status_updates.setdefault(aviso_id, {})
+                upd["confirmado_ml"] = 1
+                upd["confirmado_ml_at"] = clean_text(ev.get("confirmado_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds")
+                upd["confirmado_ml_by"] = clean_text(ev.get("confirmado_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
+        elif et == "aviso_operacional_kame_confirmado" or et == "AVISO_OPERACIONAL_KAME_CONFIRMADO":
+            try:
+                aviso_id_raw = ev.get("aviso_id", "")
+                aviso_id = int(aviso_id_raw) if clean_text(aviso_id_raw) else None
+            except Exception:
+                aviso_id = None
+            if aviso_id:
+                upd = avisos_status_updates.setdefault(aviso_id, {})
+                upd["confirmado_inventario"] = 1
+                upd["confirmado_inventario_at"] = clean_text(ev.get("confirmado_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds")
+                upd["confirmado_inventario_by"] = clean_text(ev.get("confirmado_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
+        elif et == "aviso_operacional_resuelto" or et == "AVISO_OPERACIONAL_RESUELTO":
+            try:
+                aviso_id_raw = ev.get("aviso_id", "")
+                aviso_id = int(aviso_id_raw) if clean_text(aviso_id_raw) else None
+            except Exception:
+                aviso_id = None
+            if aviso_id:
+                upd = avisos_status_updates.setdefault(aviso_id, {})
+                upd.update({
+                    "estado": "RESUELTO",
+                    "visible_operador": 0,
+                    "resolved_at": clean_text(ev.get("resolved_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "resolved_by": clean_text(ev.get("resolved_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "resolution_comment": clean_text(ev.get("resolution_comment", "")) or clean_text(ev.get("comentario", "")),
+                })
         elif et == "lote_cerrado":
             lote_status_updates[lote_id] = {
                 "status": "CERRADO",
@@ -677,6 +792,7 @@ def restore_from_backup_if_empty():
     restored_scans = 0
     restored_incidencias = 0
     restored_reimpresiones = 0
+    restored_avisos = 0
 
     with db() as c:
         for lid in sorted(active_lote_ids):
@@ -736,9 +852,62 @@ def restore_from_backup_if_empty():
                     (rep["lote_id"], rep["item_id"], rep["block_index"], rep["block_key"], rep["scope"], rep["cantidad"], rep["motivo"], rep["usuario"], rep["created_at"]),
                 )
                 restored_reimpresiones += 1
+        for aviso in avisos_rows.values():
+            if aviso["lote_id"] in active_lote_ids and aviso.get("item_id"):
+                upd = avisos_status_updates.get(aviso.get("id"), {}) if aviso.get("id") else {}
+                aviso_estado = clean_text(upd.get("estado", aviso.get("estado", "ACTIVO"))) or "ACTIVO"
+                aviso_confirmado_ml = int(upd.get("confirmado_ml", aviso.get("confirmado_ml", 0)))
+                aviso_confirmado_inv = int(upd.get("confirmado_inventario", aviso.get("confirmado_inventario", 0)))
+                aviso_confirmado_ml_at = clean_text(upd.get("confirmado_ml_at", aviso.get("confirmado_ml_at", "")))
+                aviso_confirmado_ml_by = clean_text(upd.get("confirmado_ml_by", aviso.get("confirmado_ml_by", "")))
+                aviso_confirmado_inv_at = clean_text(upd.get("confirmado_inventario_at", aviso.get("confirmado_inventario_at", "")))
+                aviso_confirmado_inv_by = clean_text(upd.get("confirmado_inventario_by", aviso.get("confirmado_inventario_by", "")))
+                aviso_visible = int(upd.get("visible_operador", aviso.get("visible_operador", 1)))
+                aviso_resolved_at = clean_text(upd.get("resolved_at", aviso.get("resolved_at", "")))
+                aviso_resolved_by = clean_text(upd.get("resolved_by", aviso.get("resolved_by", "")))
+                aviso_resolution_comment = clean_text(upd.get("resolution_comment", aviso.get("resolution_comment", "")))
+                if aviso.get("id"):
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO avisos_operacionales
+                        (id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                         tipo_aviso, mensaje_operador, cantidad_original, cantidad_nueva,
+                         requiere_ajuste_ml, requiere_ajuste_inventario, confirmado_ml, confirmado_inventario,
+                         confirmado_ml_at, confirmado_ml_by, confirmado_inventario_at, confirmado_inventario_by,
+                         visible_operador, estado, comentario_interno, created_by, created_at,
+                         resolved_at, resolved_by, resolution_comment)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (aviso["id"], aviso["lote_id"], aviso["item_id"], aviso["codigo_ml"], aviso["codigo_universal"], aviso["sku"], aviso["descripcion"],
+                         aviso["tipo_aviso"], aviso["mensaje_operador"], aviso["cantidad_original"], aviso["cantidad_nueva"],
+                         aviso["requiere_ajuste_ml"], aviso["requiere_ajuste_inventario"], aviso_confirmado_ml, aviso_confirmado_inv,
+                         aviso_confirmado_ml_at, aviso_confirmado_ml_by, aviso_confirmado_inv_at, aviso_confirmado_inv_by,
+                         aviso_visible, aviso_estado, aviso["comentario_interno"], aviso["created_by"], aviso["created_at"],
+                         aviso_resolved_at, aviso_resolved_by, aviso_resolution_comment),
+                    )
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO avisos_operacionales
+                        (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                         tipo_aviso, mensaje_operador, cantidad_original, cantidad_nueva,
+                         requiere_ajuste_ml, requiere_ajuste_inventario, confirmado_ml, confirmado_inventario,
+                         confirmado_ml_at, confirmado_ml_by, confirmado_inventario_at, confirmado_inventario_by,
+                         visible_operador, estado, comentario_interno, created_by, created_at,
+                         resolved_at, resolved_by, resolution_comment)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (aviso["lote_id"], aviso["item_id"], aviso["codigo_ml"], aviso["codigo_universal"], aviso["sku"], aviso["descripcion"],
+                         aviso["tipo_aviso"], aviso["mensaje_operador"], aviso["cantidad_original"], aviso["cantidad_nueva"],
+                         aviso["requiere_ajuste_ml"], aviso["requiere_ajuste_inventario"], aviso_confirmado_ml, aviso_confirmado_inv,
+                         aviso_confirmado_ml_at, aviso_confirmado_ml_by, aviso_confirmado_inv_at, aviso_confirmado_inv_by,
+                         aviso_visible, aviso_estado, aviso["comentario_interno"], aviso["created_by"], aviso["created_at"],
+                         aviso_resolved_at, aviso_resolved_by, aviso_resolution_comment),
+                    )
+                restored_avisos += 1
         c.commit()
 
-    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es)."
+    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es)."
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
     """Envía eventos pendientes a Google Sheets.
@@ -1749,6 +1918,25 @@ INCIDENCIA_TIPOS = [
     "Otro",
 ]
 
+AVISO_OPERACIONAL_TIPOS = [
+    "Ajuste de cantidad",
+    "Producto retirado del lote",
+    "Preparar con observación",
+    "No escanear / esperar instrucción",
+    "Cambio autorizado por administración",
+]
+
+AVISO_OPERACIONAL_BLOQUEA = {
+    "Producto retirado del lote",
+    "No escanear / esperar instrucción",
+}
+
+AVISO_OPERACIONAL_REQUIERE_CONFIRMACION = {
+    "Ajuste de cantidad",
+    "Producto retirado del lote",
+    "Cambio autorizado por administración",
+}
+
 
 def get_operator_name() -> str:
     return clean_text(st.session_state.get("operator_name", "")) or "SIN_USUARIO"
@@ -2091,19 +2279,298 @@ def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo:
     return True, "Reimpresión individual registrada."
 
 
+
+def get_avisos_operacionales(lote_id=None, estado=None, item_id=None, visible_only: bool = False) -> pd.DataFrame:
+    with db() as c:
+        where = []
+        params = []
+        if lote_id:
+            where.append("av.lote_id=?")
+            params.append(int(lote_id))
+        if estado and clean_text(estado) != "Todos":
+            where.append("av.estado=?")
+            params.append(clean_text(estado))
+        if item_id:
+            where.append("av.item_id=?")
+            params.append(int(item_id))
+        if visible_only:
+            where.append("av.visible_operador=1")
+        sql_where = ("WHERE " + " AND ".join(where)) if where else ""
+        return pd.read_sql_query(
+            f"""
+            SELECT av.*, i.unidades AS unidades_actuales, i.acopiadas AS acopiadas_actuales
+            FROM avisos_operacionales av
+            LEFT JOIN items i ON i.id=av.item_id
+            {sql_where}
+            ORDER BY av.id DESC
+            """,
+            c,
+            params=params,
+        )
+
+
+def get_avisos_activos_item(lote_id: int, item_id: int, visible_only: bool = True) -> pd.DataFrame:
+    return get_avisos_operacionales(lote_id=lote_id, estado="ACTIVO", item_id=item_id, visible_only=visible_only)
+
+
+def aviso_bloquea_operacion(avisos_df: pd.DataFrame) -> bool:
+    if avisos_df is None or avisos_df.empty:
+        return False
+    return any(clean_text(x) in AVISO_OPERACIONAL_BLOQUEA for x in avisos_df["tipo_aviso"].fillna("").tolist())
+
+
+def render_avisos_operacionales_scan(lote_id: int, item_id: int) -> bool:
+    avisos = get_avisos_activos_item(lote_id, item_id, visible_only=True)
+    if avisos.empty:
+        return False
+    bloquea = aviso_bloquea_operacion(avisos)
+    for _, av in avisos.iterrows():
+        tipo = clean_text(av.get("tipo_aviso", ""))
+        msg = clean_text(av.get("mensaje_operador", ""))
+        cantidad_nueva = av.get("cantidad_nueva")
+        cantidad_txt = ""
+        try:
+            if cantidad_nueva is not None and clean_text(cantidad_nueva) != "" and int(cantidad_nueva) > 0:
+                cantidad_txt = f"<br><b>Nueva cantidad objetivo:</b> {int(cantidad_nueva)}"
+        except Exception:
+            cantidad_txt = ""
+        color = "#FEE2E2" if tipo in AVISO_OPERACIONAL_BLOQUEA else "#FEF3C7"
+        border = "#EF4444" if tipo in AVISO_OPERACIONAL_BLOQUEA else "#F59E0B"
+        titulo = "⛔ PRODUCTO CON BLOQUEO OPERACIONAL" if tipo in AVISO_OPERACIONAL_BLOQUEA else "⚠️ AVISO OPERACIONAL"
+        st.markdown(f"""
+        <div style="border:3px solid {border}; background:{color}; border-radius:18px; padding:18px; margin:14px 0;">
+            <div style="font-size:1.65rem;font-weight:950;line-height:1.2;">{titulo}</div>
+            <div style="font-size:1.25rem;font-weight:850;margin-top:8px;">{esc(tipo)}</div>
+            <div style="font-size:1.15rem;margin-top:8px;">{esc(msg)}{cantidad_txt}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    return bloquea
+
+
+def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaje_operador: str,
+                             cantidad_nueva, confirmado_ml: bool, confirmado_inventario: bool,
+                             visible_operador: bool, comentario_interno: str, created_by: str):
+    if is_lote_closed(lote_id):
+        return False, "Este lote está cerrado. Reabre el lote antes de crear avisos operacionales."
+    tipo_aviso = clean_text(tipo_aviso)
+    mensaje_operador = clean_text(mensaje_operador)
+    created_by = clean_text(created_by) or "SIN_USUARIO"
+    comentario_interno = clean_text(comentario_interno)
+    if not item_id:
+        return False, "Selecciona un producto."
+    # El aviso puede crearse aunque las confirmaciones externas estén pendientes.
+    # Esas confirmaciones se controlan después desde Supervisor y bloquean solo la resolución/cierre del aviso.
+    if len(mensaje_operador) < 4:
+        return False, "Ingresa un mensaje claro para el operador."
+    if len(comentario_interno) < 4:
+        return False, "Ingresa comentario interno para trazabilidad."
+
+    with db() as c:
+        row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
+        if not row:
+            return False, "Producto no encontrado en el lote activo."
+        item = dict(row)
+
+    now = now_cl().isoformat(timespec="seconds")
+    cantidad_original = int(item.get("unidades") or 0)
+    try:
+        cantidad_nueva_int = int(cantidad_nueva) if clean_text(cantidad_nueva) != "" else None
+    except Exception:
+        cantidad_nueva_int = None
+
+    requiere_conf = tipo_aviso in AVISO_OPERACIONAL_REQUIERE_CONFIRMACION
+    with db() as c:
+        cur = c.execute(
+            """
+            INSERT INTO avisos_operacionales
+            (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+             tipo_aviso, mensaje_operador, cantidad_original, cantidad_nueva,
+             requiere_ajuste_ml, requiere_ajuste_inventario, confirmado_ml, confirmado_inventario,
+             visible_operador, estado, comentario_interno, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?, ?, ?)
+            """,
+            (
+                int(lote_id), int(item_id), norm_code(item.get("codigo_ml", "")), norm_code(item.get("codigo_universal", "")),
+                norm_code(item.get("sku", "")), clean_text(item.get("descripcion", "")), tipo_aviso, mensaje_operador,
+                cantidad_original, cantidad_nueva_int, 1 if requiere_conf else 0, 1 if requiere_conf else 0,
+                1 if confirmado_ml else 0, 1 if confirmado_inventario else 0, 1 if visible_operador else 0,
+                comentario_interno, created_by, now,
+            ),
+        )
+        aviso_id = int(cur.lastrowid)
+        c.commit()
+
+    enqueue_backup_event("aviso_operacional_creado", {
+        **build_lote_payload(lote_id),
+        "aviso_id": aviso_id,
+        "item_id": int(item_id),
+        "codigo_ml": norm_code(item.get("codigo_ml", "")),
+        "codigo_universal": norm_code(item.get("codigo_universal", "")),
+        "sku": norm_code(item.get("sku", "")),
+        "descripcion": clean_text(item.get("descripcion", "")),
+        "tipo_aviso": tipo_aviso,
+        "mensaje_operador": mensaje_operador,
+        "cantidad_original": cantidad_original,
+        "cantidad_nueva": cantidad_nueva_int if cantidad_nueva_int is not None else "",
+        "requiere_ajuste_ml": 1 if requiere_conf else 0,
+        "requiere_ajuste_inventario": 1 if requiere_conf else 0,
+        "confirmado_ml": 1 if confirmado_ml else 0,
+        "confirmado_inventario": 1 if confirmado_inventario else 0,
+        "confirmado_kame": 1 if confirmado_inventario else 0,
+        "visible_operador": 1 if visible_operador else 0,
+        "estado": "ACTIVO",
+        "comentario_interno": comentario_interno,
+        "created_by": created_by,
+        "created_at": now,
+        "tipo": tipo_aviso,
+        "comentario": comentario_interno,
+        "modo": "AVISO_OPERACIONAL",
+    })
+    log_audit_event(lote_id, int(item_id), "AVISO_OPERACIONAL_CREADO", f"{tipo_aviso} · {mensaje_operador}", cantidad_nueva_int, item.get("codigo_ml", ""), item.get("sku", ""), created_by)
+    return True, "Aviso operacional creado."
+
+
+def resolve_aviso_operacional(aviso_id: int, resolved_by: str, resolution_comment: str):
+    resolved_by = clean_text(resolved_by) or "SIN_USUARIO"
+    resolution_comment = clean_text(resolution_comment)
+    if len(resolution_comment) < 3:
+        return False, "Ingresa comentario de resolución."
+    now = now_cl().isoformat(timespec="seconds")
+    with db() as c:
+        row = c.execute("SELECT * FROM avisos_operacionales WHERE id=?", (int(aviso_id),)).fetchone()
+        if not row:
+            return False, "Aviso operacional no encontrado."
+        aviso = dict(row)
+        if clean_text(aviso.get("estado")) == "RESUELTO":
+            return False, "Este aviso ya estaba resuelto."
+        if int(aviso.get("requiere_ajuste_ml") or 0) == 1 and int(aviso.get("confirmado_ml") or 0) != 1:
+            return False, "No puedes resolver este aviso: falta confirmar ajuste/rebaja en Mercado Libre."
+        if int(aviso.get("requiere_ajuste_inventario") or 0) == 1 and int(aviso.get("confirmado_inventario") or 0) != 1:
+            return False, "No puedes resolver este aviso: falta confirmar ajuste en inventario Kame."
+        c.execute(
+            """
+            UPDATE avisos_operacionales
+            SET estado='RESUELTO', visible_operador=0, resolved_at=?, resolved_by=?, resolution_comment=?
+            WHERE id=?
+            """,
+            (now, resolved_by, resolution_comment, int(aviso_id)),
+        )
+        c.commit()
+
+    enqueue_backup_event("aviso_operacional_resuelto", {
+        **build_lote_payload(int(aviso["lote_id"])),
+        "aviso_id": int(aviso_id),
+        "item_id": int(aviso["item_id"]),
+        "codigo_ml": norm_code(aviso.get("codigo_ml", "")),
+        "codigo_universal": norm_code(aviso.get("codigo_universal", "")),
+        "sku": norm_code(aviso.get("sku", "")),
+        "descripcion": clean_text(aviso.get("descripcion", "")),
+        "tipo_aviso": clean_text(aviso.get("tipo_aviso", "")),
+        "estado": "RESUELTO",
+        "visible_operador": 0,
+        "resolved_at": now,
+        "resolved_by": resolved_by,
+        "resolution_comment": resolution_comment,
+        "created_at": now,
+        "tipo": clean_text(aviso.get("tipo_aviso", "")),
+        "comentario": resolution_comment,
+        "modo": "AVISO_OPERACIONAL",
+    })
+    log_audit_event(int(aviso["lote_id"]), int(aviso["item_id"]), "AVISO_OPERACIONAL_RESUELTO", resolution_comment, None, aviso.get("codigo_ml", ""), aviso.get("sku", ""), resolved_by)
+    return True, "Aviso operacional resuelto y oculto al operador."
+
+
+def confirmar_tarea_externa_aviso(aviso_id: int, tarea: str, usuario: str):
+    """Marca una tarea externa pendiente del aviso operacional.
+
+    tarea='ml' confirma rebaja/ajuste en Mercado Libre.
+    tarea='kame' confirma ajuste de inventario Kame.
+    """
+    tarea = clean_text(tarea).lower()
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    now = now_cl().isoformat(timespec="seconds")
+    if tarea not in {"ml", "kame"}:
+        return False, "Tarea externa inválida."
+
+    with db() as c:
+        row = c.execute("SELECT * FROM avisos_operacionales WHERE id=?", (int(aviso_id),)).fetchone()
+        if not row:
+            return False, "Aviso operacional no encontrado."
+        aviso = dict(row)
+        if clean_text(aviso.get("estado")) == "RESUELTO":
+            return False, "Este aviso ya está resuelto."
+
+        if tarea == "ml":
+            if int(aviso.get("confirmado_ml") or 0) == 1:
+                return False, "Mercado Libre ya estaba confirmado."
+            c.execute(
+                """
+                UPDATE avisos_operacionales
+                SET confirmado_ml=1, confirmado_ml_at=?, confirmado_ml_by=?
+                WHERE id=?
+                """,
+                (now, usuario, int(aviso_id)),
+            )
+            event_type = "aviso_operacional_ml_confirmado"
+            audit_type = "AVISO_OPERACIONAL_ML_CONFIRMADO"
+            detail = "Ajuste/rebaja confirmado en Mercado Libre"
+            msg = "Mercado Libre confirmado."
+        else:
+            if int(aviso.get("confirmado_inventario") or 0) == 1:
+                return False, "Inventario Kame ya estaba confirmado."
+            c.execute(
+                """
+                UPDATE avisos_operacionales
+                SET confirmado_inventario=1, confirmado_inventario_at=?, confirmado_inventario_by=?
+                WHERE id=?
+                """,
+                (now, usuario, int(aviso_id)),
+            )
+            event_type = "aviso_operacional_kame_confirmado"
+            audit_type = "AVISO_OPERACIONAL_KAME_CONFIRMADO"
+            detail = "Ajuste confirmado en inventario Kame"
+            msg = "Inventario Kame confirmado."
+        c.commit()
+
+    enqueue_backup_event(event_type, {
+        **build_lote_payload(int(aviso["lote_id"])),
+        "aviso_id": int(aviso_id),
+        "item_id": int(aviso["item_id"]),
+        "codigo_ml": norm_code(aviso.get("codigo_ml", "")),
+        "codigo_universal": norm_code(aviso.get("codigo_universal", "")),
+        "sku": norm_code(aviso.get("sku", "")),
+        "descripcion": clean_text(aviso.get("descripcion", "")),
+        "tipo_aviso": clean_text(aviso.get("tipo_aviso", "")),
+        "mensaje_operador": clean_text(aviso.get("mensaje_operador", "")),
+        "confirmado_ml": 1 if tarea == "ml" else int(aviso.get("confirmado_ml") or 0),
+        "confirmado_inventario": 1 if tarea == "kame" else int(aviso.get("confirmado_inventario") or 0),
+        "confirmado_kame": 1 if tarea == "kame" else int(aviso.get("confirmado_inventario") or 0),
+        "confirmado_at": now,
+        "confirmado_by": usuario,
+        "created_at": now,
+        "tipo": clean_text(aviso.get("tipo_aviso", "")),
+        "comentario": detail,
+        "modo": "AVISO_OPERACIONAL",
+    })
+    log_audit_event(int(aviso["lote_id"]), int(aviso["item_id"]), audit_type, detail, None, aviso.get("codigo_ml", ""), aviso.get("sku", ""), usuario)
+    return True, msg
+
+
 def supervisor_metrics(lote_id: int) -> dict:
     items = get_items(lote_id)
     if items.empty:
-        return {"total": 0, "done": 0, "pending": 0, "incidencias_abiertas": 0, "label_pending": 0}
+        return {"total": 0, "done": 0, "pending": 0, "incidencias_abiertas": 0, "avisos_activos": 0, "label_pending": 0}
     view = items.copy()
     view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
     labels = label_control_view(lote_id)
     incid = get_incidencias(lote_id, status="ABIERTA")
+    avisos = get_avisos_operacionales(lote_id, estado="ACTIVO")
     return {
         "total": int(view["unidades"].sum()),
         "done": int(view["acopiadas"].sum()),
         "pending": int(view["pendiente"].sum()),
         "incidencias_abiertas": int(len(incid)),
+        "avisos_activos": int(len(avisos)),
         "label_pending": int(labels["label_pending"].sum()) if not labels.empty else 0,
     }
 
@@ -2124,6 +2591,10 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
     if not inc_abiertas.empty:
         issues.append(f"Hay {len(inc_abiertas)} incidencia(s) abiertas.")
 
+    avisos_activos = get_avisos_operacionales(lote_id, estado="ACTIVO")
+    if not avisos_activos.empty:
+        issues.append(f"Hay {len(avisos_activos)} aviso(s) operacional(es) activo(s).")
+
     label_view = label_control_view(lote_id)
     label_pending = int(label_view["label_pending"].sum()) if not label_view.empty else 0
     if label_pending > 0:
@@ -2139,6 +2610,7 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
     return len(issues) == 0, issues, {
         "pending_units": pending_units,
         "open_incidents": int(len(inc_abiertas)),
+        "active_notices": int(len(avisos_activos)),
         "label_pending": label_pending,
         "expected_blocks": int(len(blocks_expected)),
         "printed_blocks": int(len(blocks_db)),
@@ -2200,6 +2672,7 @@ def export_lote(lote_id):
     audit = get_audit_events(lote_id, limit=5000)
     incidencias = get_incidencias(lote_id)
     reimpresiones = get_reimpresiones(lote_id)
+    avisos = get_avisos_operacionales(lote_id)
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         items.to_excel(writer, sheet_name="control_full", index=False)
@@ -2207,6 +2680,7 @@ def export_lote(lote_id):
         audit.to_excel(writer, sheet_name="auditoria", index=False)
         incidencias.to_excel(writer, sheet_name="incidencias", index=False)
         reimpresiones.to_excel(writer, sheet_name="reimpresiones", index=False)
+        avisos.to_excel(writer, sheet_name="avisos_operacionales", index=False)
     return out.getvalue()
 
 
@@ -2652,6 +3126,8 @@ elif page == "Escaneo":
             if item_tiene_incidencia_abierta(active_lote, int(candidate["id"])):
                 st.warning("⚠️ ESTE PRODUCTO TIENE INCIDENCIAS ABIERTAS. Revisa Supervisor antes de cerrar el lote.")
 
+            aviso_bloqueante = render_avisos_operacionales_scan(active_lote, int(candidate["id"]))
+
             if not candidate_from_preview_this_run:
                 st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
                 x1, x2, x3, x4 = st.columns(4)
@@ -2667,7 +3143,10 @@ elif page == "Escaneo":
                     key="scan_qty_input",
                     placeholder="Ingresa cantidad",
                 )
-                agregar = st.form_submit_button("Agregar cantidad", type="primary")
+                agregar = st.form_submit_button("Agregar cantidad", type="primary", disabled=aviso_bloqueante)
+
+            if aviso_bloqueante:
+                st.error("Este producto tiene un aviso operacional bloqueante. No se permite agregar cantidad hasta que Supervisor lo resuelva.")
 
             if agregar:
                 qty = to_int(qty_txt)
@@ -2724,12 +3203,13 @@ elif page == "Supervisor":
         done = metrics["done"]
         avance = (done / total * 100) if total else 0
 
-        s1, s2, s3, s4, s5 = st.columns(5)
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
         s1.metric("Estado lote", clean_text(lote.get("status", "ACTIVO")))
         s2.metric("Avance", f"{avance:.1f}%")
         s3.metric("Pendientes", metrics["pending"])
         s4.metric("Incidencias abiertas", metrics["incidencias_abiertas"])
-        s5.metric("Etiquetas pendientes", metrics["label_pending"])
+        s5.metric("Avisos activos", metrics.get("avisos_activos", 0))
+        s6.metric("Etiquetas pendientes", metrics["label_pending"])
 
         st.progress(done / total if total else 0)
         st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Creado: {fmt_dt(lote.get('created_at',''))}")
@@ -2741,7 +3221,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Bloques", "Reimpresión", "Cierre", "Auditoría"])
+        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_avisos, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Avisos operacionales", "Bloques", "Reimpresión", "Cierre", "Auditoría"])
 
         with tab_resumen:
             view = items.copy()
@@ -2756,6 +3236,7 @@ elif page == "Supervisor":
                     "Bloques impresos": cierre_data.get("printed_blocks", 0),
                     "Bloques esperados": cierre_data.get("expected_blocks", 0),
                     "Incidencias abiertas": cierre_data.get("open_incidents", 0),
+                    "Avisos operacionales activos": cierre_data.get("active_notices", 0),
                 }])
                 st.dataframe(resumen, use_container_width=True, hide_index=True)
 
@@ -2782,6 +3263,135 @@ elif page == "Supervisor":
                 out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
                 cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "SKU", "Producto", "Comentario", "Usuario"]
                 st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
+
+        with tab_avisos:
+            st.info("Los avisos operacionales los crea Supervisor/Admin. El operador solo los ve al escanear el producto.")
+            sub_crear, sub_activos, sub_historial = st.tabs(["Crear aviso", "Activos", "Historial"])
+            with sub_crear:
+                if is_lote_closed(active_lote):
+                    st.warning("El lote está cerrado. Reabre el lote para crear avisos operacionales.")
+                else:
+                    items_av = get_items(active_lote)
+                    opciones_av = []
+                    mapa_av = {}
+                    for _, r in items_av.iterrows():
+                        label = f"{clean_text(r.get('descripcion',''))[:85]} | ML {clean_text(r.get('codigo_ml',''))} | EAN {clean_text(r.get('codigo_universal',''))} | SKU {clean_text(r.get('sku',''))}"
+                        opciones_av.append(label)
+                        mapa_av[label] = int(r["id"])
+                    if not opciones_av:
+                        st.warning("No hay productos para avisar.")
+                    else:
+                        producto_label = st.selectbox("Producto", opciones_av, key="aviso_producto_select")
+                        aviso_item_id = mapa_av[producto_label]
+                        item_av = items_av[items_av["id"].astype(int) == int(aviso_item_id)].iloc[0].to_dict()
+                        c1, c2 = st.columns([2, 1])
+                        with c1:
+                            tipo_av = st.selectbox("Tipo de aviso", AVISO_OPERACIONAL_TIPOS, key="aviso_tipo")
+                        with c2:
+                            cantidad_nueva = st.text_input("Cantidad nueva objetivo opcional", key="aviso_cantidad_nueva", placeholder="Ej: 10")
+                        mensaje_def = ""
+                        if tipo_av == "Ajuste de cantidad" and clean_text(cantidad_nueva):
+                            mensaje_def = f"Producto con ajuste administrativo. Nueva cantidad objetivo: {clean_text(cantidad_nueva)}."
+                        elif tipo_av == "Producto retirado del lote":
+                            mensaje_def = "Producto retirado del lote. No continuar preparación."
+                        elif tipo_av == "No escanear / esperar instrucción":
+                            mensaje_def = "No escanear este producto. Esperar instrucción de Supervisor."
+                        mensaje_operador = st.text_area("Mensaje visible para operador", value=mensaje_def, key="aviso_msg_operador")
+                        requiere_conf = tipo_av in AVISO_OPERACIONAL_REQUIERE_CONFIRMACION
+                        if requiere_conf:
+                            st.info("Este aviso puede crearse aunque Mercado Libre o Kame queden pendientes. No podrá resolverse hasta confirmar ambas tareas externas.")
+                        cc1, cc2, cc3 = st.columns(3)
+                        with cc1:
+                            confirmado_ml = st.checkbox("Mercado Libre ya rebajado/ajustado", value=False, key="aviso_conf_ml", disabled=not requiere_conf)
+                        with cc2:
+                            confirmado_inv = st.checkbox("Inventario Kame ya ajustado", value=False, key="aviso_conf_inv", disabled=not requiere_conf)
+                        with cc3:
+                            visible_op = st.checkbox("Visible para operador", value=True, key="aviso_visible")
+                        created_by = st.text_input("Creado por", key="aviso_created_by", placeholder="Ej: administrador / supervisor")
+                        comentario_interno = st.text_area("Comentario interno / respaldo administrativo", key="aviso_comentario_interno", placeholder="Indica quién autorizó, qué se ajustó en ML/inventario y por qué.")
+                        if st.button("Guardar aviso operacional", type="primary", key="aviso_guardar"):
+                            ok_av, msg_av = create_aviso_operacional(
+                                active_lote,
+                                aviso_item_id,
+                                tipo_av,
+                                mensaje_operador,
+                                cantidad_nueva,
+                                bool(confirmado_ml) if requiere_conf else False,
+                                bool(confirmado_inv) if requiere_conf else False,
+                                bool(visible_op),
+                                comentario_interno,
+                                created_by,
+                            )
+                            st.success(msg_av) if ok_av else st.error(msg_av)
+                            if ok_av:
+                                st.rerun()
+            with sub_activos:
+                avisos_act = get_avisos_operacionales(active_lote, estado="ACTIVO")
+                if avisos_act.empty:
+                    st.success("No hay avisos operacionales activos.")
+                else:
+                    for _, av in avisos_act.iterrows():
+                        tipo = clean_text(av.get("tipo_aviso", ""))
+                        color = "#FEE2E2" if tipo in AVISO_OPERACIONAL_BLOQUEA else "#FEF3C7"
+                        requiere_ml = int(av.get('requiere_ajuste_ml') or 0) == 1
+                        requiere_kame = int(av.get('requiere_ajuste_inventario') or 0) == 1
+                        ml_ok = int(av.get('confirmado_ml') or 0) == 1
+                        kame_ok = int(av.get('confirmado_inventario') or 0) == 1
+                        estado_ml = '✅ Mercado Libre confirmado' if (not requiere_ml or ml_ok) else '⏳ Mercado Libre pendiente'
+                        estado_kame = '✅ Kame confirmado' if (not requiere_kame or kame_ok) else '⏳ Kame pendiente'
+                        st.markdown(f"""
+                        <div class='control-card' style='background:{color};'>
+                            <div class='control-title'>{esc(tipo)} · {esc(av.get('descripcion',''))}</div>
+                            <div class='control-meta'><b>ML:</b> {esc(av.get('codigo_ml',''))} · <b>EAN:</b> {esc(av.get('codigo_universal',''))} · <b>SKU:</b> {esc(av.get('sku',''))}</div>
+                            <div><b>Mensaje operador:</b> {esc(av.get('mensaje_operador',''))}</div>
+                            <div class='control-meta' style='margin-top:8px;'><b>Estado externo:</b> {estado_ml} · {estado_kame}</div>
+                            <div class='control-meta' style='margin-top:8px;'><b>Creado por:</b> {esc(av.get('created_by',''))} · <b>Fecha:</b> {esc(fmt_dt(av.get('created_at','')))} · <b>Visible:</b> {'Sí' if int(av.get('visible_operador') or 0) == 1 else 'No'}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if requiere_ml or requiere_kame:
+                            with st.expander(f"Tareas externas del aviso #{int(av['id'])}"):
+                                conf_by = st.text_input("Confirmado por", key=f"aviso_conf_by_{int(av['id'])}", placeholder="Ej: administrador")
+                                ccml, cckame = st.columns(2)
+                                with ccml:
+                                    st.caption(estado_ml)
+                                    if requiere_ml and not ml_ok:
+                                        if st.button("Marcar Mercado Libre ajustado", key=f"aviso_conf_ml_btn_{int(av['id'])}"):
+                                            ok_conf, msg_conf = confirmar_tarea_externa_aviso(int(av['id']), 'ml', conf_by)
+                                            st.success(msg_conf) if ok_conf else st.error(msg_conf)
+                                            if ok_conf:
+                                                st.rerun()
+                                with cckame:
+                                    st.caption(estado_kame)
+                                    if requiere_kame and not kame_ok:
+                                        if st.button("Marcar inventario Kame ajustado", key=f"aviso_conf_kame_btn_{int(av['id'])}"):
+                                            ok_conf, msg_conf = confirmar_tarea_externa_aviso(int(av['id']), 'kame', conf_by)
+                                            st.success(msg_conf) if ok_conf else st.error(msg_conf)
+                                            if ok_conf:
+                                                st.rerun()
+                        with st.expander(f"Resolver aviso #{int(av['id'])}"):
+                            if (requiere_ml and not ml_ok) or (requiere_kame and not kame_ok):
+                                st.warning("Este aviso tiene tareas externas pendientes. Puedes mantenerlo activo, pero no resolverlo hasta confirmar Mercado Libre y Kame.")
+                            res_by = st.text_input("Resuelto por", key=f"aviso_res_by_{int(av['id'])}", placeholder="Ej: supervisor")
+                            res_comment = st.text_area("Comentario de resolución", key=f"aviso_res_comment_{int(av['id'])}")
+                            if st.button("Marcar aviso como resuelto", key=f"aviso_resolve_{int(av['id'])}", type="primary"):
+                                ok_res, msg_res = resolve_aviso_operacional(int(av["id"]), res_by, res_comment)
+                                st.success(msg_res) if ok_res else st.error(msg_res)
+                                if ok_res:
+                                    st.rerun()
+            with sub_historial:
+                avisos_all = get_avisos_operacionales(active_lote)
+                if avisos_all.empty:
+                    st.info("Sin avisos operacionales registrados.")
+                else:
+                    out_av = avisos_all.rename(columns={
+                        "created_at": "Fecha", "estado": "Estado", "tipo_aviso": "Tipo", "mensaje_operador": "Mensaje operador",
+                        "cantidad_original": "Cantidad original", "cantidad_nueva": "Cantidad nueva", "confirmado_ml": "Conf. ML",
+                        "confirmado_inventario": "Conf. Kame", "visible_operador": "Visible operador", "created_by": "Creado por",
+                        "resolved_at": "Fecha resolución", "resolved_by": "Resuelto por", "codigo_ml": "Código ML",
+                        "codigo_universal": "Código Universal", "sku": "SKU", "descripcion": "Producto",
+                    })
+                    cols_av = ["Fecha", "Estado", "Tipo", "Código ML", "Código Universal", "SKU", "Producto", "Mensaje operador", "Cantidad original", "Cantidad nueva", "Conf. ML", "Conf. Kame", "Visible operador", "Creado por", "Fecha resolución", "Resuelto por"]
+                    st.dataframe(out_av[[c for c in cols_av if c in out_av.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_bloques:
             labels = label_control_view(active_lote)
@@ -2848,11 +3458,12 @@ elif page == "Supervisor":
         with tab_cierre:
             lote_close = get_lote(active_lote)
             ok_close2, issues2, data_close2 = cierre_validaciones(active_lote, int(capacity_sup))
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Estado actual", clean_text(lote_close.get("status", "ACTIVO")))
             c2.metric("Unidades pendientes", data_close2.get("pending_units", 0))
             c3.metric("Incidencias abiertas", data_close2.get("open_incidents", 0))
-            c4.metric("Bloques", f"{data_close2.get('printed_blocks',0)}/{data_close2.get('expected_blocks',0)}")
+            c4.metric("Avisos activos", data_close2.get("active_notices", 0))
+            c5.metric("Bloques", f"{data_close2.get('printed_blocks',0)}/{data_close2.get('expected_blocks',0)}")
             if clean_text(lote_close.get("status")) == "CERRADO":
                 st.success(f"Lote cerrado por {clean_text(lote_close.get('closed_by',''))} el {fmt_dt(lote_close.get('closed_at',''))}.")
                 st.caption(clean_text(lote_close.get("close_note", "")))
