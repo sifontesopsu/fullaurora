@@ -1339,25 +1339,30 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         if not item:
             return False, "Producto no encontrado."
         pendiente = int(item["unidades"]) - int(item["acopiadas"])
-        picking_meta = get_picking_list_meta(picking_list_id) if picking_list_id else {}
+        # Picking obligatorio:
+        # todo escaneo debe estar asociado a una lista activa. No se permite validar
+        # productos sin lista, porque se pierde trazabilidad de picker/lista.
+        try:
+            pick_id = int(picking_list_id or 0)
+        except Exception:
+            pick_id = 0
+        if not pick_id:
+            return False, "Debes seleccionar una lista de picking activa antes de validar. No se permite escanear sin lista."
+
+        picking_meta = get_picking_list_meta(pick_id)
 
         # Regla estricta de picking:
-        # si hay lista activa, solo se puede validar productos que pertenecen a esa lista.
+        # solo se puede validar productos que pertenecen a la lista activa.
         # Esto evita que el validador PDA cargue por error productos de otro picker
         # o productos todavía sin asignar.
-        if picking_list_id:
-            try:
-                pick_id = int(picking_list_id)
-            except Exception:
-                pick_id = 0
-            if not pick_id or not item_in_picking_list(pick_id, int(item_id)):
-                return False, f"Este producto no pertenece a la lista activa {clean_text(picking_meta.get('codigo_lista',''))}. Cambia la lista de picking antes de validar."
-            pp = picking_pending_for_item(pick_id, int(item_id))
-            pendiente_lista = int(pp.get("pendiente") or 0)
-            if pendiente_lista <= 0:
-                return False, f"Este producto ya está completo en la lista activa {clean_text(picking_meta.get('codigo_lista',''))}."
-            if cantidad > pendiente_lista:
-                return False, f"No puedes agregar {cantidad} en la lista activa. Solo quedan {pendiente_lista} pendientes para esta lista."
+        if not item_in_picking_list(pick_id, int(item_id)):
+            return False, f"Este producto no pertenece a la lista activa {clean_text(picking_meta.get('codigo_lista',''))}. Cambia la lista de picking antes de validar."
+        pp = picking_pending_for_item(pick_id, int(item_id))
+        pendiente_lista = int(pp.get("pendiente") or 0)
+        if pendiente_lista <= 0:
+            return False, f"Este producto ya está completo en la lista activa {clean_text(picking_meta.get('codigo_lista',''))}."
+        if cantidad > pendiente_lista:
+            return False, f"No puedes agregar {cantidad} en la lista activa. Solo quedan {pendiente_lista} pendientes para esta lista."
 
         if pendiente <= 0:
             return False, "Este producto ya está completo."
@@ -1374,7 +1379,7 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         """, (
             lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now,
             clean_text(operador_validador) or "SIN_USUARIO",
-            int(picking_list_id) if picking_list_id else None,
+            int(pick_id),
             clean_text(picking_meta.get("codigo_lista", "")),
             clean_text(picking_meta.get("asignado_a", "")),
         ))
@@ -1393,9 +1398,9 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         "scan_secundario": norm_code(scan_secundario),
         "created_at": now,
         "operador_validador": clean_text(operador_validador) or "SIN_USUARIO",
-        "picking_list_id": int(picking_list_id) if picking_list_id else "",
-        "picking_code": clean_text(picking_meta.get("codigo_lista", "")) if picking_list_id else "",
-        "picker_asignado": clean_text(picking_meta.get("asignado_a", "")) if picking_list_id else "",
+        "picking_list_id": int(pick_id),
+        "picking_code": clean_text(picking_meta.get("codigo_lista", "")),
+        "picker_asignado": clean_text(picking_meta.get("asignado_a", "")),
     })
     log_audit_event(lote_id, item_id, "SKU_ESCANEADO", clean_text(item["descripcion"]), int(cantidad), item["codigo_ml"], item["sku"], modo)
     return True, "Cantidad agregada."
@@ -3801,13 +3806,19 @@ elif page == "Escaneo":
         if "scan_picking_list_id" not in st.session_state:
             st.session_state["scan_picking_list_id"] = 0
 
-        picking_options = {"Sin lista de picking": 0}
+        picking_options = {}
         pl_active = get_picking_lists(active_lote)
         if not pl_active.empty:
-            pl_active = pl_active[pl_active["estado"].astype(str).str.upper() != "ANULADA"]
+            pl_active = pl_active[~pl_active["estado"].astype(str).str.upper().isin(["ANULADA", "COMPLETADA"])]
             for r in pl_active.itertuples(index=False):
                 picking_options[f"{r.codigo_lista} · {r.asignado_a} · {r.estado}"] = int(r.id)
+
         current_pick_id = int(st.session_state.get("scan_picking_list_id") or 0)
+        valid_pick_ids = set(picking_options.values())
+        if current_pick_id not in valid_pick_ids:
+            st.session_state["scan_picking_list_id"] = next(iter(valid_pick_ids), 0)
+            current_pick_id = int(st.session_state.get("scan_picking_list_id") or 0)
+
         labels_pick = list(picking_options.keys())
         default_idx_pick = 0
         for idx, label in enumerate(labels_pick):
@@ -3830,14 +3841,18 @@ elif page == "Escaneo":
                 )
                 st.session_state["scan_operator"] = op_selected
             with sx2:
-                chosen_pick = st.selectbox("Lista picking activa", labels_pick, index=default_idx_pick, key="scan_picking_select")
-                st.session_state["scan_picking_list_id"] = int(picking_options[chosen_pick])
+                if labels_pick:
+                    chosen_pick = st.selectbox("Lista picking activa", labels_pick, index=default_idx_pick, key="scan_picking_select")
+                    st.session_state["scan_picking_list_id"] = int(picking_options[chosen_pick])
+                else:
+                    st.session_state["scan_picking_list_id"] = 0
+                    st.warning("No hay listas de picking activas para este lote. Crea una lista en el módulo Picking antes de escanear.")
 
             if int(st.session_state.get("scan_picking_list_id") or 0):
                 pm = get_picking_list_meta(int(st.session_state.get("scan_picking_list_id") or 0))
                 session_msg = f"Validando como <b>{esc(st.session_state.get('scan_operator'))}</b> · Lista <b>{esc(pm.get('codigo_lista',''))}</b> · Picker <b>{esc(pm.get('asignado_a',''))}</b>"
             else:
-                session_msg = f"Validando como <b>{esc(st.session_state.get('scan_operator'))}</b> · <b>Sin lista de picking asociada</b>"
+                session_msg = f"Validación bloqueada · <b>Debes seleccionar una lista de picking activa</b>"
             st.markdown(
                 f"""
                 <div style="background:#eaf3ff;border:1px solid #cfe3ff;border-radius:10px;padding:10px 14px;font-size:1.05rem;">
@@ -3849,6 +3864,15 @@ elif page == "Escaneo":
 
         if lote_cerrado:
             st.error(f"Lote cerrado por {clean_text(lote_scan.get('closed_by',''))} el {fmt_dt(lote_scan.get('closed_at',''))}. No se permiten escaneos ni incidencias nuevas.")
+            recientes = get_recent_scans(active_lote, limit=8)
+            if not recientes.empty:
+                st.subheader("Últimos escaneos")
+                st.dataframe(recientes, use_container_width=True, hide_index=True, height=260)
+            st.stop()
+
+        if not int(st.session_state.get("scan_picking_list_id") or 0):
+            st.error("Para validar productos debes tener una lista de picking activa. No se permite escanear con 'Sin lista de picking'.")
+            st.info("Ve al módulo Picking, crea/asigna una lista y vuelve a Escaneo para validar.")
             recientes = get_recent_scans(active_lote, limit=8)
             if not recientes.empty:
                 st.subheader("Últimos escaneos")
@@ -3927,7 +3951,7 @@ elif page == "Escaneo":
                         picking_bloqueo_prevalidacion = True
                         st.error(
                             f"Este producto NO pertenece a la lista activa {clean_text(pm_preview.get('codigo_lista',''))}. "
-                            "Cambia la lista de picking o selecciona 'Sin lista de picking' antes de validar este producto."
+                            "Cambia la lista de picking activa antes de validar este producto."
                         )
                     else:
                         pp_preview = picking_pending_for_item(active_pick_id_preview, int(preview["id"]))
@@ -4003,7 +4027,7 @@ elif page == "Escaneo":
                 pm = get_picking_list_meta(active_pick_id)
                 if not item_in_picking_list(active_pick_id, int(candidate["id"])):
                     picking_bloqueo = True
-                    st.error(f"Este producto no pertenece a la lista activa {clean_text(pm.get('codigo_lista',''))}. Cambia la lista o selecciona 'Sin lista de picking'.")
+                    st.error(f"Este producto no pertenece a la lista activa {clean_text(pm.get('codigo_lista',''))}. Cambia la lista de picking activa.")
                 else:
                     pp = picking_pending_for_item(active_pick_id, int(candidate["id"]))
                     st.info(f"Picking {clean_text(pm.get('codigo_lista',''))} · Asignado a {clean_text(pm.get('asignado_a',''))} · Validado {int(pp['validado_pda'])}/{int(pp['cantidad'])} · Pendiente lista {int(pp['pendiente'])}")
@@ -4040,7 +4064,7 @@ elif page == "Escaneo":
                     pp_now = picking_pending_for_item(active_pick_id, int(candidate["id"]))
                     st.error(f"No puedes agregar {qty} en la lista activa. Solo quedan {int(pp_now.get('pendiente') or 0)} pendientes para esta lista.")
                 else:
-                    submit_sig = f"{active_lote}:{int(candidate['id'])}:{qty}:{norm_code(st.session_state.get('scan_primary', ''))}:{norm_code(st.session_state.get('scan_secondary', ''))}:{modo}"
+                    submit_sig = f"{active_lote}:{int(candidate['id'])}:{qty}:{norm_code(st.session_state.get('scan_primary', ''))}:{norm_code(st.session_state.get('scan_secondary', ''))}:{modo}:{active_pick_id}"
                     if st.session_state.get("_last_scan_submit_sig") == submit_sig:
                         st.warning("Este escaneo ya fue procesado. Limpia o escanea el siguiente producto.")
                     else:
