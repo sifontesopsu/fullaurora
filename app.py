@@ -1721,7 +1721,13 @@ def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.Data
         # una instrucción explícita sobre fecha de vencimiento. Para operación, basta
         # marcar Vence=SI cuando esa instrucción aparece en el texto de preparación.
         instr_norm = normalize_header(instrucciones)
-        vence = "SI" if ("fecha de vencimiento" in instr_norm or "vencimiento" in instr_norm) else ""
+        # Regla estricta: no basta con que exista cualquier instrucción de preparación.
+        # Solo marcamos Vence=SI cuando aparece la instrucción específica de vencimiento
+        # del PDF ML: fecha de vencimiento impresa y vigencia mayor a 90 días.
+        vence = "SI" if (
+            "fecha de vencimiento debe estar impresa" in instr_norm
+            and "90 dias" in instr_norm
+        ) else ""
 
         rows.append({
             "area": "",
