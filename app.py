@@ -1339,6 +1339,26 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         if not item:
             return False, "Producto no encontrado."
         pendiente = int(item["unidades"]) - int(item["acopiadas"])
+        picking_meta = get_picking_list_meta(picking_list_id) if picking_list_id else {}
+
+        # Regla estricta de picking:
+        # si hay lista activa, solo se puede validar productos que pertenecen a esa lista.
+        # Esto evita que el validador PDA cargue por error productos de otro picker
+        # o productos todavía sin asignar.
+        if picking_list_id:
+            try:
+                pick_id = int(picking_list_id)
+            except Exception:
+                pick_id = 0
+            if not pick_id or not item_in_picking_list(pick_id, int(item_id)):
+                return False, f"Este producto no pertenece a la lista activa {clean_text(picking_meta.get('codigo_lista',''))}. Cambia la lista de picking antes de validar."
+            pp = picking_pending_for_item(pick_id, int(item_id))
+            pendiente_lista = int(pp.get("pendiente") or 0)
+            if pendiente_lista <= 0:
+                return False, f"Este producto ya está completo en la lista activa {clean_text(picking_meta.get('codigo_lista',''))}."
+            if cantidad > pendiente_lista:
+                return False, f"No puedes agregar {cantidad} en la lista activa. Solo quedan {pendiente_lista} pendientes para esta lista."
+
         if pendiente <= 0:
             return False, "Este producto ya está completo."
         if cantidad <= 0:
@@ -1346,7 +1366,6 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         if cantidad > pendiente:
             return False, f"No puedes agregar {cantidad}. Solo quedan {pendiente} pendientes."
         c.execute("UPDATE items SET acopiadas=acopiadas+?, updated_at=? WHERE id=?", (cantidad, now, item_id))
-        picking_meta = get_picking_list_meta(picking_list_id) if picking_list_id else {}
         c.execute("""
             INSERT INTO scans
             (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
@@ -3896,6 +3915,29 @@ elif page == "Escaneo":
                 q1.metric("Solicitadas", int(preview["unidades"]))
                 q2.metric("Acopiadas", int(preview["acopiadas"]))
                 q3.metric("Pendientes", max(pendiente_preview, 0))
+
+                # Regla estricta de picking en el primer paso:
+                # si hay lista activa, el Código ML debe pertenecer a esa lista.
+                # Si no pertenece, se informa de inmediato y no se permite seguir a SKU/EAN.
+                picking_bloqueo_prevalidacion = False
+                active_pick_id_preview = int(st.session_state.get("scan_picking_list_id") or 0)
+                if active_pick_id_preview:
+                    pm_preview = get_picking_list_meta(active_pick_id_preview)
+                    if not item_in_picking_list(active_pick_id_preview, int(preview["id"])):
+                        picking_bloqueo_prevalidacion = True
+                        st.error(
+                            f"Este producto NO pertenece a la lista activa {clean_text(pm_preview.get('codigo_lista',''))}. "
+                            "Cambia la lista de picking o selecciona 'Sin lista de picking' antes de validar este producto."
+                        )
+                    else:
+                        pp_preview = picking_pending_for_item(active_pick_id_preview, int(preview["id"]))
+                        st.info(
+                            f"Producto correcto para lista {clean_text(pm_preview.get('codigo_lista',''))} · "
+                            f"Picker {clean_text(pm_preview.get('asignado_a',''))} · "
+                            f"Validado {int(pp_preview['validado_pda'])}/{int(pp_preview['cantidad'])} · "
+                            f"Pendiente lista {int(pp_preview['pendiente'])}"
+                        )
+
                 # Aviso operacional temprano: se muestra apenas se valida el Código ML,
                 # antes de pedir/validar SKU, EAN o Código Universal.
                 aviso_prevalidacion_item_id = int(preview["id"])
@@ -3903,14 +3945,15 @@ elif page == "Escaneo":
                 if aviso_bloqueante_prevalidacion:
                     st.error("Este producto tiene un aviso operacional bloqueante. No continúes con SKU/EAN ni agregues cantidad hasta que Supervisor lo resuelva.")
 
-                st.text_input("SKU / EAN / Código Universal", key="scan_secondary", disabled=aviso_bloqueante_prevalidacion)
+                bloqueo_prevalidacion = aviso_bloqueante_prevalidacion or picking_bloqueo_prevalidacion
+                st.text_input("SKU / EAN / Código Universal", key="scan_secondary", disabled=bloqueo_prevalidacion)
                 b1, b2 = st.columns(2)
                 with b1:
-                    validar_sec = st.button("Validar SKU/EAN", type="primary", disabled=aviso_bloqueante_prevalidacion)
+                    validar_sec = st.button("Validar SKU/EAN", type="primary", disabled=bloqueo_prevalidacion)
                 with b2:
-                    sin_ean = st.button("Sin EAN", disabled=aviso_bloqueante_prevalidacion)
+                    sin_ean = st.button("Sin EAN", disabled=bloqueo_prevalidacion)
 
-                if sin_ean and not aviso_bloqueante_prevalidacion:
+                if sin_ean and not bloqueo_prevalidacion:
                     m_no_super = m1[~m1["identificacion"].map(is_supermercado)]
                     if m_no_super.empty:
                         st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
@@ -3922,7 +3965,7 @@ elif page == "Escaneo":
                         modo = "SIN_EAN"
                         candidate_from_preview_this_run = True
 
-                if validar_sec and candidate is None and not aviso_bloqueante_prevalidacion:
+                if validar_sec and candidate is None and not bloqueo_prevalidacion:
                     sec = st.session_state.get("scan_secondary", "")
                     if not norm_code(sec):
                         st.error("Escanea o ingresa el SKU/EAN.")
