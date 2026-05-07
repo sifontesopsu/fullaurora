@@ -3866,19 +3866,6 @@ elif page == "Escaneo":
                     st.session_state["scan_picking_list_id"] = 0
                     st.warning("No hay listas de picking activas para este lote. Crea una lista en el módulo Picking antes de escanear.")
 
-            if int(st.session_state.get("scan_picking_list_id") or 0):
-                pm = get_picking_list_meta(int(st.session_state.get("scan_picking_list_id") or 0))
-                session_msg = f"Validando como <b>{esc(st.session_state.get('scan_operator'))}</b> · Lista <b>{esc(pm.get('codigo_lista',''))}</b> · Picker <b>{esc(pm.get('asignado_a',''))}</b>"
-            else:
-                session_msg = f"Validación bloqueada · <b>Debes seleccionar una lista de picking activa</b>"
-            st.markdown(
-                f"""
-                <div style="background:#eaf3ff;border:1px solid #cfe3ff;border-radius:10px;padding:10px 14px;font-size:1.05rem;">
-                    {session_msg}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
         if lote_cerrado:
             st.error(f"Lote cerrado por {clean_text(lote_scan.get('closed_by',''))} el {fmt_dt(lote_scan.get('closed_at',''))}. No se permiten escaneos ni incidencias nuevas.")
