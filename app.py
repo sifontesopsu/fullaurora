@@ -1683,6 +1683,8 @@ def load_kame_master_maps(source=None) -> tuple[dict, dict, dict, int]:
 
 def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.DataFrame, dict]:
     pdf_df, totals = parse_ml_full_pdf(uploaded_pdf)
+    # En producción usamos el maestro fijo del repo: data/maestro_sku_ean.xlsx.
+    # master_source se conserva solo por compatibilidad interna, pero la UI ya no lo solicita.
     desc_map, family_map, barcode_map, master_count = load_kame_master_maps(master_source)
 
     rows = []
@@ -4028,21 +4030,17 @@ if page == "Cargar lote FULL":
                 st.error(f"No pude leer la hoja seleccionada: {e}")
 
     else:
-        st.caption("Carga el PDF de instrucciones de preparación de Mercado Libre. La app cruza por SKU contra el maestro Kame y genera el mismo formato operativo del Excel depurado.")
+        st.caption("Carga el PDF de instrucciones de preparación de Mercado Libre. La app cruza por SKU contra el maestro Kame del repositorio y genera el mismo formato operativo del Excel depurado.")
         pdf_file = st.file_uploader("PDF Mercado Libre", type=["pdf"], key="pdf_ml_upload")
-        master_upload = st.file_uploader(
-            "Maestro SKU/EAN Kame opcional",
-            type=["xlsx"],
-            key="maestro_kame_upload",
-            help="Si no cargas uno, la app intentará usar data/maestro_sku_ean.xlsx del repositorio.",
-        )
-        if not master_upload and not MAESTRO_PATH.exists():
-            st.warning("No encontré data/maestro_sku_ean.xlsx. Puedes cargar el maestro Kame en el campo opcional para usar descripciones Kame.")
 
-        if pdf_file:
+        if MAESTRO_PATH.exists():
+            st.success(f"Maestro SKU/EAN Kame detectado en repo: {MAESTRO_PATH}")
+        else:
+            st.error("No encontré data/maestro_sku_ean.xlsx en el repositorio. Sube ese archivo al repo para usar la carga desde PDF.")
+
+        if pdf_file and MAESTRO_PATH.exists():
             try:
-                master_source = io.BytesIO(master_upload.getvalue()) if master_upload else None
-                df_pdf, checks = build_full_input_from_pdf(pdf_file, master_source)
+                df_pdf, checks = build_full_input_from_pdf(pdf_file)
                 if df_pdf.empty:
                     st.error("No pude detectar productos válidos en el PDF.")
                 else:
