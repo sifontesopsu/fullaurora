@@ -3186,10 +3186,15 @@ def get_picking_items(picking_list_id: int) -> pd.DataFrame:
     with db() as c:
         return pd.read_sql_query(
             """
-            SELECT *
-            FROM picking_list_items
-            WHERE picking_list_id=?
-            ORDER BY area, CAST(nro AS INTEGER), id
+            SELECT
+                pli.*,
+                COALESCE(i.identificacion, '') AS identificacion,
+                COALESCE(i.vence, '') AS vence,
+                COALESCE(i.instrucciones, '') AS instrucciones
+            FROM picking_list_items pli
+            LEFT JOIN items i ON i.id = pli.item_id AND i.lote_id = pli.lote_id
+            WHERE pli.picking_list_id=?
+            ORDER BY pli.area, CAST(pli.nro AS INTEGER), pli.id
             """,
             c,
             params=(int(picking_list_id),),
@@ -3306,85 +3311,146 @@ def picking_pending_for_item(picking_list_id, item_id) -> dict:
 
 
 def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentario: str, selected_rows: list[dict]):
+    """Crea una lista de picking de forma más rápida.
+
+    Optimización producción:
+    - valida asignaciones en una sola consulta;
+    - trae todos los items seleccionados en una sola consulta;
+    - inserta los items con executemany;
+    - mantiene la regla operacional: producto completo, no parcial.
+    """
     asignado_a = clean_text(asignado_a)
     created_by = clean_text(created_by) or "SIN_USUARIO"
     comentario = clean_text(comentario)
+    lote_id = int(lote_id)
+
     if not asignado_a:
         return False, "Debes indicar a quién se asigna la lista."
+
     rows_clean = []
     seen_items = set()
     for r in selected_rows:
-        item_id = int(r.get("id") or r.get("item_id") or 0)
-        cantidad = int(r.get("unidades") or r.get("cantidad") or 0)
-        ya_asignado = bool(r.get("ya_asignado")) or int(r.get("asignado") or 0) > 0
-        disponible = int(r.get("disponible_asignar") or 0)
+        try:
+            item_id = int(r.get("id") or r.get("item_id") or 0)
+        except Exception:
+            item_id = 0
+        try:
+            cantidad = int(r.get("unidades") or r.get("cantidad") or 0)
+        except Exception:
+            cantidad = 0
+        try:
+            asignado = int(r.get("asignado") or 0)
+        except Exception:
+            asignado = 0
+        try:
+            disponible = int(r.get("disponible_asignar") or 0)
+        except Exception:
+            disponible = 0
+        ya_asignado = bool(r.get("ya_asignado")) or asignado > 0
+
         if item_id and cantidad > 0:
             if item_id in seen_items:
                 continue
             if ya_asignado or disponible <= 0:
                 return False, f"El producto item {item_id} ya está asignado en otra lista activa. Anula esa lista si necesitas reasignarlo."
-            # Regla: se asigna el producto completo, nunca una cantidad parcial.
             rows_clean.append((item_id, cantidad))
             seen_items.add(item_id)
+
     if not rows_clean:
         return False, "Selecciona al menos un producto disponible."
 
-    # Validación defensiva contra datos desactualizados en pantalla: ningún item
-    # seleccionado puede estar ya asignado a otra lista activa/no anulada.
-    with db() as c:
-        for item_id, _cantidad in rows_clean:
-            row = c.execute(
-                """
-                SELECT COALESCE(SUM(pli.cantidad),0) AS n
-                FROM picking_list_items pli
-                JOIN picking_lists pl ON pl.id=pli.picking_list_id
-                WHERE pli.lote_id=? AND pli.item_id=? AND pl.estado <> 'ANULADA'
-                """,
-                (int(lote_id), int(item_id)),
-            ).fetchone()
-            if int(row["n"] or 0) > 0:
-                return False, f"El producto item {item_id} ya fue asignado a otra lista activa."
+    selected_ids = [int(x[0]) for x in rows_clean]
+    qty_by_item = {int(item_id): int(cantidad) for item_id, cantidad in rows_clean}
+    placeholders = ",".join(["?"] * len(selected_ids))
 
     now = now_cl().isoformat(timespec="seconds")
     codigo = next_picking_code(lote_id)
+
     with db() as c:
+        # Validación defensiva en bloque contra pantalla desactualizada.
+        assigned_rows = c.execute(
+            f"""
+            SELECT pli.item_id, COALESCE(SUM(pli.cantidad),0) AS n
+            FROM picking_list_items pli
+            JOIN picking_lists pl ON pl.id=pli.picking_list_id
+            WHERE pli.lote_id=? AND pl.estado <> 'ANULADA' AND pli.item_id IN ({placeholders})
+            GROUP BY pli.item_id
+            """,
+            [lote_id, *selected_ids],
+        ).fetchall()
+        already = [int(r["item_id"]) for r in assigned_rows if int(r["n"] or 0) > 0]
+        if already:
+            return False, f"Uno o más productos ya fueron asignados a otra lista activa: {', '.join(map(str, already[:10]))}."
+
+        item_rows = c.execute(
+            f"""
+            SELECT *
+            FROM items
+            WHERE lote_id=? AND id IN ({placeholders})
+            """,
+            [lote_id, *selected_ids],
+        ).fetchall()
+        items_by_id = {int(r["id"]): r for r in item_rows}
+
+        if not items_by_id:
+            return False, "No encontré los productos seleccionados en el lote."
+
         cur = c.execute(
             """
             INSERT INTO picking_lists
             (lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at)
             VALUES (?, ?, ?, 'CREADA', ?, ?, ?)
             """,
-            (int(lote_id), codigo, asignado_a, created_by, comentario, now),
+            (lote_id, codigo, asignado_a, created_by, comentario, now),
         )
         list_id = int(cur.lastrowid)
+
+        insert_rows = []
         inserted_items = []
-        for item_id, cantidad in rows_clean:
-            item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
+        for item_id in selected_ids:
+            item = items_by_id.get(int(item_id))
             if not item:
                 continue
-            c.execute(
-                """
-                INSERT INTO picking_list_items
-                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
-                 cantidad, area, nro, estado, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
-                """,
-                (
-                    list_id, int(lote_id), int(item_id), norm_code(item["codigo_ml"]), norm_code(item["codigo_universal"]),
-                    norm_code(item["sku"]), clean_text(item["descripcion"]), int(cantidad), clean_text(item["area"]),
-                    clean_text(item["nro"]), now,
-                ),
-            )
+            cantidad = int(qty_by_item.get(int(item_id), 0))
+            insert_rows.append((
+                list_id,
+                lote_id,
+                int(item_id),
+                norm_code(item["codigo_ml"]),
+                norm_code(item["codigo_universal"]),
+                norm_code(item["sku"]),
+                clean_text(item["descripcion"]),
+                cantidad,
+                clean_text(item["area"]),
+                clean_text(item["nro"]),
+                now,
+            ))
             inserted_items.append({
                 "item_id": int(item_id),
                 "codigo_ml": norm_code(item["codigo_ml"]),
                 "codigo_universal": norm_code(item["codigo_universal"]),
                 "sku": norm_code(item["sku"]),
                 "descripcion": clean_text(item["descripcion"]),
-                "cantidad": int(cantidad),
+                "cantidad": cantidad,
                 "area": clean_text(item["area"]),
                 "nro": clean_text(item["nro"]),
+                "identificacion": clean_text(item["identificacion"]),
             })
+
+        if not insert_rows:
+            c.execute("DELETE FROM picking_lists WHERE id=?", (list_id,))
+            c.commit()
+            return False, "No encontré productos válidos para crear la lista."
+
+        c.executemany(
+            """
+            INSERT INTO picking_list_items
+            (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+             cantidad, area, nro, estado, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
+            """,
+            insert_rows,
+        )
         c.commit()
 
     total_units = sum(int(x["cantidad"]) for x in inserted_items)
@@ -3406,7 +3472,6 @@ def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentar
     })
     log_audit_event(lote_id, event_type="PICKING_LISTA_CREADA", detail=f"{codigo} asignada a {asignado_a}", qty=total_units, mode=created_by)
     return True, f"Lista {codigo} creada para {asignado_a}."
-
 
 def mark_picking_printed(picking_list_id: int, usuario: str = ""):
     usuario = clean_text(usuario) or "SIN_USUARIO"
@@ -3545,6 +3610,7 @@ def build_picking_print_html(picking_list_id: int) -> str:
           <td class="skucell">{esc(r.sku)}</td>
           <td class="desccell">{esc(r.descripcion)}</td>
           <td class="qty">{int(r.cantidad)}</td>
+          <td class="tagcell">{esc(getattr(r, "identificacion", ""))}</td>
           <td class="obs"></td>
         </tr>
         """)
@@ -3567,12 +3633,14 @@ def build_picking_print_html(picking_list_id: int) -> str:
   col.col-code {{ width:128px; }}
   col.col-sku {{ width:98px; }}
   col.col-qty {{ width:44px; }}
-  col.col-obs {{ width:310px; }}
+  col.col-tag {{ width:108px; }}
+  col.col-obs {{ width:210px; }}
   .check {{ font-size:18px; text-align:center; padding:2px; }}
   .qty {{ font-size:16px; font-weight:900; text-align:center; padding:3px 2px; }}
   .codecell {{ font-size:11px; line-height:1.25; word-break:break-word; }}
   .skucell {{ font-size:11px; line-height:1.25; word-break:break-word; }}
   .desccell {{ font-size:12px; line-height:1.25; }}
+  .tagcell {{ font-size:11px; line-height:1.25; font-weight:700; word-break:break-word; }}
   .obs {{ min-width:0; }}
   .firma-wrap {{ margin-top:28px; padding-top:10px; }}
   .firma-linea {{ margin-top:30px; width:320px; border-top:1.5px solid #111; padding-top:6px; font-size:13px; }}
@@ -3599,11 +3667,12 @@ def build_picking_print_html(picking_list_id: int) -> str:
   <col class="col-sku">
   <col class="col-desc">
   <col class="col-qty">
+  <col class="col-tag">
   <col class="col-obs">
 </colgroup>
 <thead>
 <tr>
-  <th>OK</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Obs.</th>
+  <th>OK</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Etiquetado</th><th>Obs.</th>
 </tr>
 </thead>
 <tbody>
@@ -3671,30 +3740,56 @@ def render_picking_module(active_lote: int):
                 )
                 base = base[mask]
             base = base[["id", "area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "asignado", "disponible_asignar", "estado_asignacion", "ya_asignado"]].copy()
-            base.insert(0, "seleccionar", False)
-            edited = st.data_editor(
-                base,
-                use_container_width=True,
-                hide_index=True,
-                height=430,
-                column_config={
-                    "seleccionar": st.column_config.CheckboxColumn("Seleccionar"),
-                    "id": None,
-                    "ya_asignado": None,
-                    "disponible_asignar": None,
-                },
-                disabled=["area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "asignado", "disponible_asignar", "estado_asignacion", "ya_asignado"],
-                key="pick_editor",
-            )
-            selected = edited[(edited["seleccionar"] == True) & (edited["disponible_asignar"].astype(int) > 0)] if not edited.empty else pd.DataFrame()
-            st.caption(f"Seleccionados: {len(selected)} productos · {int(selected['unidades'].sum()) if not selected.empty else 0} unidades completas")
-            if st.button("Crear lista de picking", type="primary", disabled=selected.empty):
-                ok, msg = create_picking_list(active_lote, asignado_a, created_by, comentario, selected.to_dict("records"))
-                if ok:
-                    st.success(msg)
-                    st.rerun()
+            st.caption(f"Productos visibles: {len(base)} · {int(base['unidades'].sum()) if not base.empty else 0} unidades")
+
+            # Formulario para que marcar muchos productos no dispare reruns por cada checkbox.
+            # Esto hace mucho más expedita la asignación al picker.
+            with st.form("pick_create_form", clear_on_submit=False):
+                edit_base = base.copy()
+                edit_base.insert(0, "seleccionar", False)
+                edited = st.data_editor(
+                    edit_base,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=430,
+                    column_config={
+                        "seleccionar": st.column_config.CheckboxColumn("Seleccionar"),
+                        "id": None,
+                        "ya_asignado": None,
+                        "disponible_asignar": None,
+                    },
+                    disabled=["area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "asignado", "disponible_asignar", "estado_asignacion", "ya_asignado"],
+                    key="pick_editor",
+                )
+                selected = edited[(edited["seleccionar"] == True) & (edited["disponible_asignar"].astype(int) > 0)] if not edited.empty else pd.DataFrame()
+                st.caption(f"Seleccionados: {len(selected)} productos · {int(selected['unidades'].sum()) if not selected.empty else 0} unidades completas")
+                b1, b2 = st.columns([1, 1])
+                submit_selected = b1.form_submit_button("Crear lista con seleccionados", type="primary", disabled=base.empty)
+                submit_visible = b2.form_submit_button("Crear lista con todos los visibles", disabled=base.empty)
+
+            if submit_selected:
+                if selected.empty:
+                    st.error("Selecciona al menos un producto disponible.")
                 else:
-                    st.error(msg)
+                    with st.spinner("Creando lista de picking..."):
+                        ok, msg = create_picking_list(active_lote, asignado_a, created_by, comentario, selected.to_dict("records"))
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            elif submit_visible:
+                visibles = base[base["disponible_asignar"].astype(int) > 0].copy()
+                if visibles.empty:
+                    st.error("No hay productos visibles disponibles para asignar.")
+                else:
+                    with st.spinner("Creando lista de picking con productos visibles..."):
+                        ok, msg = create_picking_list(active_lote, asignado_a, created_by, comentario, visibles.to_dict("records"))
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
     with tab_detalle:
         lists = get_picking_lists(active_lote)
