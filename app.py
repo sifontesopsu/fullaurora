@@ -1503,6 +1503,281 @@ def read_full_excel_sheet(uploaded_file, sheet_name):
 
 
 # ============================================================
+# Carga directa desde PDF Mercado Libre + maestro Kame
+# ============================================================
+
+def valid_barcode_code(v) -> bool:
+    c = norm_code(v)
+    if not c or c in {"N/A", "NA", "SIN", "SINCODIGO"}:
+        return False
+    if not re.fullmatch(r"\d+", c):
+        return False
+    # Evita valores basura del maestro, por ejemplo "5".
+    return 8 <= len(c) <= 18 and len(set(c)) > 1
+
+
+def normalize_universal_code(v) -> str:
+    c = norm_code(v)
+    if valid_barcode_code(c):
+        return c
+    return "N/A"
+
+
+def words_to_lines_text(words, y_tol: float = 3.0) -> str:
+    """Agrupa palabras extraídas desde PDF respetando líneas visuales."""
+    lines = []
+    for w in words:
+        added = False
+        for line in lines:
+            if abs(float(line[0]) - float(w.get("top", 0))) <= y_tol:
+                line[1].append(w)
+                added = True
+                break
+        if not added:
+            lines.append([float(w.get("top", 0)), [w]])
+    lines.sort(key=lambda x: x[0])
+    out = []
+    for _, ws in lines:
+        ws.sort(key=lambda w: float(w.get("x0", 0)))
+        out.append(" ".join(clean_text(w.get("text", "")) for w in ws if clean_text(w.get("text", ""))))
+    return "\n".join([x for x in out if x])
+
+
+def parse_ml_full_pdf(uploaded_pdf) -> tuple[pd.DataFrame, dict]:
+    """Extrae productos desde el PDF de instrucciones de preparación de Mercado Libre.
+
+    El PDF no es una tabla limpia: visualmente tiene columnas. Por eso se parsea con
+    posiciones X/Y, no solo con texto plano. Devuelve una tabla base ML y totales
+    esperados declarados por el PDF.
+    """
+    try:
+        import pdfplumber
+    except Exception as e:
+        raise RuntimeError("Falta instalar la dependencia pdfplumber para leer PDFs. Agrega pdfplumber a requirements.txt.") from e
+
+    pdf_bytes = uploaded_pdf.getvalue() if hasattr(uploaded_pdf, "getvalue") else uploaded_pdf.read()
+    rows = []
+    totals = {"expected_products": None, "expected_units": None, "shipment": ""}
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if pdf.pages:
+            first_text = pdf.pages[0].extract_text() or ""
+            m_ship = re.search(r"Envío\s*#\s*(\d+)", first_text, re.I)
+            if m_ship:
+                totals["shipment"] = m_ship.group(1)
+            m = re.search(
+                r"Productos\s+del\s+env[ií]o:\s*(\d+)\s*\|\s*Total\s+de\s+unidades:\s*(\d+)",
+                first_text,
+                re.I,
+            )
+            if m:
+                totals["expected_products"] = int(m.group(1))
+                totals["expected_units"] = int(m.group(2))
+
+        for page_num, page in enumerate(pdf.pages, start=1):
+            words = page.extract_words(x_tolerance=1, y_tolerance=3, keep_blank_chars=False) or []
+            starts = []
+            for i, w in enumerate(words):
+                if (
+                    float(w.get("x0", 999)) < 85
+                    and clean_text(w.get("text", "")) == "Código"
+                    and i + 1 < len(words)
+                    and clean_text(words[i + 1].get("text", "")) == "ML:"
+                ):
+                    starts.append(float(w.get("top", 0)))
+
+            for idx, start in enumerate(starts):
+                end = starts[idx + 1] if idx + 1 < len(starts) else float(page.height) + 1
+                prod_words = [w for w in words if float(w.get("x0", 0)) < 230 and start - 1 <= float(w.get("top", 0)) < end - 1]
+                qty_words = [w for w in words if 225 <= float(w.get("x0", 0)) < 282 and start - 5 <= float(w.get("top", 0)) < end - 1]
+                ident_words = [w for w in words if 282 <= float(w.get("x0", 0)) < 370 and start - 5 <= float(w.get("top", 0)) < end - 1]
+                instr_words = [w for w in words if float(w.get("x0", 0)) >= 370 and start - 5 <= float(w.get("top", 0)) < end - 1]
+
+                prod_text = words_to_lines_text(prod_words)
+                flat = " ".join(prod_text.split())
+                ml_m = re.search(r"Código\s+ML:\s*([A-Z0-9]+)", flat, re.I)
+                sku_m = re.search(r"SKU:\s*([A-Z0-9]+)", flat, re.I)
+                univ_m = re.search(r"Código\s+universal:\s*(.*?)\s+SKU:", flat, re.I)
+                if not ml_m or not sku_m:
+                    continue
+
+                qty = 0
+                for w in sorted(qty_words, key=lambda z: (float(z.get("top", 0)), float(z.get("x0", 0)))):
+                    t = clean_text(w.get("text", ""))
+                    if re.fullmatch(r"\d+", t):
+                        qty = int(t)
+                        break
+
+                sku = norm_code(sku_m.group(1))
+                desc_pdf = flat[sku_m.end():].strip()
+                desc_pdf = re.sub(r"\bSUPERMERCADO\b.*$", "", desc_pdf, flags=re.I).strip()
+                desc_pdf = re.sub(r"\bEtiquetado\s+obligatorio\b.*$", "", desc_pdf, flags=re.I).strip()
+
+                ident = " ".join(words_to_lines_text(ident_words).split())
+                if "SUPERMERCADO" in flat.upper():
+                    ident = "SUPERMERCADO"
+                elif re.search(r"c[oó]digo\s+universal", ident, re.I):
+                    ident = "Código universal"
+                elif re.search(r"etiquetado", ident, re.I):
+                    ident = "Etiquetado obligatorio"
+
+                instr = " ".join(words_to_lines_text(instr_words).replace("•", " ").split())
+
+                rows.append({
+                    "page": page_num,
+                    "codigo_ml": norm_code(ml_m.group(1)),
+                    "codigo_universal_pdf": normalize_universal_code(univ_m.group(1) if univ_m else ""),
+                    "sku": sku,
+                    "descripcion_ml": clean_text(desc_pdf),
+                    "unidades": int(qty),
+                    "identificacion": clean_text(ident),
+                    "instrucciones": clean_text(instr),
+                })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df[df["unidades"].astype(int) > 0].reset_index(drop=True)
+    return df, totals
+
+
+def load_kame_master_maps(source=None) -> tuple[dict, dict, dict, int]:
+    """Carga maestro Kame por SKU: descripción, familia y código de barras."""
+    if source is None:
+        if not MAESTRO_PATH.exists():
+            return {}, {}, {}, 0
+        source = MAESTRO_PATH
+
+    raw = pd.read_excel(source, dtype=object).dropna(how="all")
+    if raw.empty:
+        return {}, {}, {}, 0
+    raw.columns = [clean_text(c) for c in raw.columns]
+    cols = list(raw.columns)
+    sku_col = col_exact(cols, ["SKU", "SKU ML", "sku_ml"])
+    desc_col = col_exact(cols, ["Descripción", "Descripcion", "Producto", "Title", "Titulo"])
+    barcode_col = col_exact(cols, ["codigo de barras", "Código de barras", "Codigo Universal", "Código Universal", "EAN", "Barcode"])
+    family_col = col_exact(cols, ["Familia", "Family", "Categoría", "Categoria"])
+    if not sku_col:
+        return {}, {}, {}, 0
+
+    desc_map = {}
+    family_map = {}
+    barcode_map = {}
+    for _, r in raw.iterrows():
+        sku = norm_code(r.get(sku_col, ""))
+        if not sku:
+            continue
+        if desc_col:
+            desc = clean_text(r.get(desc_col, ""))
+            if desc:
+                desc_map[sku] = desc
+        if family_col:
+            fam = clean_text(r.get(family_col, ""))
+            if fam:
+                family_map[sku] = fam
+        if barcode_col:
+            bc = norm_code(r.get(barcode_col, ""))
+            if valid_barcode_code(bc):
+                barcode_map[sku] = bc
+    return desc_map, family_map, barcode_map, len(raw)
+
+
+def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.DataFrame, dict]:
+    pdf_df, totals = parse_ml_full_pdf(uploaded_pdf)
+    desc_map, family_map, barcode_map, master_count = load_kame_master_maps(master_source)
+
+    rows = []
+    for idx, r in pdf_df.iterrows():
+        sku = norm_code(r.get("sku", ""))
+        alerts = []
+        desc_kame = clean_text(desc_map.get(sku, ""))
+        if not desc_kame:
+            alerts.append("SKU no encontrado en maestro Kame; se usa descripción ML")
+        desc_final = desc_kame or clean_text(r.get("descripcion_ml", ""))
+
+        pdf_univ = normalize_universal_code(r.get("codigo_universal_pdf", ""))
+        master_barcode = normalize_universal_code(barcode_map.get(sku, ""))
+        if pdf_univ != "N/A":
+            codigo_universal = pdf_univ
+        elif master_barcode != "N/A":
+            codigo_universal = master_barcode
+            alerts.append("Código universal tomado desde maestro Kame")
+        else:
+            codigo_universal = "N/A"
+            alerts.append("Código universal N/A")
+
+        instrucciones = clean_text(r.get("instrucciones", ""))
+        vence = "SI" if re.search(r"fecha\s+de\s+vencimiento|vencimiento", instrucciones, re.I) else ""
+
+        rows.append({
+            "area": "",
+            "nro": str(idx + 1),
+            "codigo_ml": norm_code(r.get("codigo_ml", "")),
+            "codigo_universal": codigo_universal,
+            "sku": sku,
+            "descripcion": desc_final,
+            "unidades": int(r.get("unidades", 0) or 0),
+            "identificacion": clean_text(r.get("identificacion", "")),
+            "vence": vence,
+            "dia": "",
+            "hora": "",
+            "instrucciones": instrucciones,
+            "descripcion_ml": clean_text(r.get("descripcion_ml", "")),
+            "familia_kame": clean_text(family_map.get(sku, "")),
+            "alertas": " | ".join(alerts),
+        })
+
+    df = pd.DataFrame(rows)
+    checks = {
+        **totals,
+        "detected_products": int(len(df)),
+        "detected_units": int(df["unidades"].sum()) if not df.empty else 0,
+        "master_rows": int(master_count),
+        "sku_not_found": int(df["alertas"].str.contains("SKU no encontrado", na=False).sum()) if not df.empty else 0,
+        "codigo_universal_na": int((df["codigo_universal"] == "N/A").sum()) if not df.empty else 0,
+        "products_match": (totals.get("expected_products") in [None, 0]) or int(totals.get("expected_products")) == int(len(df)),
+        "units_match": (totals.get("expected_units") in [None, 0]) or int(totals.get("expected_units")) == (int(df["unidades"].sum()) if not df.empty else 0),
+    }
+    return df, checks
+
+
+def full_input_excel_bytes(df: pd.DataFrame) -> bytes:
+    export_cols = [
+        ("nro", "Nº"),
+        ("codigo_ml", "Código ML"),
+        ("codigo_universal", "Código Universal"),
+        ("sku", "SKU"),
+        ("descripcion", "Descripción"),
+        ("unidades", "Unidades"),
+        ("identificacion", "Identificación"),
+        ("vence", "Vence"),
+        ("dia", "Dia"),
+        ("hora", "Hora"),
+        ("instrucciones", "Instrucciones"),
+        ("descripcion_ml", "Descripción ML"),
+        ("familia_kame", "Familia Kame"),
+        ("alertas", "Alertas"),
+    ]
+    out_df = pd.DataFrame()
+    for src, dst in export_cols:
+        out_df[dst] = df[src] if src in df.columns else ""
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        out_df.to_excel(writer, sheet_name="full_input", index=False)
+        ws = writer.sheets["full_input"]
+        for col_idx, col_name in enumerate(out_df.columns, start=1):
+            width = 18
+            if col_name in {"Descripción", "Instrucciones", "Descripción ML", "Alertas"}:
+                width = 48
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = width
+            if col_name in {"Código ML", "Código Universal", "SKU"}:
+                for cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+                    for c in cell:
+                        c.number_format = "@"
+    bio.seek(0)
+    return bio.getvalue()
+
+
+# ============================================================
 # Maestro SKU/EAN desde repo
 # ============================================================
 
@@ -3716,33 +3991,101 @@ with st.sidebar:
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
-    full_file = st.file_uploader("Excel FULL", type=["xlsx"])
-    if full_file:
-        names = sheet_names(full_file)
-        default_idx = len(names) - 1 if names else 0
-        selected_sheet = st.selectbox("Hoja a cargar", names, index=default_idx)
-        try:
-            df, warns = read_full_excel_sheet(full_file, selected_sheet)
-            for w in warns:
-                st.warning(w)
-            if df.empty:
-                st.error("No se encontraron productos válidos en la hoja seleccionada.")
-            else:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Hoja", selected_sheet)
-                c2.metric("Líneas", len(df))
-                c3.metric("Unidades", int(df["unidades"].sum()))
-                c4.metric("SKUs únicos", int(df["sku"].nunique()))
-                with st.expander("Revisión rápida de columnas leídas", expanded=True):
-                    st.dataframe(df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20), use_container_width=True, hide_index=True)
-                nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {now_cl().strftime('%d-%m-%Y %H:%M')}")
-                if st.button("Crear lote", type="primary"):
-                    create_lote(nombre, full_file.name, selected_sheet, df)
-                    reset_scan_state()
-                    st.success("Lote creado correctamente.")
-                    st.rerun()
-        except Exception as e:
-            st.error(f"No pude leer la hoja seleccionada: {e}")
+    modo_carga = st.radio(
+        "Origen del lote",
+        ["Excel depurado", "PDF Mercado Libre"],
+        horizontal=True,
+        help="Puedes mantener el flujo actual con Excel o crear el lote directo desde el PDF de preparación de Mercado Libre.",
+    )
+
+    if modo_carga == "Excel depurado":
+        full_file = st.file_uploader("Excel FULL", type=["xlsx"], key="excel_full_upload")
+        if full_file:
+            names = sheet_names(full_file)
+            default_idx = len(names) - 1 if names else 0
+            selected_sheet = st.selectbox("Hoja a cargar", names, index=default_idx)
+            try:
+                df, warns = read_full_excel_sheet(full_file, selected_sheet)
+                for w in warns:
+                    st.warning(w)
+                if df.empty:
+                    st.error("No se encontraron productos válidos en la hoja seleccionada.")
+                else:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Hoja", selected_sheet)
+                    c2.metric("Líneas", len(df))
+                    c3.metric("Unidades", int(df["unidades"].sum()))
+                    c4.metric("SKUs únicos", int(df["sku"].nunique()))
+                    with st.expander("Revisión rápida de columnas leídas", expanded=True):
+                        st.dataframe(df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20), use_container_width=True, hide_index=True)
+                    nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {now_cl().strftime('%d-%m-%Y %H:%M')}")
+                    if st.button("Crear lote", type="primary"):
+                        create_lote(nombre, full_file.name, selected_sheet, df)
+                        reset_scan_state()
+                        st.success("Lote creado correctamente.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"No pude leer la hoja seleccionada: {e}")
+
+    else:
+        st.caption("Carga el PDF de instrucciones de preparación de Mercado Libre. La app cruza por SKU contra el maestro Kame y genera el mismo formato operativo del Excel depurado.")
+        pdf_file = st.file_uploader("PDF Mercado Libre", type=["pdf"], key="pdf_ml_upload")
+        master_upload = st.file_uploader(
+            "Maestro SKU/EAN Kame opcional",
+            type=["xlsx"],
+            key="maestro_kame_upload",
+            help="Si no cargas uno, la app intentará usar data/maestro_sku_ean.xlsx del repositorio.",
+        )
+        if not master_upload and not MAESTRO_PATH.exists():
+            st.warning("No encontré data/maestro_sku_ean.xlsx. Puedes cargar el maestro Kame en el campo opcional para usar descripciones Kame.")
+
+        if pdf_file:
+            try:
+                master_source = io.BytesIO(master_upload.getvalue()) if master_upload else None
+                df_pdf, checks = build_full_input_from_pdf(pdf_file, master_source)
+                if df_pdf.empty:
+                    st.error("No pude detectar productos válidos en el PDF.")
+                else:
+                    c1, c2, c3, c4 = st.columns(4)
+                    expected_products = checks.get("expected_products") or "N/D"
+                    expected_units = checks.get("expected_units") or "N/D"
+                    c1.metric("Productos", f"{checks['detected_products']} / {expected_products}")
+                    c2.metric("Unidades", f"{checks['detected_units']} / {expected_units}")
+                    c3.metric("SKU sin maestro", checks.get("sku_not_found", 0))
+                    c4.metric("Cód. universal N/A", checks.get("codigo_universal_na", 0))
+
+                    if checks.get("products_match") and checks.get("units_match"):
+                        st.success("Validación OK: productos y unidades cuadran con el PDF.")
+                    else:
+                        st.error("La validación no cuadra con los totales del PDF. Revisa antes de crear el lote.")
+
+                    if checks.get("sku_not_found", 0):
+                        st.warning("Hay SKUs no encontrados en maestro Kame. Se usará la descripción de Mercado Libre para esos productos.")
+
+                    preview_cols = ["nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence", "alertas"]
+                    with st.expander("Vista previa del lote generado desde PDF", expanded=True):
+                        st.dataframe(df_pdf[preview_cols], use_container_width=True, hide_index=True, height=380)
+
+                    excel_name_base = f"full_input_pdf_{checks.get('shipment') or now_cl().strftime('%Y%m%d_%H%M')}"
+                    st.download_button(
+                        "Descargar Excel depurado generado",
+                        data=full_input_excel_bytes(df_pdf),
+                        file_name=f"{excel_name_base}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+                    nombre_default = f"PDF ML {checks.get('shipment') or ''} {now_cl().strftime('%d-%m-%Y %H:%M')}".strip()
+                    nombre = st.text_input("Nombre del lote", value=nombre_default, key="pdf_lote_nombre")
+                    can_create = bool(checks.get("products_match") and checks.get("units_match"))
+                    if not can_create:
+                        st.caption("Por seguridad, la creación se bloquea hasta que productos y unidades detectadas cuadren con el PDF.")
+                    if st.button("Crear lote desde PDF", type="primary", disabled=not can_create):
+                        create_lote(nombre, pdf_file.name, "PDF Mercado Libre", df_pdf)
+                        reset_scan_state()
+                        st.success("Lote creado correctamente desde PDF.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"No pude procesar el PDF: {e}")
 
 elif page == "Escaneo":
     st.markdown("""
