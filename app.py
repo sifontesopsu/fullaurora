@@ -1708,7 +1708,11 @@ def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.Data
             alerts.append("Código universal N/A")
 
         instrucciones = clean_text(r.get("instrucciones", ""))
-        vence = "SI" if re.search(r"fecha\s+de\s+vencimiento|vencimiento", instrucciones, re.I) else ""
+        # IMPORTANTE:
+        # El PDF de Mercado Libre NO trae una columna estructurada de vencimiento.
+        # Puede mencionar "fecha de vencimiento" dentro de instrucciones de preparación,
+        # pero eso NO debe convertirse en Vence=SI. Esa lógica pertenece solo al Excel depurado.
+        vence = ""
 
         rows.append({
             "area": "",
