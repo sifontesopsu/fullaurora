@@ -3247,9 +3247,9 @@ def build_picking_print_html(picking_list_id: int) -> str:
         rows_html.append(f"""
         <tr>
           <td class="check">☐</td>
-          <td><strong>{esc(r.codigo_ml)}</strong><br><span>{esc(r.codigo_universal)}</span></td>
-          <td>{esc(r.sku)}</td>
-          <td>{esc(r.descripcion)}</td>
+          <td class="codecell"><strong>{esc(r.codigo_ml)}</strong><br><span>{esc(r.codigo_universal)}</span></td>
+          <td class="skucell">{esc(r.sku)}</td>
+          <td class="desccell">{esc(r.descripcion)}</td>
           <td class="qty">{int(r.cantidad)}</td>
           <td class="obs"></td>
         </tr>
@@ -3267,11 +3267,19 @@ def build_picking_print_html(picking_list_id: int) -> str:
   .meta {{ font-size:13px; line-height:1.45; }}
   h1 {{ font-size:20px; margin:0 0 6px 0; }}
   table {{ width:100%; border-collapse:collapse; font-size:12px; table-layout:fixed; }}
-  th, td {{ border:1px solid #333; padding:6px; vertical-align:top; }}
+  th, td {{ border:1px solid #333; padding:4px; vertical-align:top; }}
   th {{ background:#eee; }}
-  .check {{ font-size:22px; width:32px; text-align:center; }}
-  .qty {{ font-size:18px; font-weight:900; text-align:center; width:70px; }}
-  .obs {{ width:260px; min-width:260px; }}
+  col.col-ok {{ width:34px; }}
+  col.col-code {{ width:128px; }}
+  col.col-sku {{ width:98px; }}
+  col.col-qty {{ width:44px; }}
+  col.col-obs {{ width:310px; }}
+  .check {{ font-size:18px; text-align:center; padding:2px; }}
+  .qty {{ font-size:16px; font-weight:900; text-align:center; padding:3px 2px; }}
+  .codecell {{ font-size:11px; line-height:1.25; word-break:break-word; }}
+  .skucell {{ font-size:11px; line-height:1.25; word-break:break-word; }}
+  .desccell {{ font-size:12px; line-height:1.25; }}
+  .obs {{ min-width:0; }}
   .firma-wrap {{ margin-top:28px; padding-top:10px; }}
   .firma-linea {{ margin-top:30px; width:320px; border-top:1.5px solid #111; padding-top:6px; font-size:13px; }}
   @media print {{ body {{ margin: 0; }} .no-print {{ display:none; }} }}
@@ -3291,6 +3299,14 @@ def build_picking_print_html(picking_list_id: int) -> str:
   <div class="code">{esc(meta.get('codigo_lista',''))}</div>
 </div>
 <table>
+<colgroup>
+  <col class="col-ok">
+  <col class="col-code">
+  <col class="col-sku">
+  <col class="col-desc">
+  <col class="col-qty">
+  <col class="col-obs">
+</colgroup>
 <thead>
 <tr>
   <th>OK</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Obs.</th>
