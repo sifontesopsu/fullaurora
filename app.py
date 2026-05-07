@@ -3247,12 +3247,11 @@ def build_picking_print_html(picking_list_id: int) -> str:
         rows_html.append(f"""
         <tr>
           <td class="check">☐</td>
-          <td>{esc(r.area)} / {esc(r.nro)}</td>
           <td><strong>{esc(r.codigo_ml)}</strong><br><span>{esc(r.codigo_universal)}</span></td>
           <td>{esc(r.sku)}</td>
           <td>{esc(r.descripcion)}</td>
           <td class="qty">{int(r.cantidad)}</td>
-          <td></td>
+          <td class="obs"></td>
         </tr>
         """)
     return f"""<!doctype html>
@@ -3270,8 +3269,10 @@ def build_picking_print_html(picking_list_id: int) -> str:
   th, td {{ border:1px solid #333; padding:6px; vertical-align:top; }}
   th {{ background:#eee; }}
   .check {{ font-size:22px; width:32px; text-align:center; }}
-  .qty {{ font-size:18px; font-weight:900; text-align:center; width:55px; }}
-  .obs {{ min-width:90px; }}
+  .qty {{ font-size:18px; font-weight:900; text-align:center; width:60px; }}
+  .obs {{ width:180px; min-width:180px; }}
+  .firma-wrap {{ margin-top:28px; padding-top:10px; }}
+  .firma-linea {{ margin-top:30px; width:320px; border-top:1.5px solid #111; padding-top:6px; font-size:13px; }}
   @media print {{ body {{ margin: 8mm; }} .no-print {{ display:none; }} }}
 </style>
 </head>
@@ -3291,13 +3292,16 @@ def build_picking_print_html(picking_list_id: int) -> str:
 <table>
 <thead>
 <tr>
-  <th>OK</th><th>Área/N°</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Obs.</th>
+  <th>OK</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Obs.</th>
 </tr>
 </thead>
 <tbody>
 {''.join(rows_html)}
 </tbody>
 </table>
+<div class="firma-wrap">
+  <div class="firma-linea">Firma pickeador</div>
+</div>
 <script>window.onload = function(){{ setTimeout(function(){{ window.print(); }}, 300); }};</script>
 </body>
 </html>"""
