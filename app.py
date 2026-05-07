@@ -3260,20 +3260,21 @@ def build_picking_print_html(picking_list_id: int) -> str:
 <meta charset="utf-8">
 <title>{esc(meta.get('codigo_lista','PICKING'))}</title>
 <style>
-  body {{ font-family: Arial, sans-serif; margin: 18px; color: #111; }}
+  @page {{ size: A4 landscape; margin: 10mm; }}
+  body {{ font-family: Arial, sans-serif; margin: 14px; color: #111; }}
   .top {{ display:flex; justify-content:space-between; align-items:flex-start; border-bottom:2px solid #111; padding-bottom:10px; margin-bottom:14px; }}
   .code {{ font-size:34px; font-weight:900; letter-spacing:1px; }}
   .meta {{ font-size:13px; line-height:1.45; }}
   h1 {{ font-size:20px; margin:0 0 6px 0; }}
-  table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12px; table-layout:fixed; }}
   th, td {{ border:1px solid #333; padding:6px; vertical-align:top; }}
   th {{ background:#eee; }}
   .check {{ font-size:22px; width:32px; text-align:center; }}
-  .qty {{ font-size:18px; font-weight:900; text-align:center; width:60px; }}
-  .obs {{ width:180px; min-width:180px; }}
+  .qty {{ font-size:18px; font-weight:900; text-align:center; width:70px; }}
+  .obs {{ width:260px; min-width:260px; }}
   .firma-wrap {{ margin-top:28px; padding-top:10px; }}
   .firma-linea {{ margin-top:30px; width:320px; border-top:1.5px solid #111; padding-top:6px; font-size:13px; }}
-  @media print {{ body {{ margin: 8mm; }} .no-print {{ display:none; }} }}
+  @media print {{ body {{ margin: 0; }} .no-print {{ display:none; }} }}
 </style>
 </head>
 <body>
