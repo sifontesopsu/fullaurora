@@ -213,6 +213,7 @@ def init_db():
                 acopiadas INTEGER NOT NULL DEFAULT 0,
                 identificacion TEXT,
                 vence TEXT,
+                instrucciones TEXT,
                 dia TEXT,
                 hora TEXT,
                 created_at TEXT NOT NULL,
@@ -394,6 +395,7 @@ def init_db():
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
         ensure_column(c, "lotes", "close_note", "TEXT")
+        ensure_column(c, "items", "instrucciones", "TEXT")
         # Incidencias por código: se conserva lote_id para control/cierre, pero el operador registra por ML/EAN/SKU.
         ensure_column(c, "incidencias", "codigo_ml", "TEXT")
         ensure_column(c, "incidencias", "codigo_universal", "TEXT")
@@ -648,6 +650,7 @@ def restore_from_backup_if_empty():
                 "acopiadas": 0,
                 "identificacion": clean_text(ev.get("identificacion", "")),
                 "vence": clean_text(ev.get("vence", "")),
+                "instrucciones": clean_text(ev.get("instrucciones", "")),
                 "dia": clean_text(ev.get("dia", "")),
                 "hora": clean_text(ev.get("hora", "")),
                 "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
@@ -673,6 +676,7 @@ def restore_from_backup_if_empty():
                     "acopiadas": 0,
                     "identificacion": clean_text(item_ev.get("identificacion", "")),
                     "vence": clean_text(item_ev.get("vence", "")),
+                    "instrucciones": clean_text(item_ev.get("instrucciones", "")),
                     "dia": clean_text(item_ev.get("dia", "")),
                     "hora": clean_text(item_ev.get("hora", "")),
                     "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
@@ -913,10 +917,10 @@ def restore_from_backup_if_empty():
                     """
                     INSERT OR REPLACE INTO items
                     (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
-                     identificacion, vence, dia, hora, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item["dia"], item["hora"], item["created_at"], item["updated_at"]),
+                    (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item.get("instrucciones", ""), item["dia"], item["hora"], item["created_at"], item["updated_at"]),
                 )
                 restored_items += 1
         for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at, operador_validador, picking_list_id, picking_code, picker_asignado in scan_rows:
@@ -1255,17 +1259,18 @@ def create_lote(nombre, archivo, hoja, df):
                 int(r.unidades),
                 0,
                 clean_text(r.identificacion),
-                clean_text(r.vence),
-                clean_text(r.dia),
-                clean_text(r.hora),
+                clean_text(getattr(r, "vence", "")),
+                clean_text(getattr(r, "instrucciones", "")),
+                clean_text(getattr(r, "dia", "")),
+                clean_text(getattr(r, "hora", "")),
                 now,
                 now,
             ))
         c.executemany("""
             INSERT INTO items
             (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
-             identificacion, vence, dia, hora, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         c.commit()
 
@@ -1284,8 +1289,9 @@ def create_lote(nombre, archivo, hoja, df):
             "descripcion": clean_text(r.descripcion),
             "unidades": int(r.unidades),
             "identificacion": clean_text(r.identificacion),
-            "vence": clean_text(r.vence),
-            "dia": clean_text(r.dia),
+            "vence": clean_text(getattr(r, "vence", "")),
+            "instrucciones": clean_text(getattr(r, "instrucciones", "")),
+            "dia": clean_text(getattr(r, "dia", "")),
             "hora": clean_text(r.hora),
             "item_created_at": clean_text(r.created_at),
             "item_updated_at": clean_text(r.updated_at),
@@ -1470,6 +1476,7 @@ def read_full_excel_sheet(uploaded_file, sheet_name):
     # Separación estricta: Identificación y Vence son columnas independientes.
     identificacion_col = col_exact(cols, ["Identificación", "Identificacion", "ETIQUETA", "ETIQ"])
     vence_col = col_exact(cols, ["Vence", "VCTO", "Vencimiento", "Fecha vencimiento", "Fecha de vencimiento"])
+    instrucciones_col = col_exact(cols, ["Instrucciones", "Instrucciones de preparación", "Instrucciones Preparación", "Preparación", "Preparacion"])
     dia_col = col_exact(cols, ["Dia", "Día"])
     hora_col = col_exact(cols, ["Hora"])
 
@@ -1488,11 +1495,12 @@ def read_full_excel_sheet(uploaded_file, sheet_name):
         "unidades": raw[unidades_col],
         "identificacion": raw[identificacion_col] if identificacion_col else "",
         "vence": raw[vence_col] if vence_col else "",
+        "instrucciones": raw[instrucciones_col] if instrucciones_col else "",
         "dia": raw[dia_col] if dia_col else "",
         "hora": raw[hora_col] if hora_col else "",
     })
 
-    for k in ["area", "nro", "descripcion", "identificacion", "vence", "dia", "hora"]:
+    for k in ["area", "nro", "descripcion", "identificacion", "vence", "instrucciones", "dia", "hora"]:
         df[k] = df[k].map(clean_text)
     for k in ["codigo_ml", "codigo_universal", "sku"]:
         df[k] = df[k].map(norm_code)
@@ -1708,11 +1716,12 @@ def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.Data
             alerts.append("Código universal N/A")
 
         instrucciones = clean_text(r.get("instrucciones", ""))
-        # IMPORTANTE:
-        # El PDF de Mercado Libre NO trae una columna estructurada de vencimiento.
-        # Puede mencionar "fecha de vencimiento" dentro de instrucciones de preparación,
-        # pero eso NO debe convertirse en Vence=SI. Esa lógica pertenece solo al Excel depurado.
-        vence = ""
+        # Regla PDF Mercado Libre:
+        # el PDF no trae una columna Vence como el Excel depurado, pero sí puede traer
+        # una instrucción explícita sobre fecha de vencimiento. Para operación, basta
+        # marcar Vence=SI cuando esa instrucción aparece en el texto de preparación.
+        instr_norm = normalize_header(instrucciones)
+        vence = "SI" if ("fecha de vencimiento" in instr_norm or "vencimiento" in instr_norm) else ""
 
         rows.append({
             "area": "",
@@ -1756,9 +1765,7 @@ def full_input_excel_bytes(df: pd.DataFrame) -> bytes:
         ("unidades", "Unidades"),
         ("identificacion", "Identificación"),
         ("vence", "Vence"),
-        ("dia", "Dia"),
-        ("hora", "Hora"),
-        ("instrucciones", "Instrucciones"),
+        ("instrucciones", "Instrucciones de preparación"),
         ("descripcion_ml", "Descripción ML"),
         ("familia_kame", "Familia Kame"),
         ("alertas", "Alertas"),
@@ -1772,7 +1779,7 @@ def full_input_excel_bytes(df: pd.DataFrame) -> bytes:
         ws = writer.sheets["full_input"]
         for col_idx, col_name in enumerate(out_df.columns, start=1):
             width = 18
-            if col_name in {"Descripción", "Instrucciones", "Descripción ML", "Alertas"}:
+            if col_name in {"Descripción", "Instrucciones", "Instrucciones de preparación", "Descripción ML", "Alertas"}:
                 width = 48
             ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = width
             if col_name in {"Código ML", "Código Universal", "SKU"}:
@@ -4023,7 +4030,10 @@ if page == "Cargar lote FULL":
                     c3.metric("Unidades", int(df["unidades"].sum()))
                     c4.metric("SKUs únicos", int(df["sku"].nunique()))
                     with st.expander("Revisión rápida de columnas leídas", expanded=True):
-                        st.dataframe(df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20), use_container_width=True, hide_index=True)
+                        preview_cols_excel = ["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]
+                        if "instrucciones" in df.columns and df["instrucciones"].astype(str).str.strip().ne("").any():
+                            preview_cols_excel.append("instrucciones")
+                        st.dataframe(df[preview_cols_excel].head(20), use_container_width=True, hide_index=True)
                     nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {now_cl().strftime('%d-%m-%Y %H:%M')}")
                     if st.button("Crear lote", type="primary"):
                         create_lote(nombre, full_file.name, selected_sheet, df)
