@@ -3359,11 +3359,8 @@ def render_picking_module(active_lote: int):
         if items_av.empty:
             st.warning("El lote no tiene productos.")
         else:
-            c1, c2 = st.columns(2)
-            with c1:
-                asignado_a = st.text_input("Asignado a", key="pick_asignado_a", placeholder="Nombre del picker")
-            with c2:
-                created_by = st.text_input("Creado por", key="pick_created_by", placeholder="Supervisor/Admin")
+            asignado_a = st.text_input("Asignado a", key="pick_asignado_a", placeholder="Nombre del picker")
+            created_by = "ADMIN"
             comentario = st.text_input("Comentario", key="pick_comentario", placeholder="Opcional")
             q = st.text_input("Buscar producto", key="pick_search", placeholder="SKU, Código ML o descripción")
             st.info("Regla operativa: cada producto seleccionado se asigna completo a esta lista. No se dividen cantidades del mismo SKU entre listas activas.")
