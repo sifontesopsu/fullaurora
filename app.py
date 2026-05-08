@@ -462,6 +462,25 @@ def mask_url(url: str) -> str:
     return url[:28] + "..." + url[-12:]
 
 
+
+
+def stop_for_backup_failure(message: str):
+    """Detiene la operación de forma controlada cuando Sheets no confirma respaldo.
+
+    No usamos RuntimeError para no mostrar pantalla roja de Streamlit. Si Sheets es
+    la fuente única, la operación debe detenerse, pero con una instrucción clara.
+    """
+    msg = clean_text(message)
+    try:
+        st.error("⚠️ Respaldo obligatorio en Sheets falló.")
+        st.warning("No continúes la operación hasta corregir el respaldo. El evento quedó en cola local, pero Sheets no lo confirmó.")
+        if msg:
+            st.code(msg[:1200])
+        st.info("Revisa: Apps Script implementado como Nueva versión, URL webhook definitiva y hoja de errores del Apps Script.")
+        st.stop()
+    except Exception:
+        raise RuntimeError(msg or "Respaldo obligatorio en Sheets falló")
+
 def enqueue_backup_event(event_type: str, payload: dict):
     """Registra un evento y exige respaldo inmediato en Google Sheets.
 
@@ -482,14 +501,14 @@ def enqueue_backup_event(event_type: str, payload: dict):
 
     webhook_url = get_backup_webhook_url()
     if not webhook_url:
-        raise RuntimeError("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
+        stop_for_backup_failure("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
 
     flush_backup_queue(webhook_url, limit=5000, include_failed=False)
     with db() as c:
         row = c.execute("SELECT status, last_error FROM backup_queue WHERE id=?", (event_id,)).fetchone()
     if not row or clean_text(row["status"]) != "sent":
         detail = clean_text(row["last_error"] if row else "Evento no encontrado en cola")
-        raise RuntimeError(f"Respaldo Sheets obligatorio falló para {event_type}: {detail}")
+        stop_for_backup_failure(f"Respaldo Sheets obligatorio falló para {event_type}: {detail}")
     return event_id
 
 
@@ -542,7 +561,7 @@ def enqueue_backup_events_batch(events):
 
     url = get_backup_webhook_url()
     if not url:
-        raise RuntimeError("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
+        stop_for_backup_failure("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
 
     flush_backup_queue(url, limit=max(5000, len(events) + 10), include_failed=False)
     with db() as c:
@@ -554,7 +573,7 @@ def enqueue_backup_events_batch(events):
     failed = [r for r in rows_status if clean_text(r["status"]) != "sent"]
     if failed:
         sample = failed[0]
-        raise RuntimeError(
+        stop_for_backup_failure(
             f"Respaldo Sheets obligatorio falló: {len(failed)} evento(s) sin enviar. "
             f"Ejemplo {sample['event_type']}: {clean_text(sample['last_error'])}"
         )
