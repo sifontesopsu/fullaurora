@@ -626,17 +626,22 @@ def local_lotes_count():
     return int(row["n"] or 0) if row else 0
 
 
-def restore_from_backup_if_empty():
-    """Restaura base local desde Sheets cuando SQLite está vacío.
+def local_lote_ids() -> set[int]:
+    with db() as c:
+        rows = c.execute("SELECT id FROM lotes").fetchall()
+    return {int(r["id"]) for r in rows}
 
-    Refuerzos producción:
-    - deduplica eventos por queue_id;
-    - soporta eventos que vengan con raw_json plano desde Apps Script;
-    - restaura incidencias;
-    - restaura reimpresiones controladas;
-    - restaura estado de lote cerrado/reabierto.
+
+def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: bool = False):
+    """Restaura/sincroniza base local desde Sheets.
+
+    - Modo automático: restaura solo si SQLite está vacío.
+    - Modo manual con allow_existing=True y only_missing=True: trae lotes que existen en Sheets
+      pero no existen en la base local, sin duplicar movimientos del lote ya presente.
     """
-    if local_lotes_count() > 0:
+
+    existing_local_ids = local_lote_ids()
+    if existing_local_ids and not allow_existing:
         return False, "Base local con datos; no se restaura."
     ok, events, msg = get_backup_events_from_sheets()
     if not ok:
@@ -956,7 +961,11 @@ def restore_from_backup_if_empty():
             deleted_lotes.add(lote_id)
 
     active_lote_ids = [lid for lid in lotes if lid not in deleted_lotes and items_by_lote.get(lid)]
+    if only_missing:
+        active_lote_ids = [lid for lid in active_lote_ids if lid not in existing_local_ids]
     if not active_lote_ids:
+        if only_missing:
+            return False, "No encontré lotes nuevos en Sheets para sincronizar."
         return False, "No encontré lotes activos con snapshot completo en Sheets. Crea el lote una vez con esta nueva versión para activar restauración automática."
 
     now = now_cl().isoformat(timespec="seconds")
@@ -4573,18 +4582,22 @@ with st.sidebar:
             st.success(st.session_state.get("_auto_restore_msg"))
         else:
             st.caption(f"Restauración: {st.session_state.get('_auto_restore_msg')}")
-    if st.button("Restaurar desde Sheets"):
-        if local_lotes_count() > 0:
-            st.warning("Ya hay lotes en la base local.")
+    if st.button("Sincronizar desde Sheets"):
+        # Si SQLite ya tiene lotes, no hacemos una restauración completa que pueda duplicar movimientos.
+        # Traemos solo lotes faltantes desde Sheets. Esto permite recuperar el último lote real
+        # aunque haya quedado un lote de práctica cerrado en la base local.
+        has_local = local_lotes_count() > 0
+        ok_restore, msg_restore = restore_from_backup_if_empty(
+            allow_existing=has_local,
+            only_missing=has_local,
+        )
+        st.session_state["_auto_restore_ok"] = ok_restore
+        st.session_state["_auto_restore_msg"] = msg_restore
+        if ok_restore:
+            st.success(msg_restore)
+            st.rerun()
         else:
-            ok_restore, msg_restore = restore_from_backup_if_empty()
-            st.session_state["_auto_restore_ok"] = ok_restore
-            st.session_state["_auto_restore_msg"] = msg_restore
-            if ok_restore:
-                st.success(msg_restore)
-                st.rerun()
-            else:
-                st.error(msg_restore)
+            st.error(msg_restore)
     if st.button("Probar respaldo Sheets"):
         ok_test, detail_test = test_backup_webhook()
         if ok_test:
