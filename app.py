@@ -3204,29 +3204,61 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
     }
 
 
-def close_lote(lote_id: int, usuario: str, nota: str):
+def close_lote(lote_id: int, usuario: str, nota: str, force: bool = False, force_reason: str = ""):
+    """Cierra un lote.
+
+    Cierre normal: exige validaciones completas.
+    Cierre forzado: permitido solo para casos administrativos/práctica, dejando trazabilidad
+    explícita en Sheets para no bloquear la operación real cuando hay un lote de prueba activo.
+    """
     if is_lote_closed(lote_id):
         return False, "Este lote ya está cerrado."
-    ok, issues, _ = cierre_validaciones(lote_id)
-    if not ok:
+
+    ok, issues, validation_data = cierre_validaciones(lote_id)
+    force = bool(force)
+    nota_limpia = clean_text(nota)
+    force_reason_limpio = clean_text(force_reason)
+
+    if not ok and not force:
         return False, "No se puede cerrar: " + " ".join(issues)
+
+    if force and not nota_limpia and not force_reason_limpio:
+        return False, "Para cierre administrativo forzado debes dejar una nota o motivo."
+
     now = now_cl().isoformat(timespec="seconds")
     usuario = clean_text(usuario) or "SIN_USUARIO"
+    if force:
+        nota_final = nota_limpia or force_reason_limpio
+        if issues:
+            nota_final = f"CIERRE FORZADO / ADMINISTRATIVO. {nota_final} | Pendientes al cierre: " + " | ".join(issues)
+    else:
+        nota_final = nota_limpia
+
     with db() as c:
         c.execute(
             "UPDATE lotes SET status='CERRADO', closed_at=?, closed_by=?, close_note=? WHERE id=?",
-            (now, usuario, clean_text(nota), int(lote_id)),
+            (now, usuario, nota_final, int(lote_id)),
         )
         c.commit()
+
     enqueue_backup_event("lote_cerrado", {
         **build_lote_payload(lote_id),
         "created_at": now,
         "usuario": usuario,
-        "comentario": clean_text(nota),
+        "comentario": nota_final,
         "status": "CERRADO",
+        "cierre_forzado": 1 if force else 0,
+        "cierre_forzado_motivo": force_reason_limpio,
+        "bloqueos_cierre": issues,
+        "validacion_cierre": validation_data,
     })
-    log_audit_event(lote_id, event_type="LOTE_CERRADO", detail=clean_text(nota), mode=usuario)
-    return True, "Lote cerrado correctamente."
+    log_audit_event(
+        lote_id,
+        event_type="LOTE_CERRADO_FORZADO" if force else "LOTE_CERRADO",
+        detail=nota_final,
+        mode=usuario,
+    )
+    return True, "Lote cerrado correctamente." if not force else "Lote cerrado por cierre administrativo forzado."
 
 
 def reopen_lote(lote_id: int, usuario: str, motivo: str):
@@ -5338,11 +5370,19 @@ elif page == "Supervisor":
                         st.write(f"• {issue}")
                 close_user = st.text_input("Cerrado por", key="sup_close_user", placeholder="Ej: supervisor")
                 close_note = st.text_area("Nota de cierre", placeholder="Ej: lote revisado completo, sin diferencias abiertas.", key="sup_close_note")
-                if st.button("Cerrar lote", type="primary", disabled=not ok_close2, key="sup_close_btn"):
+                force_close2 = False
+                force_reason2 = ""
+                if not ok_close2:
+                    with st.expander("Cierre administrativo forzado"):
+                        st.warning("Usar solo para lotes de práctica, lotes cargados por error o casos autorizados por administración. Quedará registrado en Sheets con los pendientes existentes.")
+                        force_close2 = st.checkbox("Cerrar igualmente este lote", key="sup_force_close_chk")
+                        force_reason2 = st.text_input("Motivo del cierre forzado", key="sup_force_close_reason", placeholder="Ej: lote de práctica / no operativo")
+                can_close2 = ok_close2 or force_close2
+                if st.button("Cerrar lote", type="primary", disabled=not can_close2, key="sup_close_btn"):
                     if not clean_text(close_user):
                         st.error("Ingresa quién cierra el lote.")
                     else:
-                        ok_final, msg_final = close_lote(active_lote, close_user, close_note)
+                        ok_final, msg_final = close_lote(active_lote, close_user, close_note, force=force_close2, force_reason=force_reason2)
                         st.success(msg_final) if ok_final else st.error(msg_final)
                         if ok_final:
                             st.rerun()
@@ -5496,8 +5536,16 @@ elif page == "Cierre de lote":
                     st.write(f"• {issue}")
             close_user = st.text_input("Cerrado por", value=get_operator_name(), key="close_user")
             close_note = st.text_area("Nota de cierre", placeholder="Ej: lote revisado completo, sin diferencias abiertas.", key="close_note")
-            if st.button("Cerrar lote", type="primary", disabled=not ok_close):
-                ok_final, msg_final = close_lote(active_lote, close_user, close_note)
+            force_close = False
+            force_reason = ""
+            if not ok_close:
+                with st.expander("Cierre administrativo forzado"):
+                    st.warning("Usar solo para lotes de práctica, lotes cargados por error o casos autorizados por administración. Quedará registrado en Sheets con los pendientes existentes.")
+                    force_close = st.checkbox("Cerrar igualmente este lote", key="force_close_chk")
+                    force_reason = st.text_input("Motivo del cierre forzado", key="force_close_reason", placeholder="Ej: lote de práctica / no operativo")
+            can_close = ok_close or force_close
+            if st.button("Cerrar lote", type="primary", disabled=not can_close):
+                ok_final, msg_final = close_lote(active_lote, close_user, close_note, force=force_close, force_reason=force_reason)
                 st.success(msg_final) if ok_final else st.error(msg_final)
                 if ok_final:
                     st.rerun()
