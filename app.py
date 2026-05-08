@@ -3270,7 +3270,7 @@ def get_picking_items(picking_list_id: int) -> pd.DataFrame:
             FROM picking_list_items pli
             LEFT JOIN items i ON i.id = pli.item_id AND i.lote_id = pli.lote_id
             WHERE pli.picking_list_id=?
-            ORDER BY pli.area, CAST(pli.nro AS INTEGER), pli.id
+            ORDER BY pli.area, pli.sku, pli.cantidad DESC, pli.id
             """,
             c,
             params=(int(picking_list_id),),
@@ -3317,6 +3317,36 @@ def get_picking_available_items(lote_id: int) -> pd.DataFrame:
     )
     view["estado_asignacion"] = view["ya_asignado"].map(lambda x: "YA ASIGNADO" if x else "DISPONIBLE")
     return view
+
+
+
+def apply_picking_operational_sort(df: pd.DataFrame, units_desc: bool = True) -> pd.DataFrame:
+    """Orden operacional para armar listas de picking.
+
+    La tabla de Streamlit permite ordenar visualmente por una columna, pero la
+    operación necesita un orden compuesto y estable: Área → SKU → Unidades.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    def area_key(v):
+        s = clean_text(v).upper()
+        if not s:
+            return "ZZZ"
+        return s
+
+    out["_sort_area"] = out["area"].map(area_key) if "area" in out.columns else "ZZZ"
+    out["_sort_sku"] = out["sku"].map(norm_code) if "sku" in out.columns else ""
+    out["_sort_unidades"] = out["unidades"].map(to_int) if "unidades" in out.columns else 0
+    out["_sort_nro"] = out["nro"].map(to_int) if "nro" in out.columns else 0
+
+    out = out.sort_values(
+        by=["_sort_area", "_sort_sku", "_sort_unidades", "_sort_nro"],
+        ascending=[True, True, not bool(units_desc), True],
+        kind="mergesort",
+    )
+    return out.drop(columns=["_sort_area", "_sort_sku", "_sort_unidades", "_sort_nro"], errors="ignore").reset_index(drop=True)
 
 
 def get_picking_validation_summary(picking_list_id: int) -> pd.DataFrame:
@@ -3730,6 +3760,7 @@ def render_picking_module(active_lote: int):
             st.dataframe(lists_progress.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True, height=330)
         if not items_av.empty:
             sin_asignar = items_av[items_av["disponible_asignar"].astype(int) > 0]
+            sin_asignar = apply_picking_operational_sort(sin_asignar, units_desc=True)
             with st.expander("Productos sin asignar", expanded=False):
                 show = sin_asignar[["area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "estado_asignacion"]].copy()
                 st.dataframe(show, use_container_width=True, hide_index=True, height=320)
@@ -3744,6 +3775,22 @@ def render_picking_module(active_lote: int):
             q = st.text_input("Buscar producto", key="pick_search", placeholder="SKU, Código ML o descripción")
             st.info("Regla operativa: cada producto seleccionado se asigna completo a esta lista. No se dividen cantidades del mismo SKU entre listas activas.")
             solo_disp = st.checkbox("Mostrar solo productos sin asignar", value=True, key="pick_solo_disp")
+            col_ord1, col_ord2 = st.columns([2, 1])
+            with col_ord1:
+                orden_operativo = st.selectbox(
+                    "Orden operativo",
+                    ["Área → SKU → Unidades", "SKU → Área → Unidades", "Unidades → Área → SKU"],
+                    index=0,
+                    key="pick_orden_operativo",
+                    help="Ordena la tabla antes de seleccionar. Así no dependes del orden manual de una sola columna.",
+                )
+            with col_ord2:
+                unidades_desc = st.selectbox(
+                    "Unidades",
+                    ["Mayor a menor", "Menor a mayor"],
+                    index=0,
+                    key="pick_unidades_orden",
+                ) == "Mayor a menor"
             base = items_av.copy()
             if solo_disp:
                 base = base[base["disponible_asignar"].astype(int) > 0]
@@ -3755,6 +3802,29 @@ def render_picking_module(active_lote: int):
                     base["descripcion"].astype(str).map(normalize_header).str.contains(qn, na=False)
                 )
                 base = base[mask]
+            if orden_operativo == "Área → SKU → Unidades":
+                base = apply_picking_operational_sort(base, units_desc=unidades_desc)
+            elif orden_operativo == "SKU → Área → Unidades":
+                base = base.copy()
+                base["_sort_sku"] = base["sku"].map(norm_code)
+                base["_sort_area"] = base["area"].map(lambda x: clean_text(x).upper() or "ZZZ")
+                base["_sort_unidades"] = base["unidades"].map(to_int)
+                base = base.sort_values(
+                    by=["_sort_sku", "_sort_area", "_sort_unidades"],
+                    ascending=[True, True, not bool(unidades_desc)],
+                    kind="mergesort",
+                ).drop(columns=["_sort_sku", "_sort_area", "_sort_unidades"], errors="ignore").reset_index(drop=True)
+            else:
+                base = base.copy()
+                base["_sort_unidades"] = base["unidades"].map(to_int)
+                base["_sort_area"] = base["area"].map(lambda x: clean_text(x).upper() or "ZZZ")
+                base["_sort_sku"] = base["sku"].map(norm_code)
+                base = base.sort_values(
+                    by=["_sort_unidades", "_sort_area", "_sort_sku"],
+                    ascending=[not bool(unidades_desc), True, True],
+                    kind="mergesort",
+                ).drop(columns=["_sort_unidades", "_sort_area", "_sort_sku"], errors="ignore").reset_index(drop=True)
+            st.caption(f"Orden aplicado: {orden_operativo} · Unidades {'mayor a menor' if unidades_desc else 'menor a mayor'}")
             base = base[["id", "area", "nro", "codigo_ml", "sku", "descripcion", "unidades", "asignado", "disponible_asignar", "estado_asignacion", "ya_asignado"]].copy()
             base.insert(0, "seleccionar", False)
             edited = st.data_editor(
