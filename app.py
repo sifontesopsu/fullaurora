@@ -20,6 +20,7 @@ APP_TITLE = "Control FULL Aurora"
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "aurora_full_v3.db"
 MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
+PACKS_PATH = DATA_DIR / "packs.xlsx"
 DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
 MAX_BACKUP_ATTEMPTS = 5
 SHEETS_STRICT_MODE = True  # Sheets es fuente única: no ocultar fallas de respaldo.
@@ -392,6 +393,27 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS reservas_kame (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                folio TEXT NOT NULL,
+                folio_auto TEXT,
+                ficha TEXT,
+                fecha TEXT,
+                glosa TEXT,
+                bodega_salida TEXT,
+                unidad_negocio TEXT,
+                sku_count INTEGER NOT NULL DEFAULT 0,
+                unidades_total REAL NOT NULL DEFAULT 0,
+                productos_full INTEGER NOT NULL DEFAULT 0,
+                packs_expandidos INTEGER NOT NULL DEFAULT 0,
+                lineas_csv INTEGER NOT NULL DEFAULT 0,
+                archivo_nombre TEXT,
+                usuario TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -428,6 +450,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_picking_items_list ON picking_list_items (picking_list_id, item_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_picking_items_lote ON picking_list_items (lote_id, item_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_scans_picking ON scans (picking_list_id, item_id, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_reservas_kame_lote ON reservas_kame (lote_id, created_at)")
 
         c.commit()
 
@@ -3902,6 +3925,380 @@ def render_picking_module(active_lote: int):
                     else:
                         st.error(msg)
 
+
+# ============================================================
+# Reservas Kame: importador inventario con expansión de packs
+# ============================================================
+
+KAME_RESERVA_HEADERS = [
+    "Tipo Movimiento",
+    "Motivo Movimiento",
+    "FolioAuto",
+    "Folio",
+    "Bodega Entrada",
+    "Bodega Salida",
+    "Ficha",
+    "Fecha",
+    "Glosa",
+    "SKU",
+    "Nombre Unidad de Negocio",
+    "Cantidad",
+    "PrecioUnitario",
+]
+
+
+def to_float_qty(v) -> float:
+    s = clean_text(v)
+    if not s:
+        return 0.0
+    s = s.replace(".", "").replace(",", ".") if re.search(r"\d\.\d{3}", s) else s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def format_kame_qty(v) -> str:
+    try:
+        n = float(v)
+    except Exception:
+        n = 0.0
+    if abs(n - round(n)) < 0.0000001:
+        return str(int(round(n)))
+    return (f"{n:.6f}").rstrip("0").rstrip(".")
+
+
+def kame_csv_field(v) -> str:
+    # Kame permite CSV/TXT separado por ;. Evitamos saltos y ; dentro de campos.
+    s = clean_text(v).replace(";", ",")
+    s = re.sub(r"[\r\n]+", " ", s).strip()
+    return s
+
+
+def load_pack_components(path: Path = PACKS_PATH) -> dict:
+    """Devuelve {PACK SKU: [componentes]} usando data/packs.xlsx.
+
+    Cada componente trae ART. SKU y ART. Cantidad, que es la cantidad del artículo
+    unitario necesaria por 1 unidad del pack vendido en FULL.
+    """
+    if not Path(path).exists():
+        raise FileNotFoundError(f"No encontré {path}. Debe existir data/packs.xlsx en el repositorio.")
+    raw = pd.read_excel(path, dtype=object)
+    raw = raw.dropna(how="all")
+    if raw.empty:
+        return {}
+    raw.columns = [clean_text(c) for c in raw.columns]
+    cols = list(raw.columns)
+    pack_col = col_required(cols, "PACK SKU", ["PACK SKU", "Pack SKU", "SKU Pack", "SKU PACK"])
+    art_col = col_required(cols, "ART. SKU", ["ART. SKU", "ART SKU", "SKU Art", "SKU Articulo", "SKU Artículo"])
+    qty_col = col_required(cols, "ART. Cantidad", ["ART. Cantidad", "ART Cantidad", "Cantidad", "Cantidad Articulo", "Cantidad Artículo"])
+    desc_pack_col = col_exact(cols, ["PACK Descripción", "PACK Descripcion", "Descripción Pack", "Descripcion Pack"])
+    desc_art_col = col_exact(cols, ["ART. Descripción", "ART. Descripcion", "ART Descripción", "ART Descripcion"])
+
+    pack_map = {}
+    for _, row in raw.iterrows():
+        pack_sku = norm_code(row.get(pack_col, ""))
+        art_sku = norm_code(row.get(art_col, ""))
+        factor = to_float_qty(row.get(qty_col, 0))
+        if not pack_sku:
+            continue
+        pack_map.setdefault(pack_sku, []).append({
+            "pack_sku": pack_sku,
+            "pack_descripcion": clean_text(row.get(desc_pack_col, "")) if desc_pack_col else "",
+            "art_sku": art_sku,
+            "art_descripcion": clean_text(row.get(desc_art_col, "")) if desc_art_col else "",
+            "factor": factor,
+        })
+    return pack_map
+
+
+def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Expande packs y genera preview + agrupado final para reserva Kame."""
+    items = get_items(lote_id)
+    alerts = []
+    if items.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame([{"tipo": "ERROR", "detalle": "El lote no tiene productos."}])
+
+    pack_map = load_pack_components(PACKS_PATH)
+    rows = []
+    for it in items.itertuples(index=False):
+        sku_full = norm_code(getattr(it, "sku", ""))
+        unidades_full = to_float_qty(getattr(it, "unidades", 0))
+        desc_full = clean_text(getattr(it, "descripcion", ""))
+        codigo_ml = norm_code(getattr(it, "codigo_ml", ""))
+        item_id = int(getattr(it, "id", 0) or 0)
+
+        if not sku_full:
+            alerts.append({"tipo": "ERROR", "detalle": f"Item {item_id} no tiene SKU. No se puede reservar en Kame."})
+            continue
+
+        components = pack_map.get(sku_full, [])
+        if components:
+            valid_components = 0
+            for comp in components:
+                art_sku = norm_code(comp.get("art_sku", ""))
+                factor = float(comp.get("factor") or 0)
+                if not art_sku:
+                    alerts.append({"tipo": "ERROR", "detalle": f"Pack {sku_full} tiene un componente sin ART. SKU."})
+                    continue
+                if factor <= 0:
+                    alerts.append({"tipo": "ERROR", "detalle": f"Pack {sku_full} → ART. SKU {art_sku} tiene ART. Cantidad inválida: {factor}."})
+                    continue
+                cantidad_reserva = unidades_full * factor
+                if abs(cantidad_reserva - round(cantidad_reserva)) > 0.0000001:
+                    alerts.append({"tipo": "AVISO", "detalle": f"Cantidad decimal: pack {sku_full} → {art_sku} = {format_kame_qty(cantidad_reserva)}."})
+                rows.append({
+                    "item_id": item_id,
+                    "codigo_ml": codigo_ml,
+                    "sku_full": sku_full,
+                    "descripcion_full": desc_full,
+                    "unidades_full": unidades_full,
+                    "tipo_origen": "PACK_EXPANDIDO",
+                    "sku_reserva": art_sku,
+                    "descripcion_reserva": clean_text(comp.get("art_descripcion", "")),
+                    "factor_pack": factor,
+                    "cantidad_reserva": cantidad_reserva,
+                })
+                valid_components += 1
+            if valid_components == 0:
+                alerts.append({"tipo": "ERROR", "detalle": f"Pack {sku_full} no tiene componentes válidos. No se genera reserva para ese item."})
+        else:
+            rows.append({
+                "item_id": item_id,
+                "codigo_ml": codigo_ml,
+                "sku_full": sku_full,
+                "descripcion_full": desc_full,
+                "unidades_full": unidades_full,
+                "tipo_origen": "DIRECTO",
+                "sku_reserva": sku_full,
+                "descripcion_reserva": desc_full,
+                "factor_pack": 1.0,
+                "cantidad_reserva": unidades_full,
+            })
+
+    expanded = pd.DataFrame(rows)
+    if expanded.empty:
+        return expanded, pd.DataFrame(), pd.DataFrame(alerts or [{"tipo": "ERROR", "detalle": "No se pudo generar ninguna línea de reserva."}])
+
+    grouped = (
+        expanded.groupby("sku_reserva", as_index=False)
+        .agg(
+            descripcion_reserva=("descripcion_reserva", "first"),
+            cantidad_reserva=("cantidad_reserva", "sum"),
+            lineas_origen=("sku_full", "count"),
+            packs_expandidos=("tipo_origen", lambda s: int((s == "PACK_EXPANDIDO").sum())),
+        )
+        .sort_values("sku_reserva", kind="mergesort")
+        .reset_index(drop=True)
+    )
+    grouped["cantidad_kame"] = grouped["cantidad_reserva"].map(format_kame_qty)
+    alerts_df = pd.DataFrame(alerts, columns=["tipo", "detalle"]) if alerts else pd.DataFrame(columns=["tipo", "detalle"])
+    return expanded, grouped, alerts_df
+
+
+def build_kame_reserva_csv(grouped: pd.DataFrame, folio: str, ficha: str, fecha_doc, glosa: str, bodega_salida: str, unidad_negocio: str, folio_auto: str = "S") -> bytes:
+    if hasattr(fecha_doc, "strftime"):
+        fecha_txt = fecha_doc.strftime("%d/%m/%Y")
+    else:
+        fecha_txt = clean_text(fecha_doc)
+    lines = [";".join(KAME_RESERVA_HEADERS)]
+    for r in grouped.itertuples(index=False):
+        row = [
+            "SALIDA",
+            "reserva",
+            kame_csv_field(folio_auto or "S"),
+            kame_csv_field(folio),
+            "",
+            kame_csv_field(bodega_salida or "BODEGA UNIVERSAL"),
+            kame_csv_field(ficha),
+            kame_csv_field(fecha_txt),
+            kame_csv_field(glosa),
+            kame_csv_field(getattr(r, "sku_reserva", "")),
+            kame_csv_field(unidad_negocio or "Casa Matriz"),
+            kame_csv_field(getattr(r, "cantidad_kame", format_kame_qty(getattr(r, "cantidad_reserva", 0)))),
+            "",
+        ]
+        lines.append(";".join(row))
+    text = "\r\n".join(lines) + "\r\n"
+    return text.encode("utf-8-sig")
+
+
+def register_reserva_kame(lote_id: int, folio: str, folio_auto: str, ficha: str, fecha_doc, glosa: str, bodega_salida: str, unidad_negocio: str, archivo_nombre: str, usuario: str, expanded: pd.DataFrame, grouped: pd.DataFrame):
+    """Registra la generación/descarga de reserva en Sheets como fuente única."""
+    lote_payload = build_lote_payload(lote_id)
+    created_at = now_cl().isoformat(timespec="seconds")
+    if hasattr(fecha_doc, "strftime"):
+        fecha_txt = fecha_doc.strftime("%d/%m/%Y")
+    else:
+        fecha_txt = clean_text(fecha_doc)
+    usuario = clean_text(usuario) or "ADMIN"
+    sku_count = int(grouped["sku_reserva"].nunique()) if not grouped.empty else 0
+    unidades_total = float(grouped["cantidad_reserva"].sum()) if not grouped.empty else 0.0
+    packs_expandidos = int((expanded["tipo_origen"] == "PACK_EXPANDIDO").sum()) if not expanded.empty else 0
+    productos_full = int(expanded["item_id"].nunique()) if not expanded.empty else 0
+
+    with db() as c:
+        c.execute(
+            """
+            INSERT INTO reservas_kame
+            (lote_id, folio, folio_auto, ficha, fecha, glosa, bodega_salida, unidad_negocio,
+             sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, usuario, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (int(lote_id), clean_text(folio), clean_text(folio_auto), clean_text(ficha), fecha_txt, clean_text(glosa), clean_text(bodega_salida), clean_text(unidad_negocio),
+             sku_count, unidades_total, productos_full, packs_expandidos, int(len(grouped)), clean_text(archivo_nombre), usuario, created_at),
+        )
+        c.commit()
+
+    events = [("reserva_kame_generada", {
+        **lote_payload,
+        "created_at": created_at,
+        "folio": clean_text(folio),
+        "folio_auto": clean_text(folio_auto),
+        "ficha": clean_text(ficha),
+        "fecha": fecha_txt,
+        "glosa": clean_text(glosa),
+        "bodega_salida": clean_text(bodega_salida),
+        "unidad_negocio": clean_text(unidad_negocio),
+        "sku_count": sku_count,
+        "unidades_total": format_kame_qty(unidades_total),
+        "productos_full": productos_full,
+        "packs_expandidos": packs_expandidos,
+        "lineas_csv": int(len(grouped)),
+        "archivo_nombre": clean_text(archivo_nombre),
+        "usuario": usuario,
+    })]
+
+    for r in grouped.itertuples(index=False):
+        events.append(("reserva_kame_item", {
+            **lote_payload,
+            "created_at": created_at,
+            "folio": clean_text(folio),
+            "ficha": clean_text(ficha),
+            "fecha": fecha_txt,
+            "sku": clean_text(getattr(r, "sku_reserva", "")),
+            "descripcion": clean_text(getattr(r, "descripcion_reserva", "")),
+            "cantidad": clean_text(getattr(r, "cantidad_kame", format_kame_qty(getattr(r, "cantidad_reserva", 0)))),
+            "lineas_origen": int(getattr(r, "lineas_origen", 0) or 0),
+            "packs_expandidos": int(getattr(r, "packs_expandidos", 0) or 0),
+            "archivo_nombre": clean_text(archivo_nombre),
+            "usuario": usuario,
+        }))
+
+    enqueue_backup_events_batch(events)
+    log_audit_event(lote_id, event_type="RESERVA_KAME_GENERADA", detail=f"Reserva Kame folio {clean_text(folio)} · {sku_count} SKU · {format_kame_qty(unidades_total)} unidades", qty=int(round(unidades_total)), mode=usuario)
+
+
+def render_reservas_kame_module(active_lote: int):
+    st.subheader("Reservas Kame")
+    st.caption("Genera el archivo masivo para reservar en Kame los productos del lote FULL. Si un SKU es pack, se expande al ART. SKU unitario usando data/packs.xlsx.")
+    if not active_lote:
+        st.warning("No hay lote activo.")
+        return
+
+    lote = get_lote(active_lote)
+    if not PACKS_PATH.exists():
+        st.error("Falta data/packs.xlsx en el repo. No genero reserva Kame sin la matriz de packs, porque se podrían reservar SKUs incorrectos.")
+        return
+
+    try:
+        expanded, grouped, alerts = build_kame_reserva_data(active_lote)
+    except Exception as e:
+        st.error(f"No pude construir la reserva Kame: {e}")
+        return
+
+    has_errors = (not alerts.empty and alerts["tipo"].astype(str).str.upper().eq("ERROR").any())
+    total_full = int(get_items(active_lote)["unidades"].sum()) if not get_items(active_lote).empty else 0
+    total_reserva = float(grouped["cantidad_reserva"].sum()) if not grouped.empty else 0.0
+    packs_count = int((expanded["tipo_origen"] == "PACK_EXPANDIDO").sum()) if not expanded.empty else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Lote", clean_text(lote.get("nombre", ""))[:24])
+    m2.metric("Unidades FULL", total_full)
+    m3.metric("SKU reserva", int(grouped["sku_reserva"].nunique()) if not grouped.empty else 0)
+    m4.metric("Packs expandidos", packs_count)
+
+    with st.expander("Parámetros del archivo Kame", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            folio = st.text_input("Folio", key="kame_res_folio", placeholder="Ej: 1000006")
+            folio_auto = st.selectbox("FolioAuto", ["S", "A", ""], index=0, key="kame_res_folio_auto")
+        with c2:
+            ficha_opt = st.selectbox("Ficha", ["16.092.564-7", "16.092.564-8", "Otra"], index=0, key="kame_res_ficha_opt")
+            ficha = st.text_input("Ficha personalizada", key="kame_res_ficha_custom", placeholder="XX.XXX.XXX-X") if ficha_opt == "Otra" else ficha_opt
+        with c3:
+            fecha_doc = st.date_input("Fecha", value=now_cl().date(), format="DD/MM/YYYY", key="kame_res_fecha")
+            usuario = st.text_input("Usuario", value=get_operator_name() or "ADMIN", key="kame_res_usuario")
+        c4, c5 = st.columns(2)
+        with c4:
+            bodega_salida = st.text_input("Bodega Salida", value="BODEGA UNIVERSAL", key="kame_res_bodega")
+            unidad_negocio = st.text_input("Nombre Unidad de Negocio", value="Casa Matriz", key="kame_res_unidad")
+        with c5:
+            glosa = st.text_input("Glosa", value=f"Reserva FULL Mercado Libre {clean_text(lote.get('nombre',''))}", key="kame_res_glosa")
+
+    if not alerts.empty:
+        if has_errors:
+            st.error("Hay errores que bloquean la reserva Kame.")
+        else:
+            st.warning("Hay avisos en la expansión de packs. Revisa antes de importar en Kame.")
+        st.dataframe(alerts, use_container_width=True, hide_index=True, height=180)
+
+    tab_prev, tab_final = st.tabs(["Expansión packs", "CSV final Kame"])
+    with tab_prev:
+        if expanded.empty:
+            st.warning("Sin líneas para mostrar.")
+        else:
+            show_expanded = expanded[["codigo_ml", "sku_full", "descripcion_full", "unidades_full", "tipo_origen", "sku_reserva", "descripcion_reserva", "factor_pack", "cantidad_reserva"]].copy()
+            show_expanded["unidades_full"] = show_expanded["unidades_full"].map(format_kame_qty)
+            show_expanded["factor_pack"] = show_expanded["factor_pack"].map(format_kame_qty)
+            show_expanded["cantidad_reserva"] = show_expanded["cantidad_reserva"].map(format_kame_qty)
+            st.dataframe(show_expanded, use_container_width=True, hide_index=True, height=360)
+    with tab_final:
+        if grouped.empty:
+            st.warning("Sin líneas finales para CSV.")
+        else:
+            show_grouped = grouped[["sku_reserva", "descripcion_reserva", "cantidad_kame", "lineas_origen", "packs_expandidos"]].copy()
+            st.dataframe(show_grouped, use_container_width=True, hide_index=True, height=360)
+            st.caption(f"Total reserva Kame: {format_kame_qty(total_reserva)} unidades finales después de expandir packs y agrupar SKU.")
+
+    archivo_nombre = f"reserva_kame_lote_{int(active_lote):03d}_folio_{clean_text(folio) or 'SIN_FOLIO'}.csv"
+    can_download = bool(clean_text(folio) and clean_text(ficha) and not grouped.empty and not has_errors)
+    if not clean_text(folio):
+        st.info("Ingresa un folio Kame para habilitar la descarga.")
+    if has_errors:
+        st.info("Corrige los errores de packs/SKU antes de descargar el archivo.")
+
+    csv_bytes = build_kame_reserva_csv(grouped, folio, ficha, fecha_doc, glosa, bodega_salida, unidad_negocio, folio_auto) if not grouped.empty else b""
+    st.download_button(
+        "Descargar CSV reserva Kame",
+        data=csv_bytes,
+        file_name=archivo_nombre,
+        mime="text/csv",
+        type="primary",
+        disabled=not can_download,
+        on_click=register_reserva_kame,
+        args=(active_lote, folio, folio_auto, ficha, fecha_doc, glosa, bodega_salida, unidad_negocio, archivo_nombre, usuario, expanded, grouped),
+        key=f"download_reserva_kame_{active_lote}_{clean_text(folio)}",
+    )
+
+    with db() as c:
+        hist = pd.read_sql_query(
+            """
+            SELECT created_at, folio, ficha, fecha, sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, usuario
+            FROM reservas_kame
+            WHERE lote_id=?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            c,
+            params=(int(active_lote),),
+        )
+    if not hist.empty:
+        with st.expander("Historial local de reservas Kame generadas", expanded=False):
+            hist["created_at"] = hist["created_at"].map(fmt_dt)
+            hist["unidades_total"] = hist["unidades_total"].map(format_kame_qty)
+            st.dataframe(hist, use_container_width=True, hide_index=True, height=220)
+
 # ============================================================
 # Exportación
 # ============================================================
@@ -4102,7 +4499,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Supervisor", "Etiquetas"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Reservas Kame", "Supervisor", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -4636,6 +5033,12 @@ elif page == "Picking":
         st.warning("No hay lote activo.")
     else:
         render_picking_module(active_lote)
+
+elif page == "Reservas Kame":
+    if not active_lote:
+        st.warning("No hay lote activo.")
+    else:
+        render_reservas_kame_module(active_lote)
 
 elif page == "Supervisor":
     st.subheader("Panel supervisor")
