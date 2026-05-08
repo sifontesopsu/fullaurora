@@ -3264,10 +3264,13 @@ def get_picking_items(picking_list_id: int) -> pd.DataFrame:
     with db() as c:
         return pd.read_sql_query(
             """
-            SELECT *
-            FROM picking_list_items
-            WHERE picking_list_id=?
-            ORDER BY area, CAST(nro AS INTEGER), id
+            SELECT
+                pli.*,
+                COALESCE(i.identificacion, '') AS identificacion
+            FROM picking_list_items pli
+            LEFT JOIN items i ON i.id = pli.item_id AND i.lote_id = pli.lote_id
+            WHERE pli.picking_list_id=?
+            ORDER BY pli.area, CAST(pli.nro AS INTEGER), pli.id
             """,
             c,
             params=(int(picking_list_id),),
@@ -3623,6 +3626,7 @@ def build_picking_print_html(picking_list_id: int) -> str:
           <td class="skucell">{esc(r.sku)}</td>
           <td class="desccell">{esc(r.descripcion)}</td>
           <td class="qty">{int(r.cantidad)}</td>
+          <td class="tagcell">{esc(getattr(r, 'identificacion', ''))}</td>
           <td class="obs"></td>
         </tr>
         """)
@@ -3645,12 +3649,14 @@ def build_picking_print_html(picking_list_id: int) -> str:
   col.col-code {{ width:128px; }}
   col.col-sku {{ width:98px; }}
   col.col-qty {{ width:44px; }}
-  col.col-obs {{ width:310px; }}
+  col.col-tag {{ width:118px; }}
+  col.col-obs {{ width:192px; }}
   .check {{ font-size:18px; text-align:center; padding:2px; }}
   .qty {{ font-size:16px; font-weight:900; text-align:center; padding:3px 2px; }}
   .codecell {{ font-size:11px; line-height:1.25; word-break:break-word; }}
   .skucell {{ font-size:11px; line-height:1.25; word-break:break-word; }}
   .desccell {{ font-size:12px; line-height:1.25; }}
+  .tagcell {{ font-size:11px; line-height:1.2; font-weight:700; text-align:center; }}
   .obs {{ min-width:0; }}
   .firma-wrap {{ margin-top:28px; padding-top:10px; }}
   .firma-linea {{ margin-top:30px; width:320px; border-top:1.5px solid #111; padding-top:6px; font-size:13px; }}
@@ -3677,11 +3683,12 @@ def build_picking_print_html(picking_list_id: int) -> str:
   <col class="col-sku">
   <col class="col-desc">
   <col class="col-qty">
+  <col class="col-tag">
   <col class="col-obs">
 </colgroup>
 <thead>
 <tr>
-  <th>OK</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Obs.</th>
+  <th>OK</th><th>Código ML / Universal</th><th>SKU</th><th>Descripción</th><th>Cant.</th><th>Etiquetado</th><th>Obs.</th>
 </tr>
 </thead>
 <tbody>
