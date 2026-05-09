@@ -4836,7 +4836,10 @@ def render_rescate_sheets():
     events_df = get_sheet_lote_events_df(events, selected_lote_id)
     integ_preview = state_preview.get("integrity", {}) or {}
     if integ_preview.get("fallback_from_picking"):
-        st.warning(f"Este rescate incorporará {integ_preview.get('fallback_from_picking')} producto(s) que están en eventos de picking pero no aparecían en lote_item. Quedarán marcados como PICKING_FALLBACK para trazabilidad.")
+        msg_pick = f"Este rescate incorporará {integ_preview.get('fallback_from_picking')} producto(s) que están en eventos de picking pero no aparecían en lote_item. Quedarán marcados como PICKING_EVIDENCE para trazabilidad."
+        if integ_preview.get('fallback_from_picking_anulado'):
+            msg_pick += f" De ellos, {integ_preview.get('fallback_from_picking_anulado')} provienen de listas anuladas: eso solo anula la asignación de picking, no elimina el producto del FULL ni de la reserva Kame."
+        st.warning(msg_pick)
     if integ_preview.get("unmatched_scans") or integ_preview.get("ambiguous_scans"):
         st.info(f"Escaneos por reconciliar: sin match inicial {integ_preview.get('unmatched_scans',0)}, ambiguos {integ_preview.get('ambiguous_scans',0)}. La app resolverá solo dentro de este lote.")
 
@@ -4947,7 +4950,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
     - Filtra estrictamente por lote_id seleccionado.
     - Lote_item/lote_snapshot_chunk son snapshot primario.
     - Si picking/scan referencia un producto que no existe en el snapshot primario,
-      se crea un producto de respaldo con fuente_rescate=PICKING_FALLBACK/SCAN_FALLBACK.
+      se crea un producto de respaldo con fuente_rescate=PICKING_EVIDENCE/SCAN_FALLBACK.
     - No se suman duplicados de picking: si un producto aparece varias veces fuera del
       snapshot, se conserva una sola ficha y se toma la mayor cantidad vista para no
       duplicar unidades por reimpresiones o recreaciones.
@@ -5081,7 +5084,10 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
         elif et == "lote_eliminado":
             meta["status"] = "ELIMINADO"
 
-    # 2) Picking con estado final por código/lista. Anulación es terminal.
+    # 2) Picking con estado final por código/lista.
+    # Importante: anular una lista anula la asignación, NO elimina el producto del FULL.
+    # Por eso los raw_items de una lista anulada igual pueden alimentar el universo FULL,
+    # pero la lista queda con estado ANULADA para el control operativo.
     picking_lists = {}
     anuladas = set()
     for ev in lote_events:
@@ -5131,21 +5137,32 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             picking_lists[code]["anulada_by"] = clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
             picking_lists[code]["anulada_motivo"] = clean_text(ev.get("comentario", ""))
 
-    # 3) Agregar productos faltantes desde picking NO anulado. Esto no inventa: usa líneas completas que están en eventos.
+    # 3) Agregar productos faltantes desde TODO picking del mismo lote.
+    # Esto no inventa: usa líneas completas guardadas en los eventos picking_lista_creada.
+    # Una lista ANULADA no alimenta la asignación vigente, pero sus productos siguen siendo
+    # evidencia del universo FULL. Si luego se reasignaron a otra lista, la deduplicación
+    # evita duplicar cantidades.
     picking_item_rows = []
     fallback_from_picking = 0
+    fallback_from_picking_anulado = 0
     for code, pl in picking_lists.items():
-        if pl.get("estado") == "ANULADA":
-            continue
+        assignment_state = clean_text(pl.get("estado", "CREADA")) or "CREADA"
         for pit in pl.get("raw_items") or []:
             if not isinstance(pit, dict):
                 continue
             before_count = len(items_by_id)
-            item_id = add_or_update_item({**pit, "unidades": pit.get("cantidad", 0), "created_at": pl.get("created_at", "")}, "PICKING_FALLBACK", f"producto reconstruido desde lista {code}")
+            note = f"producto reconstruido desde lista {code}; estado_asignacion={assignment_state}"
+            item_id = add_or_update_item(
+                {**pit, "unidades": pit.get("cantidad", 0), "created_at": pl.get("created_at", "")},
+                "PICKING_EVIDENCE",
+                note,
+            )
             if item_id is None:
                 continue
             if len(items_by_id) > before_count:
                 fallback_from_picking += 1
+                if assignment_state == "ANULADA":
+                    fallback_from_picking_anulado += 1
             picking_item_rows.append({
                 "picking_list_id": int(pl["id"]),
                 "lote_id": target,
@@ -5157,7 +5174,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
                 "cantidad": to_int(pit.get("cantidad", 0)),
                 "area": clean_text(pit.get("area", "")),
                 "nro": clean_text(pit.get("nro", "")),
-                "estado": "PENDIENTE",
+                "estado": assignment_state,
                 "created_at": clean_text(pl.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
 
@@ -5369,6 +5386,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
 
     integrity = {
         "fallback_from_picking": fallback_from_picking,
+        "fallback_from_picking_anulado": fallback_from_picking_anulado,
         "unmatched_scans": unmatched_scans,
         "ambiguous_scans": ambiguous_scans,
         "warnings": warnings,
@@ -5581,7 +5599,9 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
         f"{len(state.get('auditoria', []))} evento(s) auditoría."
     )
     if integ.get("fallback_from_picking"):
-        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde picking porque no estaban en lote_item."
+        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde eventos de picking porque no estaban en lote_item."
+        if integ.get("fallback_from_picking_anulado"):
+            msg += f" {integ.get('fallback_from_picking_anulado')} venían de listas anuladas; se consideran producto del FULL, pero la asignación queda como ANULADA."
     if integ.get("unmatched_scans") or integ.get("ambiguous_scans"):
         msg += f" Scans sin match inicial: {integ.get('unmatched_scans',0)}; ambiguos: {integ.get('ambiguous_scans',0)}."
     return True, msg
