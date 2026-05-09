@@ -632,12 +632,13 @@ def local_lote_ids() -> set[int]:
     return {int(r["id"]) for r in rows}
 
 
-def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: bool = False):
+def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: bool = False, only_lote_id: int | None = None, replace_existing: bool = False):
     """Restaura/sincroniza base local desde Sheets.
 
     - Modo automático: restaura solo si SQLite está vacío.
     - Modo manual con allow_existing=True y only_missing=True: trae lotes que existen en Sheets
       pero no existen en la base local, sin duplicar movimientos del lote ya presente.
+    - Modo rescate con only_lote_id: restaura únicamente el lote elegido por el usuario.
     """
 
     existing_local_ids = local_lote_ids()
@@ -999,7 +1000,15 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     active_lote_ids = [lid for lid in lotes if lid not in deleted_lotes and items_by_lote.get(lid)]
     if only_missing:
         active_lote_ids = [lid for lid in active_lote_ids if lid not in existing_local_ids]
+    if only_lote_id is not None:
+        try:
+            target_lote_id = int(only_lote_id)
+            active_lote_ids = [lid for lid in active_lote_ids if int(lid) == target_lote_id]
+        except Exception:
+            active_lote_ids = []
     if not active_lote_ids:
+        if only_lote_id is not None:
+            return False, f"No encontré el lote seleccionado {only_lote_id} con snapshot completo en Sheets. Revisa que tenga lote_item o lote_snapshot_chunk."
         if only_missing:
             return False, "No encontré lotes nuevos en Sheets para sincronizar. Si el lote existe en eventos pero no aparece, revisa que tenga lote_item o lote_snapshot_chunk."
         return False, "No encontré lotes activos con snapshot completo en Sheets. Crea el lote una vez con esta nueva versión para activar restauración automática."
@@ -1014,6 +1023,20 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     restored_picking = 0
 
     with db() as c:
+        if replace_existing:
+            for lid in sorted(active_lote_ids):
+                c.execute("DELETE FROM scans WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM incidencias WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM reimpresiones WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM avisos_operacionales WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM picking_list_items WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM picking_lists WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM label_prints WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM label_blocks WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM reservas_kame WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM audit_events WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM items WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM lotes WHERE id=?", (lid,))
         for lid in sorted(active_lote_ids):
             lote = lotes[lid]
             status_update = lote_status_updates.get(lid, {})
@@ -4376,6 +4399,351 @@ def render_reservas_kame_module(active_lote: int):
             hist["unidades_total"] = hist["unidades_total"].map(format_kame_qty)
             st.dataframe(hist, use_container_width=True, hide_index=True, height=220)
 
+
+
+# ============================================================
+# Rescate controlado desde Sheets
+# ============================================================
+
+def normalize_sheet_event(raw_ev: dict) -> dict:
+    """Normaliza una fila leída desde la hoja eventos.
+
+    Apps Script devuelve columnas visibles + raw_json. Para restaurar de forma confiable
+    usamos raw_json cuando existe, pero conservamos las columnas visibles como respaldo.
+    """
+    base = dict(raw_ev or {})
+    raw = base.get("raw_json")
+    if raw:
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                base.update(parsed)
+        except Exception:
+            pass
+    return base
+
+
+def sheet_event_timestamp(ev: dict) -> str:
+    return clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", ""))
+
+
+def get_sheet_events_normalized() -> tuple[bool, list[dict], str]:
+    ok, events, msg = get_backup_events_from_sheets()
+    if not ok:
+        return False, [], msg
+    normalized = []
+    seen_queue_ids = set()
+    for raw_ev in events:
+        ev = normalize_sheet_event(raw_ev)
+        qid = clean_text(ev.get("queue_id", ""))
+        if qid:
+            if qid in seen_queue_ids:
+                continue
+            seen_queue_ids.add(qid)
+        normalized.append(ev)
+
+    def key(ev):
+        qid = clean_text(ev.get("queue_id", ""))
+        try:
+            return (0, int(qid))
+        except Exception:
+            return (1, sheet_event_timestamp(ev))
+
+    normalized.sort(key=key)
+    return True, normalized, f"Eventos normalizados: {len(normalized)}"
+
+
+def summarize_sheet_lotes(events: list[dict]) -> pd.DataFrame:
+    local_ids = local_lote_ids()
+    lotes = {}
+    picking_codes = {}
+
+    def ensure(lote_id: int) -> dict:
+        if lote_id not in lotes:
+            lotes[lote_id] = {
+                "lote_id": lote_id,
+                "lote_nombre": f"Lote {lote_id}",
+                "estado": "ACTIVO",
+                "created_at": "",
+                "ultimo_evento": "",
+                "productos": 0,
+                "unidades": 0,
+                "escaneos": 0,
+                "unidades_escaneadas": 0,
+                "picking_listas": 0,
+                "incidencias": 0,
+                "avisos": 0,
+                "reimpresiones": 0,
+                "reservas_kame": 0,
+                "existe_local": "SI" if lote_id in local_ids else "NO",
+            }
+            picking_codes[lote_id] = set()
+        return lotes[lote_id]
+
+    for ev in events:
+        try:
+            lote_id = int(ev.get("lote_id"))
+        except Exception:
+            continue
+        if lote_id <= 0:
+            continue
+        et = clean_text(ev.get("event_type", ""))
+        if not et or et == "test_webhook":
+            continue
+        rec = ensure(lote_id)
+        lote_nombre = clean_text(ev.get("lote_nombre", ""))
+        if lote_nombre:
+            rec["lote_nombre"] = lote_nombre
+        ts = sheet_event_timestamp(ev)
+        if ts:
+            if not rec["created_at"]:
+                rec["created_at"] = ts
+            rec["ultimo_evento"] = ts
+
+        et_low = et.lower()
+        if et == "lote_creado":
+            rec["productos"] = max(int(rec["productos"] or 0), to_int(ev.get("total_lineas", 0)))
+            rec["unidades"] = max(float(rec["unidades"] or 0), float(to_int(ev.get("total_unidades", 0))))
+            rec["estado"] = clean_text(ev.get("status", rec["estado"])) or rec["estado"]
+        elif et == "lote_item":
+            rec["productos"] = int(rec["productos"] or 0) + 1
+            rec["unidades"] = float(rec["unidades"] or 0) + float(to_int(ev.get("unidades", 0)))
+        elif et == "lote_snapshot_chunk":
+            chunk_items = ev.get("items") or []
+            rec["productos"] = int(rec["productos"] or 0) + len(chunk_items)
+            rec["unidades"] = float(rec["unidades"] or 0) + sum(float(to_int(x.get("unidades", 0))) for x in chunk_items if isinstance(x, dict))
+        elif et == "scan_agregado":
+            rec["escaneos"] = int(rec["escaneos"] or 0) + 1
+            rec["unidades_escaneadas"] = float(rec["unidades_escaneadas"] or 0) + float(to_int(ev.get("cantidad", 0)))
+        elif et == "scan_deshacer":
+            rec["unidades_escaneadas"] = max(0, float(rec["unidades_escaneadas"] or 0) - float(to_int(ev.get("cantidad", 0))))
+        elif et in {"picking_lista_creada", "PICKING_LISTA_CREADA"}:
+            code = clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")) or clean_text(ev.get("picking_list_id", ""))
+            if code and code not in picking_codes[lote_id]:
+                picking_codes[lote_id].add(code)
+                rec["picking_listas"] = len(picking_codes[lote_id])
+        elif "incidencia" in et_low:
+            if "creada" in et_low or "abierta" in et_low:
+                rec["incidencias"] = int(rec["incidencias"] or 0) + 1
+        elif "aviso_operacional_creado" in et_low:
+            rec["avisos"] = int(rec["avisos"] or 0) + 1
+        elif "reimpresion" in et_low:
+            rec["reimpresiones"] = int(rec["reimpresiones"] or 0) + 1
+        elif et == "reserva_kame_generada":
+            rec["reservas_kame"] = int(rec["reservas_kame"] or 0) + 1
+        elif et == "lote_cerrado":
+            rec["estado"] = "CERRADO"
+        elif et == "lote_reabierto":
+            rec["estado"] = "ACTIVO"
+        elif et == "lote_eliminado":
+            rec["estado"] = "ELIMINADO"
+
+    if not lotes:
+        return pd.DataFrame()
+    df = pd.DataFrame(list(lotes.values()))
+    df["created_at_fmt"] = df["created_at"].map(fmt_dt)
+    df["ultimo_evento_fmt"] = df["ultimo_evento"].map(fmt_dt)
+    df = df.sort_values(["ultimo_evento", "lote_id"], ascending=[False, False]).reset_index(drop=True)
+    return df
+
+
+def get_sheet_lote_items_from_events(events: list[dict], lote_id: int) -> pd.DataFrame:
+    rows = []
+    for ev in events:
+        try:
+            ev_lote_id = int(ev.get("lote_id"))
+        except Exception:
+            continue
+        if ev_lote_id != int(lote_id):
+            continue
+        et = clean_text(ev.get("event_type", ""))
+        if et == "lote_item":
+            rows.append({
+                "item_id": ev.get("item_id", ""),
+                "area": clean_text(ev.get("area", "")),
+                "nro": clean_text(ev.get("nro", "")),
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion", "")),
+                "unidades": to_int(ev.get("unidades", 0)),
+                "identificacion": clean_text(ev.get("identificacion", "")),
+                "vence": clean_text(ev.get("vence", "")),
+            })
+        elif et == "lote_snapshot_chunk":
+            for item in ev.get("items") or []:
+                if isinstance(item, dict):
+                    rows.append({
+                        "item_id": item.get("item_id", ""),
+                        "area": clean_text(item.get("area", "")),
+                        "nro": clean_text(item.get("nro", "")),
+                        "codigo_ml": norm_code(item.get("codigo_ml", "")),
+                        "codigo_universal": norm_code(item.get("codigo_universal", "")),
+                        "sku": norm_code(item.get("sku", "")),
+                        "descripcion": clean_text(item.get("descripcion", "")),
+                        "unidades": to_int(item.get("unidades", 0)),
+                        "identificacion": clean_text(item.get("identificacion", "")),
+                        "vence": clean_text(item.get("vence", "")),
+                    })
+    return pd.DataFrame(rows)
+
+
+def get_sheet_lote_events_df(events: list[dict], lote_id: int) -> pd.DataFrame:
+    rows = []
+    for ev in events:
+        try:
+            ev_lote_id = int(ev.get("lote_id"))
+        except Exception:
+            continue
+        if ev_lote_id != int(lote_id):
+            continue
+        rows.append({
+            "fecha": fmt_dt(sheet_event_timestamp(ev)),
+            "event_type": clean_text(ev.get("event_type", "")),
+            "queue_id": clean_text(ev.get("queue_id", "")),
+            "item_id": clean_text(ev.get("item_id", "")),
+            "codigo_ml": clean_text(ev.get("codigo_ml", "")),
+            "sku": clean_text(ev.get("sku", "")),
+            "cantidad": clean_text(ev.get("cantidad", ev.get("unidades", ""))),
+            "detalle": clean_text(ev.get("descripcion", "")) or clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
+        })
+    return pd.DataFrame(rows)
+
+
+def render_rescate_sheets():
+    st.subheader("Rescate desde Sheets")
+    st.caption("Sheets muestra candidatos, revisas el FULL y la app restaura solo el lote que elijas. No se cambia el lote activo automáticamente.")
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        load_now = st.button("Actualizar candidatos", type="primary", use_container_width=True)
+    with c2:
+        st.info("Usa este módulo para revisar FULL antiguos o recuperar un lote real cuando SQLite/Streamlit tenga una base local parcial.")
+
+    if load_now or "sheet_rescue_events" not in st.session_state:
+        ok, events, msg = get_sheet_events_normalized()
+        if not ok:
+            st.error(msg)
+            return
+        st.session_state["sheet_rescue_events"] = events
+        st.session_state["sheet_rescue_msg"] = msg
+
+    events = st.session_state.get("sheet_rescue_events") or []
+    if not events:
+        st.warning("No hay eventos disponibles desde Sheets.")
+        return
+
+    candidates = summarize_sheet_lotes(events)
+    if candidates.empty:
+        st.warning("No encontré lotes candidatos en Sheets.")
+        return
+
+    f1, f2, f3 = st.columns([2, 1, 1])
+    with f1:
+        buscar = st.text_input("Buscar FULL", placeholder="Ej: Full 1405, PDF ML, lote...", key="sheet_rescue_buscar")
+    with f2:
+        estado = st.selectbox("Estado", ["Todos", "ACTIVO", "CERRADO", "ELIMINADO"], key="sheet_rescue_estado")
+    with f3:
+        mostrar_locales = st.checkbox("Mostrar ya locales", value=True, key="sheet_rescue_locales")
+
+    show = candidates.copy()
+    if clean_text(buscar):
+        q = clean_text(buscar).lower()
+        show = show[show["lote_nombre"].astype(str).str.lower().str.contains(re.escape(q), na=False)]
+    if estado != "Todos":
+        show = show[show["estado"] == estado]
+    if not mostrar_locales:
+        show = show[show["existe_local"] != "SI"]
+
+    table_cols = ["estado", "lote_id", "lote_nombre", "created_at_fmt", "ultimo_evento_fmt", "productos", "unidades", "unidades_escaneadas", "picking_listas", "incidencias", "avisos", "reservas_kame", "existe_local"]
+    st.dataframe(show[table_cols].rename(columns={
+        "estado": "Estado",
+        "lote_id": "Lote ID",
+        "lote_nombre": "Lote",
+        "created_at_fmt": "Creado",
+        "ultimo_evento_fmt": "Último evento",
+        "productos": "Productos",
+        "unidades": "Unidades",
+        "unidades_escaneadas": "Escaneado",
+        "picking_listas": "Picking",
+        "incidencias": "Incidencias",
+        "avisos": "Avisos",
+        "reservas_kame": "Reservas Kame",
+        "existe_local": "Local",
+    }), use_container_width=True, hide_index=True, height=320)
+
+    if show.empty:
+        st.warning("Sin candidatos con esos filtros.")
+        return
+
+    option_map = {}
+    options = []
+    for r in show.itertuples(index=False):
+        label = f"{r.lote_id} · {r.estado} · {r.lote_nombre} · último {fmt_dt(r.ultimo_evento)} · local {r.existe_local}"
+        options.append(label)
+        option_map[label] = int(r.lote_id)
+
+    selected_label = st.selectbox("Lote a revisar/restaurar", options, key="sheet_rescue_selected")
+    selected_lote_id = option_map[selected_label]
+    selected_row = candidates[candidates["lote_id"].astype(int) == int(selected_lote_id)].iloc[0].to_dict()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Productos", int(selected_row.get("productos") or 0))
+    m2.metric("Unidades", format_kame_qty(float(selected_row.get("unidades") or 0)) if 'format_kame_qty' in globals() else int(selected_row.get("unidades") or 0))
+    m3.metric("Escaneado", format_kame_qty(float(selected_row.get("unidades_escaneadas") or 0)) if 'format_kame_qty' in globals() else int(selected_row.get("unidades_escaneadas") or 0))
+    m4.metric("Estado", clean_text(selected_row.get("estado", "")))
+
+    items_df = get_sheet_lote_items_from_events(events, selected_lote_id)
+    events_df = get_sheet_lote_events_df(events, selected_lote_id)
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Productos", "Eventos", "Picking/escaneos", "Incidencias y avisos"])
+    with tab1:
+        if items_df.empty:
+            st.warning("Este lote no tiene snapshot de productos visible en Sheets. No se puede restaurar con seguridad.")
+        else:
+            st.dataframe(items_df, use_container_width=True, hide_index=True, height=360)
+    with tab2:
+        st.dataframe(events_df, use_container_width=True, hide_index=True, height=360)
+    with tab3:
+        mov = events_df[events_df["event_type"].isin(["scan_agregado", "scan_deshacer", "picking_lista_creada", "picking_lista_impresa", "picking_lista_completada", "picking_lista_anulada"])] if not events_df.empty else pd.DataFrame()
+        if mov.empty:
+            st.info("Sin eventos de picking/escaneo para este lote.")
+        else:
+            st.dataframe(mov, use_container_width=True, hide_index=True, height=320)
+    with tab4:
+        ia = events_df[events_df["event_type"].astype(str).str.contains("incidencia|aviso_operacional", case=False, na=False)] if not events_df.empty else pd.DataFrame()
+        if ia.empty:
+            st.info("Sin incidencias ni avisos para este lote.")
+        else:
+            st.dataframe(ia, use_container_width=True, hide_index=True, height=320)
+
+    st.divider()
+    if items_df.empty:
+        st.error("No se puede restaurar: falta snapshot de productos lote_item/lote_snapshot_chunk en Sheets.")
+        return
+
+    exists_local = int(selected_lote_id) in local_lote_ids()
+    confirm = st.checkbox(
+        f"Confirmo restaurar {'y reemplazar localmente' if exists_local else ''} el lote {selected_lote_id}: {clean_text(selected_row.get('lote_nombre',''))}",
+        key=f"confirm_rescue_{selected_lote_id}",
+    )
+    btn_label = "Re-sincronizar lote seleccionado" if exists_local else "Restaurar lote seleccionado"
+    if st.button(btn_label, type="primary", disabled=not confirm, key=f"restore_sheet_lote_{selected_lote_id}"):
+        ok_restore, msg_restore = restore_from_backup_if_empty(
+            allow_existing=True,
+            only_missing=False,
+            only_lote_id=int(selected_lote_id),
+            replace_existing=bool(exists_local),
+        )
+        st.session_state["_auto_restore_ok"] = ok_restore
+        st.session_state["_auto_restore_msg"] = msg_restore
+        if ok_restore:
+            st.success(msg_restore)
+            st.info("Ahora selecciona este lote en el selector de Lote activo. No se cambió automáticamente.")
+            st.rerun()
+        else:
+            st.error(msg_restore)
+
 # ============================================================
 # Exportación
 # ============================================================
@@ -4553,9 +4921,11 @@ load_maestro_from_repo()
 
 if "_auto_restore_checked" not in st.session_state:
     st.session_state["_auto_restore_checked"] = True
-    restored, restore_msg = restore_from_backup_if_empty()
-    st.session_state["_auto_restore_msg"] = restore_msg
-    st.session_state["_auto_restore_ok"] = restored
+    # Producción: no restaurar a ciegas. Sheets puede contener FULL antiguos o de prueba.
+    # El rescate ahora se hace desde el módulo "Rescate Sheets", donde el usuario revisa
+    # candidatos y elige explícitamente cuál restaurar.
+    st.session_state["_auto_restore_msg"] = "Restauración automática desactivada. Usa Rescate Sheets para elegir el FULL a restaurar."
+    st.session_state["_auto_restore_ok"] = False
 
 st.markdown("""
 <style>
@@ -4576,7 +4946,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Reservas Kame", "Supervisor", "Etiquetas"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Reservas Kame", "Rescate Sheets", "Supervisor", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -4618,22 +4988,7 @@ with st.sidebar:
             st.success(st.session_state.get("_auto_restore_msg"))
         else:
             st.caption(f"Restauración: {st.session_state.get('_auto_restore_msg')}")
-    if st.button("Sincronizar desde Sheets"):
-        # Si SQLite ya tiene lotes, no hacemos una restauración completa que pueda duplicar movimientos.
-        # Traemos solo lotes faltantes desde Sheets. Esto permite recuperar el último lote real
-        # aunque haya quedado un lote de práctica cerrado en la base local.
-        has_local = local_lotes_count() > 0
-        ok_restore, msg_restore = restore_from_backup_if_empty(
-            allow_existing=has_local,
-            only_missing=has_local,
-        )
-        st.session_state["_auto_restore_ok"] = ok_restore
-        st.session_state["_auto_restore_msg"] = msg_restore
-        if ok_restore:
-            st.success(msg_restore)
-            st.rerun()
-        else:
-            st.error(msg_restore)
+    st.caption("Para recuperar un FULL desde Sheets, entra al módulo Rescate Sheets y elige el lote manualmente.")
     if st.button("Probar respaldo Sheets"):
         ok_test, detail_test = test_backup_webhook()
         if ok_test:
@@ -5120,6 +5475,9 @@ elif page == "Reservas Kame":
         st.warning("No hay lote activo.")
     else:
         render_reservas_kame_module(active_lote)
+
+elif page == "Rescate Sheets":
+    render_rescate_sheets()
 
 elif page == "Supervisor":
     st.subheader("Panel supervisor")
