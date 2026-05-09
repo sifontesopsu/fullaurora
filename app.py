@@ -430,6 +430,15 @@ def init_db():
         ensure_column(c, "scans", "picking_list_id", "INTEGER")
         ensure_column(c, "scans", "picking_code", "TEXT")
         ensure_column(c, "scans", "picker_asignado", "TEXT")
+        # Snapshot del producto al momento del scan.
+        # Esto es crítico para restaurar desde Sheets cuando el item_id histórico no
+        # coincide con el id local reconstruido, o cuando el snapshot del lote llegó incompleto.
+        ensure_column(c, "scans", "original_item_id", "INTEGER")
+        ensure_column(c, "scans", "codigo_ml", "TEXT")
+        ensure_column(c, "scans", "codigo_universal", "TEXT")
+        ensure_column(c, "scans", "sku", "TEXT")
+        ensure_column(c, "scans", "descripcion", "TEXT")
+        ensure_column(c, "scans", "restore_match_status", "TEXT")
 
         # Confirmaciones externas de avisos operacionales: ML y Kame se pueden marcar después de crear el aviso.
         ensure_column(c, "avisos_operacionales", "confirmado_ml_at", "TEXT")
@@ -800,14 +809,25 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
             except Exception:
                 continue
             movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
-            scan_rows.append((
-                lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")),
-                qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
-                clean_text(ev.get("operador_validador", "")) or "SIN_USUARIO",
-                to_int(ev.get("picking_list_id", 0)) or None,
-                clean_text(ev.get("picking_code", "")),
-                clean_text(ev.get("picker_asignado", "")),
-            ))
+            scan_rows.append({
+                "lote_id": lote_id,
+                "original_item_id": item_id,
+                "item_id": item_id,
+                "scan_primario": norm_code(ev.get("scan_primario", "")),
+                "scan_secundario": norm_code(ev.get("scan_secundario", "")),
+                "cantidad": qty,
+                "modo": clean_text(ev.get("modo", "")),
+                "created_at": clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+                "operador_validador": clean_text(ev.get("operador_validador", "")) or "SIN_USUARIO",
+                "picking_list_id": to_int(ev.get("picking_list_id", 0)) or None,
+                "picking_code": clean_text(ev.get("picking_code", "")),
+                "picker_asignado": clean_text(ev.get("picker_asignado", "")),
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion", "")),
+                "restore_match_status": "PENDING",
+            })
         elif et == "scan_deshacer":
             try:
                 item_id = int(ev.get("item_id"))
@@ -1022,6 +1042,67 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     restored_avisos = 0
     restored_picking = 0
 
+    # Reconciliación segura de scans.
+    # Regla: nunca buscar en otros FULL. Solo se resuelve contra items del lote seleccionado.
+    # Si no hay match seguro, el scan igual se conserva con snapshot propio para auditoría/visor,
+    # pero no se fuerza una asociación falsa a un producto.
+    def _build_item_lookups(items_map):
+        lookups = {"id": {}, "codigo_ml": {}, "codigo_universal": {}, "sku": {}}
+        for _iid, _it in (items_map or {}).items():
+            try:
+                lookups["id"][int(_iid)] = int(_iid)
+            except Exception:
+                pass
+            for _field in ["codigo_ml", "codigo_universal", "sku"]:
+                _code = norm_code(_it.get(_field, ""))
+                if _code:
+                    lookups[_field].setdefault(_code, set()).add(int(_iid))
+        return lookups
+
+    item_lookups_by_lote = {int(lid): _build_item_lookups(items_by_lote.get(lid, {})) for lid in active_lote_ids}
+    movement_by_item = {}
+    resolved_scan_rows = []
+    unmatched_scan_count = 0
+    ambiguous_scan_count = 0
+    for sr in scan_rows:
+        try:
+            lid = int(sr.get("lote_id"))
+        except Exception:
+            continue
+        if lid not in active_lote_ids:
+            continue
+        lookups = item_lookups_by_lote.get(lid, {})
+        original_item_id = to_int(sr.get("original_item_id", 0))
+        resolved_id = None
+        status = "NO_MATCH_SNAPSHOT"
+        if original_item_id and original_item_id in lookups.get("id", {}):
+            resolved_id = original_item_id
+            status = "MATCH_ITEM_ID"
+        else:
+            candidates = []
+            for field in ["codigo_ml", "codigo_universal", "sku"]:
+                code = norm_code(sr.get(field, ""))
+                if code:
+                    ids = lookups.get(field, {}).get(code, set())
+                    if len(ids) == 1:
+                        candidates.append(next(iter(ids)))
+            unique_candidates = sorted(set(candidates))
+            if len(unique_candidates) == 1:
+                resolved_id = int(unique_candidates[0])
+                status = "MATCH_CODE_SAME_LOTE"
+            elif len(unique_candidates) > 1:
+                ambiguous_scan_count += 1
+                status = "AMBIGUOUS_SAME_LOTE"
+        if resolved_id is None:
+            # Conservamos el id histórico para traza, pero el visor usará el snapshot guardado en scans.
+            resolved_id = original_item_id or 0
+            unmatched_scan_count += 1
+        else:
+            movement_by_item[resolved_id] = movement_by_item.get(resolved_id, 0) + int(sr.get("cantidad") or 0)
+        sr["item_id"] = resolved_id
+        sr["restore_match_status"] = status
+        resolved_scan_rows.append(sr)
+
     with db() as c:
         if replace_existing:
             for lid in sorted(active_lote_ids):
@@ -1067,17 +1148,27 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item.get("instrucciones", ""), item["dia"], item["hora"], item["created_at"], item["updated_at"]),
                 )
                 restored_items += 1
-        for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at, operador_validador, picking_list_id, picking_code, picker_asignado in scan_rows:
+        for sr in resolved_scan_rows:
+            lote_id = int(sr.get("lote_id") or 0)
+            cantidad = int(sr.get("cantidad") or 0)
             if lote_id in active_lote_ids and cantidad > 0:
                 c.execute(
                     """
                     INSERT INTO scans
                     (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
-                     operador_validador, picking_list_id, picking_code, picker_asignado)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     operador_validador, picking_list_id, picking_code, picker_asignado,
+                     original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
-                     operador_validador, picking_list_id, picking_code, picker_asignado),
+                    (
+                        lote_id, int(sr.get("item_id") or 0), norm_code(sr.get("scan_primario", "")), norm_code(sr.get("scan_secundario", "")),
+                        cantidad, clean_text(sr.get("modo", "")), clean_text(sr.get("created_at", "")),
+                        clean_text(sr.get("operador_validador", "")) or "SIN_USUARIO",
+                        sr.get("picking_list_id"), clean_text(sr.get("picking_code", "")), clean_text(sr.get("picker_asignado", "")),
+                        to_int(sr.get("original_item_id", 0)) or None,
+                        norm_code(sr.get("codigo_ml", "")), norm_code(sr.get("codigo_universal", "")), norm_code(sr.get("sku", "")),
+                        clean_text(sr.get("descripcion", "")), clean_text(sr.get("restore_match_status", "")),
+                    ),
                 )
                 restored_scans += 1
         for inc in incidencias_rows:
@@ -1205,7 +1296,10 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 restored_picking += 1
         c.commit()
 
-    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking."
+    extra = ""
+    if unmatched_scan_count or ambiguous_scan_count:
+        extra = f" Atención: {unmatched_scan_count} scan(s) quedaron sin match contra snapshot y {ambiguous_scan_count} ambiguo(s). Se conservan con datos propios del evento para trazabilidad."
+    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking.{extra}"
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
     """Envía eventos pendientes a Google Sheets.
@@ -1382,6 +1476,34 @@ def get_last_scans(lote_id):
         """, c, params=(lote_id,))
 
 
+def get_scanned_total(lote_id: int) -> int:
+    """Total acopiado real según tabla scans.
+
+    En rescates desde Sheets, puede haber scans cuyo item_id histórico no calza con
+    el snapshot local. Por eso el total operativo se calcula desde scans, no solo
+    desde items.acopiadas.
+    """
+    with db() as c:
+        row = c.execute("SELECT COALESCE(SUM(cantidad),0) AS n FROM scans WHERE lote_id=?", (int(lote_id),)).fetchone()
+    try:
+        return max(0, int(row["n"] or 0)) if row else 0
+    except Exception:
+        return 0
+
+
+def get_unmatched_scan_count(lote_id: int) -> int:
+    with db() as c:
+        row = c.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM scans
+            WHERE lote_id=? AND COALESCE(restore_match_status,'') IN ('NO_MATCH_SNAPSHOT','AMBIGUOUS_SAME_LOTE')
+            """,
+            (int(lote_id),),
+        ).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
 def create_lote(nombre, archivo, hoja, df):
     now = now_cl().isoformat(timespec="seconds")
     with db() as c:
@@ -1524,14 +1646,21 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         c.execute("""
             INSERT INTO scans
             (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
-             operador_validador, picking_list_id, picking_code, picker_asignado)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             operador_validador, picking_list_id, picking_code, picker_asignado,
+             original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now,
             clean_text(operador_validador) or "SIN_USUARIO",
             int(pick_id),
             clean_text(picking_meta.get("codigo_lista", "")),
             clean_text(picking_meta.get("asignado_a", "")),
+            int(item_id),
+            norm_code(item["codigo_ml"]),
+            norm_code(item["codigo_universal"]),
+            norm_code(item["sku"]),
+            clean_text(item["descripcion"]),
+            "LIVE_MATCH",
         ))
         c.commit()
 
@@ -2501,10 +2630,15 @@ def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
     with db() as c:
         return pd.read_sql_query(
             """
-            SELECT s.created_at, i.descripcion, i.codigo_ml, i.sku, s.cantidad, s.modo,
-                   s.operador_validador, s.picking_code, s.picker_asignado
+            SELECT s.created_at,
+                   COALESCE(i.descripcion, s.descripcion) AS descripcion,
+                   COALESCE(i.codigo_ml, s.codigo_ml) AS codigo_ml,
+                   COALESCE(i.sku, s.sku) AS sku,
+                   s.cantidad, s.modo,
+                   s.operador_validador, s.picking_code, s.picker_asignado,
+                   COALESCE(s.restore_match_status,'') AS estado_rescate
             FROM scans s
-            LEFT JOIN items i ON i.id=s.item_id
+            LEFT JOIN items i ON i.id=s.item_id AND i.lote_id=s.lote_id
             WHERE s.lote_id=?
             ORDER BY s.id DESC
             LIMIT ?
@@ -3216,14 +3350,16 @@ def supervisor_metrics(lote_id: int) -> dict:
     if items.empty:
         return {"total": 0, "done": 0, "pending": 0, "incidencias_abiertas": 0, "avisos_activos": 0, "label_pending": 0}
     view = items.copy()
-    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+    total_units = int(view["unidades"].sum())
+    done_units = min(total_units, get_scanned_total(lote_id))
+    pending_units = max(total_units - done_units, 0)
     labels = label_control_view(lote_id)
     incid = get_incidencias(lote_id, status="ABIERTA")
     avisos = get_avisos_operacionales(lote_id, estado="ACTIVO")
     return {
-        "total": int(view["unidades"].sum()),
-        "done": int(view["acopiadas"].sum()),
-        "pending": int(view["pendiente"].sum()),
+        "total": total_units,
+        "done": done_units,
+        "pending": pending_units,
         "incidencias_abiertas": int(len(incid)),
         "avisos_activos": int(len(avisos)),
         "label_pending": int(labels["label_pending"].sum()) if not labels.empty else 0,
@@ -4113,21 +4249,12 @@ def load_pack_components(path: Path = PACKS_PATH) -> dict:
 
 
 def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Expande packs y genera preview + agrupado final para reserva Kame.
-
-    Regla de seguridad: la reserva Kame usa SOLO el snapshot del lote FULL
-    reconstruido en la tabla items. No se usan listas de picking como fuente,
-    porque picking representa asignación/validación operativa y puede duplicar
-    cantidades si se mezcla con el lote.
-    """
+    """Expande packs y genera preview + agrupado final para reserva Kame."""
     items = get_items(lote_id)
     alerts = []
     if items.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame([{"tipo": "ERROR", "detalle": "El lote no tiene productos."}])
 
-    # Garantía de fidelidad: no mezclar con picking_list_items.
-    # Si el lote se ve incompleto, se debe corregir desde Rescate Sheets,
-    # no completar la reserva desde listas de picking.
     pack_map = load_pack_components(PACKS_PATH)
     rows = []
     for it in items.itertuples(index=False):
@@ -4300,7 +4427,7 @@ def register_reserva_kame(lote_id: int, folio: str, folio_auto: str, ficha: str,
 
 def render_reservas_kame_module(active_lote: int):
     st.subheader("Reservas Kame")
-    st.caption("Genera el archivo masivo para reservar en Kame usando SOLO el lote FULL reconstruido. No toma listas de picking para evitar duplicar cantidades. Si un SKU es pack, se expande al ART. SKU unitario usando data/packs.xlsx.")
+    st.caption("Genera el archivo masivo para reservar en Kame los productos del lote FULL. Si un SKU es pack, se expande al ART. SKU unitario usando data/packs.xlsx.")
     if not active_lote:
         st.warning("No hay lote activo.")
         return
@@ -4327,8 +4454,6 @@ def render_reservas_kame_module(active_lote: int):
     m3.metric("SKU reserva", int(grouped["sku_reserva"].nunique()) if not grouped.empty else 0)
     m4.metric("Packs expandidos", packs_count)
 
-    st.info("Fuente de reserva Kame: snapshot del lote FULL local/restaurado. No se usan listas de picking como respaldo, porque eso puede duplicar unidades.")
-
     with st.expander("Parámetros del archivo Kame", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -4354,9 +4479,8 @@ def render_reservas_kame_module(active_lote: int):
             st.warning("Hay avisos en la expansión de packs. Revisa antes de importar en Kame.")
         st.dataframe(alerts, use_container_width=True, hide_index=True, height=180)
 
-    tab_prev, tab_final = st.tabs(["Expansión packs desde lote", "CSV final Kame"])
+    tab_prev, tab_final = st.tabs(["Expansión packs", "CSV final Kame"])
     with tab_prev:
-        st.caption("DIRECTO = SKU del lote se reserva tal cual. PACK_EXPANDIDO = SKU del lote cruzó con PACK SKU de data/packs.xlsx y se transformó a ART. SKU.")
         if expanded.empty:
             st.warning("Sin líneas para mostrar.")
         else:
@@ -5473,6 +5597,7 @@ elif page == "Escaneo":
                 "operador_validador": "Operador",
                 "picking_code": "Lista picking",
                 "picker_asignado": "Picker",
+                "estado_rescate": "Estado rescate",
             })
             st.dataframe(recientes, use_container_width=True, hide_index=True, height=260)
 
