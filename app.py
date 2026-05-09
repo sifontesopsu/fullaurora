@@ -693,6 +693,11 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     picking_rows = {}
     picking_status_updates = {}
     lote_status_updates = {}
+    # Fallback crítico: en algunos respaldos antiguos o fallidos puede faltar el evento
+    # lote_creado, pero sí existen los lote_item con lote_nombre/archivo/hoja en raw_json.
+    # Sheets es la fuente real, así que no podemos ignorar un lote solo porque falte
+    # el encabezado lote_creado. Lo reconstruimos desde sus items.
+    lote_fallbacks = {}
 
     for ev in normalized_events:
         et = clean_text(ev.get("event_type", ""))
@@ -737,6 +742,18 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
                 "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
             }
+            if lote_id not in lotes:
+                lote_fallbacks.setdefault(lote_id, {
+                    "id": lote_id,
+                    "nombre": clean_text(ev.get("lote_nombre", "")) or f"Lote {lote_id}",
+                    "archivo": clean_text(ev.get("archivo", "")),
+                    "hoja": clean_text(ev.get("hoja", "")),
+                    "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "status": clean_text(ev.get("status", "ACTIVO")) or "ACTIVO",
+                    "closed_at": clean_text(ev.get("closed_at", "")),
+                    "closed_by": clean_text(ev.get("closed_by", "")),
+                    "close_note": clean_text(ev.get("close_note", "")),
+                })
         elif et == "lote_snapshot_chunk":
             items = ev.get("items") or []
             for item_ev in items:
@@ -763,6 +780,18 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
                     "updated_at": clean_text(item_ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
                 }
+            if lote_id not in lotes and items_by_lote.get(lote_id):
+                lote_fallbacks.setdefault(lote_id, {
+                    "id": lote_id,
+                    "nombre": clean_text(ev.get("lote_nombre", "")) or f"Lote {lote_id}",
+                    "archivo": clean_text(ev.get("archivo", "")),
+                    "hoja": clean_text(ev.get("hoja", "")),
+                    "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "status": clean_text(ev.get("status", "ACTIVO")) or "ACTIVO",
+                    "closed_at": clean_text(ev.get("closed_at", "")),
+                    "closed_by": clean_text(ev.get("closed_by", "")),
+                    "close_note": clean_text(ev.get("close_note", "")),
+                })
         elif et == "scan_agregado":
             try:
                 item_id = int(ev.get("item_id"))
@@ -960,12 +989,19 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
         elif et == "lote_eliminado":
             deleted_lotes.add(lote_id)
 
+    # Si existen items de un lote pero falta lote_creado, recuperamos el lote igual.
+    # Esto soluciona respaldos donde el snapshot de productos llegó a Sheets, pero
+    # el evento encabezado no quedó registrado o no fue exportado.
+    for lid, lote_info in lote_fallbacks.items():
+        if lid not in lotes and items_by_lote.get(lid):
+            lotes[lid] = lote_info
+
     active_lote_ids = [lid for lid in lotes if lid not in deleted_lotes and items_by_lote.get(lid)]
     if only_missing:
         active_lote_ids = [lid for lid in active_lote_ids if lid not in existing_local_ids]
     if not active_lote_ids:
         if only_missing:
-            return False, "No encontré lotes nuevos en Sheets para sincronizar."
+            return False, "No encontré lotes nuevos en Sheets para sincronizar. Si el lote existe en eventos pero no aparece, revisa que tenga lote_item o lote_snapshot_chunk."
         return False, "No encontré lotes activos con snapshot completo en Sheets. Crea el lote una vez con esta nueva versión para activar restauración automática."
 
     now = now_cl().isoformat(timespec="seconds")
