@@ -682,19 +682,6 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
 
     normalized_events.sort(key=event_order_key)
 
-    # Modo seguro de rescate: cuando el usuario elige un lote, toda la reconstrucción
-    # trabaja SOLO con eventos de ese lote_id. Esto evita mezclar scans, auditoría o
-    # productos de otros FULL históricos aunque compartan Código ML/SKU.
-    if only_lote_id is not None:
-        try:
-            selected_lote_id_safe = int(only_lote_id)
-            normalized_events = [
-                ev for ev in normalized_events
-                if clean_text(ev.get("lote_id", "")) and int(float(clean_text(ev.get("lote_id", "")))) == selected_lote_id_safe
-            ]
-        except Exception:
-            normalized_events = []
-
     lotes = {}
     items_by_lote = {}
     deleted_lotes = set()
@@ -812,8 +799,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 qty = int(ev.get("cantidad") or 0)
             except Exception:
                 continue
-            movement_key = (int(lote_id), int(item_id))
-            movement_by_item[movement_key] = movement_by_item.get(movement_key, 0) + qty
+            movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
             scan_rows.append((
                 lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")),
                 qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
@@ -828,8 +814,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 qty = int(ev.get("cantidad") or 0)
             except Exception:
                 continue
-            movement_key = (int(lote_id), int(item_id))
-            movement_by_item[movement_key] = movement_by_item.get(movement_key, 0) - qty
+            movement_by_item[item_id] = movement_by_item.get(item_id, 0) - qty
         elif et == "incidencia_creada" or et == "INCIDENCIA_ABIERTA":
             try:
                 item_id_raw = ev.get("item_id", "")
@@ -1069,7 +1054,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
             )
             restored_lotes += 1
             for item in items_by_lote[lid].values():
-                qty = max(0, min(int(item["unidades"]), int(movement_by_item.get((int(lid), int(item["id"])), 0))))
+                qty = max(0, min(int(item["unidades"]), int(movement_by_item.get(int(item["id"]), 0))))
                 item["acopiadas"] = qty
                 item["updated_at"] = now if qty else item["updated_at"]
                 c.execute(
@@ -1220,356 +1205,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 restored_picking += 1
         c.commit()
 
-    # Segunda pasada en modo seguro lote-cerrado:
-    # repara referencias antiguas usando códigos, pero solo dentro del lote seleccionado/restaurado.
-    repair_stats = reconcile_restored_lotes_from_sheet_events(active_lote_ids, normalized_events)
-
-    msg_parts = [
-        f"Restauración completa: {restored_lotes} lote(s)",
-        f"{restored_items} producto(s)",
-        f"{repair_stats.get('scans', restored_scans)} escaneo(s)",
-        f"{restored_incidencias} incidencia(s)",
-        f"{restored_reimpresiones} reimpresión(es)",
-        f"{restored_avisos} aviso(s) operacional(es)",
-        f"{repair_stats.get('picking', restored_picking)} lista(s) picking",
-        f"{repair_stats.get('audit', 0)} auditoría(s)",
-    ]
-    if repair_stats.get("unmatched_scans", 0) or repair_stats.get("unmatched_picking", 0) or repair_stats.get("ambiguous_refs", 0):
-        msg_parts.append(
-            f"Alertas: {repair_stats.get('unmatched_scans', 0)} scan(s) sin asociar, "
-            f"{repair_stats.get('unmatched_picking', 0)} picking item(s) sin asociar, "
-            f"{repair_stats.get('ambiguous_refs', 0)} referencia(s) ambigua(s)."
-        )
-    return True, "; ".join(msg_parts) + "."
-
-
-def reconcile_restored_lotes_from_sheet_events(lote_ids, events):
-    """Reconstruye movimientos operativos usando referencias lote-cerradas.
-
-    Seguridad aplicada:
-    - procesa solo eventos cuyo lote_id está en lote_ids;
-    - resuelve Código ML / Código Universal / SKU solo dentro de ese mismo lote;
-    - si una referencia coincide con más de un producto dentro del lote, no asigna automático.
-    """
-    target_ids = {int(x) for x in (lote_ids or []) if clean_text(x)}
-    if not target_ids:
-        return {"scans": 0, "audit": 0, "picking": 0, "picking_items": 0, "unmatched_scans": 0, "unmatched_picking": 0, "ambiguous_refs": 0, "reconstructed_from_picking": 0}
-
-    def safe_int(v):
-        try:
-            s = clean_text(v)
-            if not s:
-                return None
-            return int(float(s))
-        except Exception:
-            return None
-
-    def add_ref(map_obj, key, iid):
-        key = norm_code(key)
-        if key:
-            map_obj.setdefault(key, set()).add(int(iid))
-
-    with db() as c:
-        def build_product_maps():
-            maps_out = {}
-            for lid in sorted(target_ids):
-                rows = c.execute("SELECT * FROM items WHERE lote_id=?", (lid,)).fetchall()
-                by_id, by_ml, by_univ, by_sku = {}, {}, {}, {}
-                for r in rows:
-                    d = dict(r)
-                    iid = int(d["id"])
-                    by_id[iid] = d
-                    add_ref(by_ml, d.get("codigo_ml", ""), iid)
-                    add_ref(by_univ, d.get("codigo_universal", ""), iid)
-                    add_ref(by_sku, d.get("sku", ""), iid)
-                maps_out[lid] = {"by_id": by_id, "by_ml": by_ml, "by_univ": by_univ, "by_sku": by_sku}
-            return maps_out
-
-        product_maps = build_product_maps()
-        ambiguous_refs = 0
-
-        def unique_lookup(ref_map, key):
-            nonlocal ambiguous_refs
-            key = norm_code(key)
-            if not key or key not in ref_map:
-                return None
-            ids = sorted(ref_map.get(key) or [])
-            if len(ids) == 1:
-                return int(ids[0])
-            # Duplicado dentro del mismo lote: no se asigna a ciegas.
-            ambiguous_refs += 1
-            return None
-
-        def payload_exists_as_product(lid, payload):
-            maps = product_maps.get(int(lid), {})
-            raw_id = safe_int(payload.get("item_id", "")) if isinstance(payload, dict) else None
-            if raw_id is not None and raw_id in maps.get("by_id", {}):
-                return True
-            if not isinstance(payload, dict):
-                return False
-            for map_name, field in (("by_ml", "codigo_ml"), ("by_univ", "codigo_universal"), ("by_sku", "sku")):
-                ref_map = maps.get(map_name, {})
-                key = norm_code(payload.get(field, ""))
-                if key and key in ref_map and len(ref_map.get(key) or []) == 1:
-                    return True
-            return False
-
-        # Respaldo secundario: si faltó algún lote_item, reconstruimos solo desde
-        # picking_lista_creada del MISMO lote seleccionado.
-        reconstructed_from_picking = 0
-        for ev in events or []:
-            lid = safe_int(ev.get("lote_id", ""))
-            if lid not in target_ids:
-                continue
-            if clean_text(ev.get("event_type", "")) not in {"picking_lista_creada", "PICKING_LISTA_CREADA"}:
-                continue
-            for pit in ev.get("items") or []:
-                if not isinstance(pit, dict):
-                    continue
-                if payload_exists_as_product(lid, pit):
-                    continue
-                now_item = now_cl().isoformat(timespec="seconds")
-                c.execute(
-                    """
-                    INSERT INTO items
-                    (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
-                     identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', '', '', '', ?, ?)
-                    """,
-                    (
-                        int(lid),
-                        clean_text(pit.get("area", "")),
-                        clean_text(pit.get("nro", "")),
-                        norm_code(pit.get("codigo_ml", "")),
-                        norm_code(pit.get("codigo_universal", "")),
-                        norm_code(pit.get("sku", "")),
-                        clean_text(pit.get("descripcion", "")),
-                        max(0, to_int(pit.get("cantidad", pit.get("unidades", 0)))),
-                        clean_text(pit.get("identificacion", "")),
-                        now_item,
-                        now_item,
-                    ),
-                )
-                reconstructed_from_picking += 1
-                product_maps = build_product_maps()
-
-        product_maps = build_product_maps()
-
-        def resolve_item_id(lid, payload):
-            maps = product_maps.get(int(lid), {})
-            raw_id = safe_int(payload.get("item_id", "")) if isinstance(payload, dict) else None
-            if raw_id is not None and raw_id in maps.get("by_id", {}):
-                return int(raw_id)
-            if not isinstance(payload, dict):
-                return None
-            # Prioridad dentro del MISMO lote. Nunca busca en otros FULL.
-            for map_name, field in (("by_ml", "codigo_ml"), ("by_univ", "codigo_universal"), ("by_sku", "sku")):
-                iid = unique_lookup(maps.get(map_name, {}), payload.get(field, ""))
-                if iid:
-                    return int(iid)
-            return None
-
-        # Limpiar y reconstruir solo tablas derivadas del lote objetivo.
-        for lid in sorted(target_ids):
-            c.execute("DELETE FROM scans WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM audit_events WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM picking_list_items WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM picking_lists WHERE lote_id=?", (lid,))
-            c.execute("UPDATE items SET acopiadas=0 WHERE lote_id=?", (lid,))
-
-        picking_defs = {}
-        picking_updates = {}
-        picking_id_map = {}
-        scans_to_insert = []
-        audit_to_insert = []
-        movement = {}
-        unmatched_scans = 0
-        unmatched_picking = 0
-
-        def event_lote_id(ev):
-            return safe_int(ev.get("lote_id", ""))
-
-        for ev in events or []:
-            lid = event_lote_id(ev)
-            if lid not in target_ids:
-                continue
-            et = clean_text(ev.get("event_type", ""))
-            et_low = et.lower()
-            if et in {"picking_lista_creada", "PICKING_LISTA_CREADA"}:
-                old_id = safe_int(ev.get("picking_list_id", ""))
-                code = clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")) or (str(old_id) if old_id else "")
-                key = old_id or code
-                if key:
-                    picking_defs[key] = {
-                        "old_id": old_id,
-                        "lote_id": int(lid),
-                        "codigo_lista": code,
-                        "asignado_a": clean_text(ev.get("asignado_a", "")) or "SIN_ASIGNAR",
-                        "estado": clean_text(ev.get("estado", "CREADA")) or "CREADA",
-                        "created_by": clean_text(ev.get("created_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
-                        "comentario": clean_text(ev.get("comentario", "")),
-                        "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
-                        "items": ev.get("items") or [],
-                    }
-            elif et in {"picking_lista_impresa", "PICKING_LISTA_IMPRESA", "picking_lista_completada", "PICKING_LISTA_COMPLETADA", "picking_lista_anulada", "PICKING_LISTA_ANULADA"}:
-                old_id = safe_int(ev.get("picking_list_id", ""))
-                code = clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")) or (str(old_id) if old_id else "")
-                key = old_id or code
-                if key:
-                    upd = picking_updates.setdefault(key, {})
-                    ts = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds")
-                    if "impresa" in et_low:
-                        upd["estado"] = "IMPRESA"; upd["printed_at"] = ts
-                    elif "completada" in et_low:
-                        upd["estado"] = "COMPLETADA"; upd["completed_at"] = ts
-                    elif "anulada" in et_low:
-                        upd["estado"] = "ANULADA"; upd["anulada_at"] = ts; upd["anulada_by"] = clean_text(ev.get("usuario", "")) or "SIN_USUARIO"; upd["anulada_motivo"] = clean_text(ev.get("comentario", ""))
-
-        restored_picking_lists = 0
-        restored_picking_items = 0
-        for key, plist in picking_defs.items():
-            upd = picking_updates.get(key, {})
-            estado = clean_text(upd.get("estado", plist.get("estado", "CREADA"))) or "CREADA"
-            row_values = (
-                plist["lote_id"], plist["codigo_lista"], plist["asignado_a"], estado,
-                plist["created_by"], plist["comentario"], plist["created_at"],
-                clean_text(upd.get("printed_at", "")), clean_text(upd.get("completed_at", "")),
-                clean_text(upd.get("anulada_at", "")), clean_text(upd.get("anulada_by", "")), clean_text(upd.get("anulada_motivo", "")),
-            )
-            local_list_id = None
-            old_id = plist.get("old_id")
-            if old_id:
-                try:
-                    c.execute(
-                        """
-                        INSERT INTO picking_lists
-                        (id, lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at,
-                         printed_at, completed_at, anulada_at, anulada_by, anulada_motivo)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (int(old_id), *row_values),
-                    )
-                    local_list_id = int(old_id)
-                except sqlite3.IntegrityError:
-                    local_list_id = None
-            if local_list_id is None:
-                cur = c.execute(
-                    """
-                    INSERT INTO picking_lists
-                    (lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at,
-                     printed_at, completed_at, anulada_at, anulada_by, anulada_motivo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    row_values,
-                )
-                local_list_id = int(cur.lastrowid)
-            picking_id_map[key] = local_list_id
-            if old_id:
-                picking_id_map[int(old_id)] = local_list_id
-            if plist.get("codigo_lista"):
-                picking_id_map[plist["codigo_lista"]] = local_list_id
-            restored_picking_lists += 1
-
-            for pit in plist.get("items") or []:
-                if not isinstance(pit, dict):
-                    continue
-                local_item_id = resolve_item_id(plist["lote_id"], pit)
-                if not local_item_id:
-                    unmatched_picking += 1
-                    continue
-                c.execute(
-                    """
-                    INSERT INTO picking_list_items
-                    (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
-                     cantidad, area, nro, estado, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
-                    """,
-                    (local_list_id, plist["lote_id"], int(local_item_id), norm_code(pit.get("codigo_ml", "")), norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion", "")), to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")), plist["created_at"]),
-                )
-                restored_picking_items += 1
-
-        for ev in events or []:
-            lid = event_lote_id(ev)
-            if lid not in target_ids:
-                continue
-            et = clean_text(ev.get("event_type", ""))
-            if et == "scan_agregado":
-                local_item_id = resolve_item_id(lid, ev)
-                qty = to_int(ev.get("cantidad", 0))
-                if not local_item_id or qty <= 0:
-                    unmatched_scans += 1
-                    continue
-                old_pick = safe_int(ev.get("picking_list_id", ""))
-                pick_code = clean_text(ev.get("picking_code", ""))
-                local_pick = picking_id_map.get(old_pick) or picking_id_map.get(pick_code) or old_pick
-                scans_to_insert.append((
-                    int(lid), int(local_item_id), norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")),
-                    qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
-                    clean_text(ev.get("operador_validador", "")) or "SIN_USUARIO",
-                    local_pick,
-                    pick_code,
-                    clean_text(ev.get("picker_asignado", "")),
-                ))
-                movement[(int(lid), int(local_item_id))] = movement.get((int(lid), int(local_item_id)), 0) + qty
-            elif et == "scan_deshacer":
-                local_item_id = resolve_item_id(lid, ev)
-                qty = to_int(ev.get("cantidad", 0))
-                if local_item_id and qty > 0:
-                    movement[(int(lid), int(local_item_id))] = movement.get((int(lid), int(local_item_id)), 0) - qty
-            elif et == "audit_event":
-                local_item_id = resolve_item_id(lid, ev)
-                qty_raw = ev.get("cantidad", "")
-                qty_val = None if clean_text(qty_raw) == "" else to_int(qty_raw)
-                audit_to_insert.append((
-                    int(lid),
-                    int(local_item_id) if local_item_id else None,
-                    clean_text(ev.get("event_type_audit", "")) or clean_text(ev.get("tipo", "")) or "AUDIT_EVENT",
-                    clean_text(ev.get("detalle", "")) or clean_text(ev.get("comentario", "")) or clean_text(ev.get("descripcion", "")),
-                    qty_val,
-                    norm_code(ev.get("codigo_ml", "")),
-                    norm_code(ev.get("sku", "")),
-                    clean_text(ev.get("modo", "")),
-                    clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
-                ))
-
-        for row in scans_to_insert:
-            c.execute(
-                """
-                INSERT INTO scans
-                (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
-                 operador_validador, picking_list_id, picking_code, picker_asignado)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                row,
-            )
-        for (lid, iid), qty in movement.items():
-            product = product_maps.get(lid, {}).get("by_id", {}).get(iid)
-            if not product:
-                continue
-            unidades = to_int(product.get("unidades", 0))
-            safe_qty = max(0, min(int(unidades), int(qty)))
-            c.execute("UPDATE items SET acopiadas=?, updated_at=? WHERE lote_id=? AND id=?", (safe_qty, now_cl().isoformat(timespec="seconds"), int(lid), int(iid)))
-        for row in audit_to_insert:
-            c.execute(
-                """
-                INSERT INTO audit_events
-                (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                row,
-            )
-        c.commit()
-
-    return {
-        "scans": len(scans_to_insert),
-        "audit": len(audit_to_insert),
-        "picking": restored_picking_lists,
-        "picking_items": restored_picking_items,
-        "unmatched_scans": unmatched_scans,
-        "unmatched_picking": unmatched_picking,
-        "ambiguous_refs": ambiguous_refs,
-        "reconstructed_from_picking": reconstructed_from_picking,
-    }
+    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking."
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
     """Envía eventos pendientes a Google Sheets.
@@ -4476,12 +4112,103 @@ def load_pack_components(path: Path = PACKS_PATH) -> dict:
     return pack_map
 
 
+def get_kame_reserva_source_items(lote_id: int) -> pd.DataFrame:
+    """Fuente robusta para Reserva Kame.
+
+    La reserva debe salir del lote FULL completo, no de la vista de productos
+    sin asignar. En rescates desde Sheets puede pasar que algunos productos
+    existan en picking_list_items aunque no hayan quedado reconstruidos en
+    items; en ese caso se agregan como respaldo, SIN duplicar item_id.
+    """
+    base = get_items(lote_id)
+    if base is None or base.empty:
+        base = pd.DataFrame()
+    else:
+        base = base.copy()
+        base["fuente_reserva"] = "LOTE_FULL"
+
+    base_ids = set()
+    if not base.empty and "id" in base.columns:
+        for v in base["id"].tolist():
+            try:
+                base_ids.add(int(v))
+            except Exception:
+                pass
+
+    with db() as c:
+        fallback = pd.read_sql_query(
+            """
+            SELECT
+                pli.item_id AS id,
+                pli.lote_id,
+                pli.area,
+                pli.nro,
+                pli.codigo_ml,
+                pli.codigo_universal,
+                pli.sku,
+                pli.descripcion,
+                SUM(pli.cantidad) AS unidades,
+                0 AS acopiadas,
+                COALESCE(i.identificacion, '') AS identificacion,
+                COALESCE(i.vence, '') AS vence,
+                COALESCE(i.instrucciones, '') AS instrucciones,
+                COALESCE(i.dia, '') AS dia,
+                COALESCE(i.hora, '') AS hora,
+                MIN(pli.created_at) AS created_at,
+                MAX(pli.created_at) AS updated_at
+            FROM picking_list_items pli
+            JOIN picking_lists pl ON pl.id = pli.picking_list_id
+            LEFT JOIN items i ON i.id = pli.item_id AND i.lote_id = pli.lote_id
+            WHERE pli.lote_id=? AND COALESCE(pl.estado,'') <> 'ANULADA'
+            GROUP BY pli.item_id, pli.lote_id, pli.area, pli.nro, pli.codigo_ml, pli.codigo_universal, pli.sku, pli.descripcion,
+                     i.identificacion, i.vence, i.instrucciones, i.dia, i.hora
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+
+    if fallback.empty:
+        return base
+
+    missing_rows = []
+    for _, r in fallback.iterrows():
+        try:
+            rid = int(r.get("id", 0))
+        except Exception:
+            rid = 0
+        if rid and rid in base_ids:
+            continue
+        row = r.to_dict()
+        row["fuente_reserva"] = "PICKING_FALLBACK"
+        missing_rows.append(row)
+
+    if not missing_rows:
+        return base
+
+    fallback_missing = pd.DataFrame(missing_rows)
+    if base.empty:
+        return fallback_missing
+
+    # Alinear columnas para concatenar sin perder datos.
+    for col in base.columns:
+        if col not in fallback_missing.columns:
+            fallback_missing[col] = ""
+    for col in fallback_missing.columns:
+        if col not in base.columns:
+            base[col] = ""
+    return pd.concat([base, fallback_missing[base.columns]], ignore_index=True)
+
+
 def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Expande packs y genera preview + agrupado final para reserva Kame."""
-    items = get_items(lote_id)
+    items = get_kame_reserva_source_items(lote_id)
     alerts = []
     if items.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame([{"tipo": "ERROR", "detalle": "El lote no tiene productos."}])
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame([{"tipo": "ERROR", "detalle": "El lote no tiene productos para reserva Kame."}])
+
+    fallback_count = int((items.get("fuente_reserva", pd.Series(dtype=str)).astype(str) == "PICKING_FALLBACK").sum()) if "fuente_reserva" in items.columns else 0
+    if fallback_count:
+        alerts.append({"tipo": "AVISO", "detalle": f"Se incorporaron {fallback_count} línea(s) desde listas de picking porque no estaban en la tabla local de items. Esto evita perder productos ya asignados al picker."})
 
     pack_map = load_pack_components(PACKS_PATH)
     rows = []
@@ -4491,6 +4218,7 @@ def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, p
         desc_full = clean_text(getattr(it, "descripcion", ""))
         codigo_ml = norm_code(getattr(it, "codigo_ml", ""))
         item_id = int(getattr(it, "id", 0) or 0)
+        fuente_reserva = clean_text(getattr(it, "fuente_reserva", "LOTE_FULL")) or "LOTE_FULL"
 
         if not sku_full:
             alerts.append({"tipo": "ERROR", "detalle": f"Item {item_id} no tiene SKU. No se puede reservar en Kame."})
@@ -4513,6 +4241,7 @@ def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, p
                     alerts.append({"tipo": "AVISO", "detalle": f"Cantidad decimal: pack {sku_full} → {art_sku} = {format_kame_qty(cantidad_reserva)}."})
                 rows.append({
                     "item_id": item_id,
+                    "fuente_reserva": fuente_reserva,
                     "codigo_ml": codigo_ml,
                     "sku_full": sku_full,
                     "descripcion_full": desc_full,
@@ -4529,6 +4258,7 @@ def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, p
         else:
             rows.append({
                 "item_id": item_id,
+                "fuente_reserva": fuente_reserva,
                 "codigo_ml": codigo_ml,
                 "sku_full": sku_full,
                 "descripcion_full": desc_full,
@@ -4558,68 +4288,6 @@ def build_kame_reserva_data(lote_id: int) -> tuple[pd.DataFrame, pd.DataFrame, p
     grouped["cantidad_kame"] = grouped["cantidad_reserva"].map(format_kame_qty)
     alerts_df = pd.DataFrame(alerts, columns=["tipo", "detalle"]) if alerts else pd.DataFrame(columns=["tipo", "detalle"])
     return expanded, grouped, alerts_df
-
-
-def build_pack_cross_diagnostics(lote_id: int, expanded: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Diagnóstico de cruce entre el lote FULL y data/packs.xlsx.
-
-    Regla segura: solo se expande cuando SKU del FULL coincide con PACK SKU.
-    Si el SKU aparece como ART. SKU, significa que probablemente ya viene como
-    SKU unitario/componente y por eso NO debe multiplicarse nuevamente.
-    """
-    items = get_items(lote_id)
-    if items.empty:
-        return pd.DataFrame()
-
-    pack_map = load_pack_components(PACKS_PATH)
-    pack_skus = set(pack_map.keys())
-    art_to_packs = {}
-    for pack_sku, comps in pack_map.items():
-        for comp in comps:
-            art_sku = norm_code(comp.get("art_sku", ""))
-            if art_sku:
-                art_to_packs.setdefault(art_sku, []).append(pack_sku)
-
-    expanded_pack_skus = set()
-    if expanded is not None and not expanded.empty and "tipo_origen" in expanded.columns:
-        try:
-            expanded_pack_skus = set(expanded.loc[expanded["tipo_origen"].astype(str).eq("PACK_EXPANDIDO"), "sku_full"].map(norm_code))
-        except Exception:
-            expanded_pack_skus = set()
-
-    rows = []
-    for it in items.itertuples(index=False):
-        sku_full = norm_code(getattr(it, "sku", ""))
-        desc = clean_text(getattr(it, "descripcion", ""))
-        codigo_ml = norm_code(getattr(it, "codigo_ml", ""))
-        unidades = to_float_qty(getattr(it, "unidades", 0))
-        matches_pack = sku_full in pack_skus
-        matches_art = sku_full in art_to_packs
-        desc_pack_like = bool(re.search(r"\b(PACK|SET|PAQUETE|PQT)\b", desc.upper()))
-
-        if matches_pack:
-            estado = "SE EXPANDE POR PACK SKU"
-            packs_relacionados = sku_full
-        elif matches_art:
-            estado = "SKU YA ES COMPONENTE / UNITARIO"
-            packs_relacionados = ", ".join(art_to_packs.get(sku_full, [])[:5])
-        elif desc_pack_like:
-            estado = "DESCRIPCIÓN PARECE PACK, PERO SKU NO ESTÁ EN PACK SKU"
-            packs_relacionados = ""
-        else:
-            estado = "DIRECTO SIN CRUCE PACK"
-            packs_relacionados = ""
-
-        rows.append({
-            "codigo_ml": codigo_ml,
-            "sku_full": sku_full,
-            "descripcion_full": desc,
-            "unidades_full": format_kame_qty(unidades),
-            "estado_cruce": estado,
-            "pack_sku_relacionado": packs_relacionados,
-            "se_expande": "SI" if sku_full in expanded_pack_skus else "NO",
-        })
-    return pd.DataFrame(rows)
 
 
 def build_kame_reserva_csv(grouped: pd.DataFrame, folio: str, ficha: str, fecha_doc, glosa: str, bodega_salida: str, unidad_negocio: str, folio_auto: str = "S") -> bytes:
@@ -4734,33 +4402,19 @@ def render_reservas_kame_module(active_lote: int):
         return
 
     has_errors = (not alerts.empty and alerts["tipo"].astype(str).str.upper().eq("ERROR").any())
-    total_full = int(get_items(active_lote)["unidades"].sum()) if not get_items(active_lote).empty else 0
+    source_items = get_kame_reserva_source_items(active_lote)
+    total_full = int(source_items["unidades"].map(to_float_qty).sum()) if not source_items.empty and "unidades" in source_items.columns else 0
     total_reserva = float(grouped["cantidad_reserva"].sum()) if not grouped.empty else 0.0
     packs_count = int((expanded["tipo_origen"] == "PACK_EXPANDIDO").sum()) if not expanded.empty else 0
-    pack_diag = build_pack_cross_diagnostics(active_lote, expanded)
-    full_en_pack_sku = int(pack_diag["estado_cruce"].eq("SE EXPANDE POR PACK SKU").sum()) if not pack_diag.empty else 0
-    full_en_art_sku = int(pack_diag["estado_cruce"].eq("SKU YA ES COMPONENTE / UNITARIO").sum()) if not pack_diag.empty else 0
-    pack_sospechosos = int(pack_diag["estado_cruce"].eq("DESCRIPCIÓN PARECE PACK, PERO SKU NO ESTÁ EN PACK SKU").sum()) if not pack_diag.empty else 0
+    fallback_count = int((expanded.get("fuente_reserva", pd.Series(dtype=str)).astype(str) == "PICKING_FALLBACK").sum()) if not expanded.empty and "fuente_reserva" in expanded.columns else 0
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Lote", clean_text(lote.get("nombre", ""))[:24])
     m2.metric("Unidades FULL", total_full)
     m3.metric("SKU reserva", int(grouped["sku_reserva"].nunique()) if not grouped.empty else 0)
     m4.metric("Packs expandidos", packs_count)
-
-    if packs_count == 0:
-        st.warning(
-            "No se expandió ningún pack porque ningún SKU del FULL coincide con la columna PACK SKU de data/packs.xlsx. "
-            "Esto puede estar bien si el FULL ya viene con SKU unitario, pero si esperabas packs, revisa el tab Diagnóstico packs. "
-            "La app no convierte por texto para no reservar mal."
-        )
-    elif full_en_pack_sku > 0:
-        st.success(f"Se detectaron {full_en_pack_sku} SKU FULL como PACK SKU y se expandieron a sus componentes.")
-
-    d1, d2, d3 = st.columns(3)
-    d1.metric("FULL coincide con PACK SKU", full_en_pack_sku)
-    d2.metric("FULL ya aparece como ART. SKU", full_en_art_sku)
-    d3.metric("Posibles packs sin cruce", pack_sospechosos)
+    if fallback_count:
+        st.warning(f"La reserva incluye {fallback_count} línea(s) recuperadas desde listas de picking. Esto ocurre en lotes rescatados desde Sheets cuando algunos productos asignados no estaban reconstruidos en la tabla local del lote.")
 
     with st.expander("Parámetros del archivo Kame", expanded=True):
         c1, c2, c3 = st.columns(3)
@@ -4787,16 +4441,37 @@ def render_reservas_kame_module(active_lote: int):
             st.warning("Hay avisos en la expansión de packs. Revisa antes de importar en Kame.")
         st.dataframe(alerts, use_container_width=True, hide_index=True, height=180)
 
-    tab_prev, tab_final, tab_diag = st.tabs(["Expansión packs", "CSV final Kame", "Diagnóstico packs"])
+    tab_prev, tab_packs, tab_final = st.tabs(["Expansión completa", "Solo packs", "CSV final Kame"])
     with tab_prev:
         if expanded.empty:
             st.warning("Sin líneas para mostrar.")
         else:
-            show_expanded = expanded[["codigo_ml", "sku_full", "descripcion_full", "unidades_full", "tipo_origen", "sku_reserva", "descripcion_reserva", "factor_pack", "cantidad_reserva"]].copy()
-            show_expanded["unidades_full"] = show_expanded["unidades_full"].map(format_kame_qty)
-            show_expanded["factor_pack"] = show_expanded["factor_pack"].map(format_kame_qty)
-            show_expanded["cantidad_reserva"] = show_expanded["cantidad_reserva"].map(format_kame_qty)
+            cols_prev = [c for c in ["fuente_reserva", "codigo_ml", "sku_full", "descripcion_full", "unidades_full", "tipo_origen", "sku_reserva", "descripcion_reserva", "factor_pack", "cantidad_reserva"] if c in expanded.columns]
+            show_expanded = expanded[cols_prev].copy()
+            show_expanded["orden_tipo"] = show_expanded.get("tipo_origen", "").map(lambda x: 0 if x == "PACK_EXPANDIDO" else 1) if "tipo_origen" in show_expanded.columns else 1
+            show_expanded = show_expanded.sort_values(["orden_tipo", "sku_full"], kind="mergesort").drop(columns=["orden_tipo"], errors="ignore")
+            if "unidades_full" in show_expanded.columns:
+                show_expanded["unidades_full"] = show_expanded["unidades_full"].map(format_kame_qty)
+            if "factor_pack" in show_expanded.columns:
+                show_expanded["factor_pack"] = show_expanded["factor_pack"].map(format_kame_qty)
+            if "cantidad_reserva" in show_expanded.columns:
+                show_expanded["cantidad_reserva"] = show_expanded["cantidad_reserva"].map(format_kame_qty)
             st.dataframe(show_expanded, use_container_width=True, hide_index=True, height=360)
+            st.caption("La reserva usa el lote completo. Si aparece PICKING_FALLBACK, esa línea fue recuperada desde una lista de picking porque no estaba reconstruida en items locales.")
+    with tab_packs:
+        if expanded.empty or "tipo_origen" not in expanded.columns:
+            st.warning("Sin líneas para mostrar.")
+        else:
+            pack_rows = expanded[expanded["tipo_origen"].astype(str).eq("PACK_EXPANDIDO")].copy()
+            if pack_rows.empty:
+                st.warning("No hay packs expandidos. Si visualmente ves productos con palabra PACK, entonces su SKU no está cruzando con PACK SKU en data/packs.xlsx; la app no convierte por texto para no reservar mal.")
+            else:
+                cols_pack = [c for c in ["fuente_reserva", "codigo_ml", "sku_full", "descripcion_full", "unidades_full", "sku_reserva", "descripcion_reserva", "factor_pack", "cantidad_reserva"] if c in pack_rows.columns]
+                pack_rows = pack_rows[cols_pack].copy()
+                for col in ["unidades_full", "factor_pack", "cantidad_reserva"]:
+                    if col in pack_rows.columns:
+                        pack_rows[col] = pack_rows[col].map(format_kame_qty)
+                st.dataframe(pack_rows, use_container_width=True, hide_index=True, height=360)
     with tab_final:
         if grouped.empty:
             st.warning("Sin líneas finales para CSV.")
@@ -4804,38 +4479,6 @@ def render_reservas_kame_module(active_lote: int):
             show_grouped = grouped[["sku_reserva", "descripcion_reserva", "cantidad_kame", "lineas_origen", "packs_expandidos"]].copy()
             st.dataframe(show_grouped, use_container_width=True, hide_index=True, height=360)
             st.caption(f"Total reserva Kame: {format_kame_qty(total_reserva)} unidades finales después de expandir packs y agrupar SKU.")
-
-    with tab_diag:
-        st.caption(
-            "Este diagnóstico explica por qué un producto se convierte o no. "
-            "La conversión solo ocurre cuando el SKU del FULL está en la columna PACK SKU del archivo data/packs.xlsx."
-        )
-        if pack_diag.empty:
-            st.warning("Sin datos para diagnosticar.")
-        else:
-            filtro_diag = st.selectbox(
-                "Filtrar diagnóstico",
-                ["Todos", "Solo PACK SKU", "Solo ART. SKU / unitarios", "Posibles packs sin cruce"],
-                key=f"kame_pack_diag_filter_{active_lote}",
-            )
-            show_diag = pack_diag.copy()
-            if filtro_diag == "Solo PACK SKU":
-                show_diag = show_diag[show_diag["estado_cruce"].eq("SE EXPANDE POR PACK SKU")]
-            elif filtro_diag == "Solo ART. SKU / unitarios":
-                show_diag = show_diag[show_diag["estado_cruce"].eq("SKU YA ES COMPONENTE / UNITARIO")]
-            elif filtro_diag == "Posibles packs sin cruce":
-                show_diag = show_diag[show_diag["estado_cruce"].eq("DESCRIPCIÓN PARECE PACK, PERO SKU NO ESTÁ EN PACK SKU")]
-            st.dataframe(show_diag, use_container_width=True, hide_index=True, height=360)
-            if packs_count == 0 and full_en_art_sku > 0:
-                st.info(
-                    "Veo SKU del FULL que aparecen como ART. SKU en packs.xlsx. Eso normalmente significa que el lote ya trae SKU unitario/componente, "
-                    "por eso no se multiplica. Si esos productos realmente son packs vendidos, falta que el FULL traiga el PACK SKU o falta una matriz publicación ML → PACK SKU."
-                )
-            if pack_sospechosos > 0:
-                st.warning(
-                    "Hay descripciones que parecen pack/set, pero su SKU no existe como PACK SKU en data/packs.xlsx. "
-                    "La app las deja DIRECTO para evitar una reserva inventada."
-                )
 
     archivo_nombre = f"reserva_kame_lote_{int(active_lote):03d}_folio_{clean_text(folio) or 'SIN_FOLIO'}.csv"
     can_download = bool(clean_text(folio) and clean_text(ficha) and not grouped.empty and not has_errors)
