@@ -643,6 +643,30 @@ def local_lote_ids() -> set[int]:
     return {int(r["id"]) for r in rows}
 
 
+
+def sheet_event_unique_key(ev: dict) -> tuple:
+    """Llave estable para no perder eventos después de reboot.
+
+    Antes se deduplicaba solo por queue_id; eso es frágil porque SQLite puede
+    reiniciar su contador después de un reboot. Esta llave evita descartar un
+    picking/scan real por chocar con un queue_id viejo.
+    """
+    ev = ev or {}
+    return (
+        clean_text(ev.get("event_type", "")),
+        clean_text(ev.get("queue_id", "")),
+        clean_text(ev.get("queued_at", "")),
+        clean_text(ev.get("created_at", "")),
+        clean_text(ev.get("received_at", "")),
+        clean_text(ev.get("lote_id", "")),
+        clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+        clean_text(ev.get("picking_list_id", "")),
+        clean_text(ev.get("item_id", "")),
+        norm_code(ev.get("codigo_ml", "")),
+        norm_code(ev.get("codigo_universal", "")),
+        norm_code(ev.get("sku", "")),
+    )
+
 def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: bool = False, only_lote_id: int | None = None, replace_existing: bool = False):
     """Restaura/sincroniza base local desde Sheets.
 
@@ -674,14 +698,13 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
         return base
 
     normalized_events = []
-    seen_queue_ids = set()
+    seen_event_keys = set()
     for raw_ev in events:
         ev = normalize_event(raw_ev)
-        qid = clean_text(ev.get("queue_id", ""))
-        if qid:
-            if qid in seen_queue_ids:
-                continue
-            seen_queue_ids.add(qid)
+        event_key = sheet_event_unique_key(ev)
+        if event_key in seen_event_keys:
+            continue
+        seen_event_keys.add(event_key)
         normalized_events.append(ev)
 
     def event_order_key(ev):
@@ -3539,93 +3562,88 @@ def get_picking_items(picking_list_id: int) -> pd.DataFrame:
 
 
 def get_picking_assigned_qty(lote_id: int) -> pd.DataFrame:
-    """Cantidad asignada por producto del lote.
-
-    Regla crítica:
-    - La asignación de picking se calcula por lote seleccionado.
-    - Primero intenta item_id.
-    - Si el item_id histórico no calza por rescate desde Sheets, cruza por Código ML,
-      Código Universal o SKU, pero SOLO dentro del mismo lote.
-    - Las listas ANULADAS no bloquean disponibilidad, porque anulan asignación, no producto.
-    """
-    items = get_items(int(lote_id))
-    if items.empty:
-        return pd.DataFrame(columns=["item_id", "asignado"])
-
-    current_ids = set(items["id"].astype(int).tolist())
-    lookups = {"codigo_ml": {}, "codigo_universal": {}, "sku": {}}
-    for r in items.itertuples(index=False):
-        iid = int(getattr(r, "id"))
-        for field in ["codigo_ml", "codigo_universal", "sku"]:
-            code = norm_code(getattr(r, field, ""))
-            if code and code != "N/A":
-                lookups[field].setdefault(code, set()).add(iid)
-
     with db() as c:
-        pli = pd.read_sql_query(
+        df = pd.read_sql_query(
             """
-            SELECT
-                pli.item_id, pli.codigo_ml, pli.codigo_universal, pli.sku, pli.cantidad,
-                pl.codigo_lista, pl.estado
+            SELECT pli.item_id, SUM(pli.cantidad) AS asignado
             FROM picking_list_items pli
-            JOIN picking_lists pl ON pl.id = pli.picking_list_id
-            WHERE pli.lote_id=? AND COALESCE(pl.estado,'') <> 'ANULADA'
+            JOIN picking_lists pl ON pl.id=pli.picking_list_id
+            WHERE pli.lote_id=? AND pl.estado <> 'ANULADA'
+            GROUP BY pli.item_id
             """,
             c,
             params=(int(lote_id),),
         )
-
-    if pli.empty:
+    if df.empty:
         return pd.DataFrame(columns=["item_id", "asignado"])
+    df["asignado"] = df["asignado"].fillna(0).astype(int)
+    return df
 
-    assigned = {}
-    for r in pli.itertuples(index=False):
-        try:
-            hist_id = int(getattr(r, "item_id") or 0)
-        except Exception:
-            hist_id = 0
-        resolved = None
-        if hist_id in current_ids:
-            resolved = hist_id
-        else:
-            candidates = []
-            for field in ["codigo_ml", "codigo_universal", "sku"]:
-                code = norm_code(getattr(r, field, ""))
-                if code and code != "N/A":
-                    ids = lookups.get(field, {}).get(code, set())
-                    if len(ids) == 1:
-                        candidates.append(next(iter(ids)))
-            uniq = sorted(set(candidates))
-            if len(uniq) == 1:
-                resolved = int(uniq[0])
-        if resolved is not None:
-            assigned[resolved] = assigned.get(resolved, 0) + to_int(getattr(r, "cantidad", 0))
-
-    return pd.DataFrame([{"item_id": k, "asignado": v} for k, v in assigned.items()]) if assigned else pd.DataFrame(columns=["item_id", "asignado"])
 
 def get_picking_available_items(lote_id: int) -> pd.DataFrame:
     """Productos disponibles para listas de picking.
 
-    Regla operacional: un producto/SKU se asigna completo a una sola lista activa.
-    No se permite dividir cantidades del mismo producto entre listas, porque eso
-    desordena el papel y la trazabilidad. Si ya tiene cualquier cantidad asignada
-    en una lista no anulada, queda bloqueado para nuevas listas.
+    Regla operacional: producto en lista CREADA/IMPRESA/COMPLETADA queda asignado;
+    producto en lista ANULADA vuelve a estar disponible.
+
+    Blindaje: no dependemos solo de item_id, porque al rescatar desde Sheets puede
+    cambiar o quedar histórico. La asignación se cruza por item_id y, dentro del
+    mismo lote, por Código ML / Código Universal / SKU.
     """
     items = get_items(lote_id)
     if items.empty:
         return items
-    assigned = get_picking_assigned_qty(lote_id)
-    view = items.merge(assigned, left_on="id", right_on="item_id", how="left")
-    view["asignado"] = view["asignado"].fillna(0).astype(int)
+    with db() as c:
+        assigned_rows = pd.read_sql_query(
+            """
+            SELECT pli.id AS pli_id, pli.item_id, pli.codigo_ml, pli.codigo_universal, pli.sku,
+                   pli.cantidad, pl.estado, pl.codigo_lista
+            FROM picking_list_items pli
+            JOIN picking_lists pl ON pl.id=pli.picking_list_id
+            WHERE pli.lote_id=? AND COALESCE(pl.estado,'CREADA') <> 'ANULADA'
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    view = items.copy()
+    assigned_map = {}
+    assigned_codes_map = {}
+    if not assigned_rows.empty:
+        assigned_rows["cantidad"] = assigned_rows["cantidad"].fillna(0).astype(int)
+        # Para cada item del lote, sumar filas únicas de picking que hagan match.
+        for item in view.itertuples(index=False):
+            matched_ids = set()
+            item_id = int(getattr(item, "id"))
+            ml = norm_code(getattr(item, "codigo_ml", ""))
+            ean = norm_code(getattr(item, "codigo_universal", ""))
+            sku = norm_code(getattr(item, "sku", ""))
+            for pr in assigned_rows.itertuples(index=False):
+                ok = False
+                try:
+                    ok = ok or int(getattr(pr, "item_id") or 0) == item_id
+                except Exception:
+                    pass
+                ok = ok or (ml and norm_code(getattr(pr, "codigo_ml", "")) == ml)
+                ok = ok or (ean and ean != "N/A" and norm_code(getattr(pr, "codigo_universal", "")) == ean)
+                ok = ok or (sku and norm_code(getattr(pr, "sku", "")) == sku)
+                if ok:
+                    matched_ids.add(int(getattr(pr, "pli_id")))
+            if matched_ids:
+                rows = assigned_rows[assigned_rows["pli_id"].isin(matched_ids)]
+                assigned_map[item_id] = int(rows["cantidad"].sum())
+                assigned_codes_map[item_id] = ", ".join(sorted(set(rows["codigo_lista"].astype(str))))
+    view["asignado"] = view["id"].map(lambda x: int(assigned_map.get(int(x), 0))).astype(int)
+    view["listas_asignadas"] = view["id"].map(lambda x: assigned_codes_map.get(int(x), ""))
     view["ya_asignado"] = view["asignado"].astype(int) > 0
     view["disponible_asignar"] = view.apply(
         lambda r: int(r["unidades"]) if not bool(r["ya_asignado"]) else 0,
         axis=1,
     )
-    view["estado_asignacion"] = view["ya_asignado"].map(lambda x: "YA ASIGNADO" if x else "DISPONIBLE")
+    view["estado_asignacion"] = view.apply(
+        lambda r: f"YA ASIGNADO ({r['listas_asignadas']})" if bool(r["ya_asignado"]) and clean_text(r.get("listas_asignadas", "")) else ("YA ASIGNADO" if bool(r["ya_asignado"]) else "DISPONIBLE"),
+        axis=1,
+    )
     return view
-
-
 
 def apply_picking_operational_sort(df: pd.DataFrame, units_desc: bool = True) -> pd.DataFrame:
     """Orden operacional para armar listas de picking.
@@ -3693,81 +3711,35 @@ def get_picking_validation_summary(picking_list_id: int) -> pd.DataFrame:
     return items
 
 
-def _resolve_current_item_codes(lote_id: int, item_id: int) -> dict:
-    with db() as c:
-        row = c.execute("SELECT * FROM items WHERE lote_id=? AND id=?", (int(lote_id), int(item_id))).fetchone()
-    return dict(row) if row else {}
-
-
 def item_in_picking_list(picking_list_id, item_id) -> bool:
     if not picking_list_id:
         return True
-    meta = get_picking_list_meta(int(picking_list_id))
-    if not meta:
-        return False
-    lote_id = int(meta.get("lote_id") or 0)
-    item = _resolve_current_item_codes(lote_id, int(item_id))
     with db() as c:
         row = c.execute(
             "SELECT COUNT(*) AS n FROM picking_list_items WHERE picking_list_id=? AND item_id=?",
             (int(picking_list_id), int(item_id)),
         ).fetchone()
-        if int(row["n"] or 0) > 0:
-            return True
-        if item:
-            clauses = []
-            params = [int(picking_list_id)]
-            for field in ["codigo_ml", "codigo_universal", "sku"]:
-                code = norm_code(item.get(field, ""))
-                if code and code != "N/A":
-                    clauses.append(f"UPPER(COALESCE({field},''))=?")
-                    params.append(code)
-            if clauses:
-                row = c.execute(
-                    f"SELECT COUNT(*) AS n FROM picking_list_items WHERE picking_list_id=? AND ({' OR '.join(clauses)})",
-                    params,
-                ).fetchone()
-                return int(row["n"] or 0) > 0
-    return False
+    return int(row["n"] or 0) > 0 if row else False
 
 
 def picking_pending_for_item(picking_list_id, item_id) -> dict:
     if not picking_list_id:
         return {"cantidad": None, "validado_pda": 0, "pendiente": None}
-    meta = get_picking_list_meta(int(picking_list_id))
-    if not meta:
-        return {"cantidad": 0, "validado_pda": 0, "pendiente": 0}
-    lote_id = int(meta.get("lote_id") or 0)
-    item = _resolve_current_item_codes(lote_id, int(item_id))
-
     with db() as c:
-        rows = c.execute(
-            "SELECT item_id, cantidad FROM picking_list_items WHERE picking_list_id=? AND item_id=?",
+        item = c.execute(
+            "SELECT cantidad FROM picking_list_items WHERE picking_list_id=? AND item_id=?",
             (int(picking_list_id), int(item_id)),
-        ).fetchall()
-        if not rows and item:
-            clauses = []
-            params = [int(picking_list_id)]
-            for field in ["codigo_ml", "codigo_universal", "sku"]:
-                code = norm_code(item.get(field, ""))
-                if code and code != "N/A":
-                    clauses.append(f"UPPER(COALESCE({field},''))=?")
-                    params.append(code)
-            if clauses:
-                rows = c.execute(
-                    f"SELECT item_id, cantidad FROM picking_list_items WHERE picking_list_id=? AND ({' OR '.join(clauses)})",
-                    params,
-                ).fetchall()
-        if not rows:
+        ).fetchone()
+        if not item:
             return {"cantidad": 0, "validado_pda": 0, "pendiente": 0}
-
-        cantidad = sum(to_int(r["cantidad"]) for r in rows)
         val = c.execute(
             "SELECT COALESCE(SUM(cantidad),0) AS n FROM scans WHERE picking_list_id=? AND item_id=?",
             (int(picking_list_id), int(item_id)),
         ).fetchone()
+    cantidad = int(item["cantidad"] or 0)
     validado = int(val["n"] or 0) if val else 0
     return {"cantidad": cantidad, "validado_pda": validado, "pendiente": max(cantidad - validado, 0)}
+
 
 def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentario: str, selected_rows: list[dict]):
     asignado_a = clean_text(asignado_a)
@@ -3793,18 +3765,24 @@ def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentar
     if not rows_clean:
         return False, "Selecciona al menos un producto disponible."
 
-    # Validación defensiva contra datos desactualizados en pantalla: ningún item
+    # Validación defensiva contra datos desactualizados en pantalla: ningún producto
     # seleccionado puede estar ya asignado a otra lista activa/no anulada.
+    # Se valida por item_id y también por Código ML / Universal / SKU dentro del mismo lote.
     with db() as c:
         for item_id, _cantidad in rows_clean:
+            item_row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
+            ml = norm_code(item_row["codigo_ml"] if item_row else "")
+            ean = norm_code(item_row["codigo_universal"] if item_row else "")
+            sku = norm_code(item_row["sku"] if item_row else "")
             row = c.execute(
                 """
                 SELECT COALESCE(SUM(pli.cantidad),0) AS n
                 FROM picking_list_items pli
                 JOIN picking_lists pl ON pl.id=pli.picking_list_id
-                WHERE pli.lote_id=? AND pli.item_id=? AND pl.estado <> 'ANULADA'
+                WHERE pli.lote_id=? AND COALESCE(pl.estado,'CREADA') <> 'ANULADA'
+                  AND (pli.item_id=? OR COALESCE(pli.codigo_ml,'')=? OR COALESCE(pli.codigo_universal,'')=? OR COALESCE(pli.sku,'')=?)
                 """,
-                (int(lote_id), int(item_id)),
+                (int(lote_id), int(item_id), ml, ean, sku),
             ).fetchone()
             if int(row["n"] or 0) > 0:
                 return False, f"El producto item {item_id} ya fue asignado a otra lista activa."
@@ -3878,34 +3856,29 @@ def mark_picking_printed(picking_list_id: int, usuario: str = ""):
     meta = get_picking_list_meta(picking_list_id)
     if not meta:
         return
-
-    # Snapshot obligatorio de la lista al imprimir.
-    # Esto blinda el rescate desde Sheets: aunque por cualquier motivo faltara
-    # el evento picking_lista_creada, el evento de impresión conserva los items
-    # completos que realmente salieron en la hoja de picking.
-    items_df = get_picking_items(int(picking_list_id))
-    snapshot_items = []
-    if not items_df.empty:
-        for r in items_df.itertuples(index=False):
-            snapshot_items.append({
-                "item_id": int(getattr(r, "item_id", 0) or 0),
-                "codigo_ml": norm_code(getattr(r, "codigo_ml", "")),
-                "codigo_universal": norm_code(getattr(r, "codigo_universal", "")),
-                "sku": norm_code(getattr(r, "sku", "")),
-                "descripcion": clean_text(getattr(r, "descripcion", "")),
-                "cantidad": to_int(getattr(r, "cantidad", 0)),
-                "area": clean_text(getattr(r, "area", "")),
-                "nro": clean_text(getattr(r, "nro", "")),
-                "identificacion": clean_text(getattr(r, "identificacion", "")),
-            })
-
     with db() as c:
         c.execute(
             "UPDATE picking_lists SET estado=CASE WHEN estado='CREADA' THEN 'IMPRESA' ELSE estado END, printed_at=COALESCE(printed_at, ?) WHERE id=?",
             (now, int(picking_list_id)),
         )
         c.commit()
-    total_units = sum(to_int(x.get("cantidad", 0)) for x in snapshot_items)
+    # Snapshot completo de productos también en el evento de impresión.
+    # Si el evento de creación se pierde por un problema de deduplicación/cola,
+    # la lista igual se puede reconstruir desde Sheets.
+    items_df = get_picking_items(int(picking_list_id))
+    items_payload = []
+    if not items_df.empty:
+        for r in items_df.itertuples(index=False):
+            items_payload.append({
+                "item_id": int(r.item_id),
+                "codigo_ml": norm_code(r.codigo_ml),
+                "codigo_universal": norm_code(r.codigo_universal),
+                "sku": norm_code(r.sku),
+                "descripcion": clean_text(r.descripcion),
+                "cantidad": int(r.cantidad),
+                "area": clean_text(r.area),
+                "nro": clean_text(r.nro),
+            })
     enqueue_backup_event("picking_lista_impresa", {
         **build_lote_payload(int(meta["lote_id"])),
         "picking_list_id": int(picking_list_id),
@@ -3915,13 +3888,13 @@ def mark_picking_printed(picking_list_id: int, usuario: str = ""):
         "created_at": now,
         "usuario": usuario,
         "estado": "IMPRESA",
-        "productos": len(snapshot_items),
-        "cantidad": total_units,
-        "items": snapshot_items,
+        "productos": len(items_payload),
+        "cantidad": sum(int(x.get("cantidad", 0)) for x in items_payload),
+        "items": items_payload,
         "tipo": "PICKING",
         "modo": "PICKING",
     })
-    log_audit_event(int(meta["lote_id"]), event_type="PICKING_LISTA_IMPRESA", detail=clean_text(meta.get("codigo_lista", "")), qty=total_units, mode=usuario)
+    log_audit_event(int(meta["lote_id"]), event_type="PICKING_LISTA_IMPRESA", detail=clean_text(meta.get("codigo_lista", "")), mode=usuario)
 
 
 def complete_picking_list(picking_list_id: int, usuario: str, comentario: str = ""):
@@ -4687,14 +4660,13 @@ def get_sheet_events_normalized() -> tuple[bool, list[dict], str]:
     if not ok:
         return False, [], msg
     normalized = []
-    seen_queue_ids = set()
+    seen_event_keys = set()
     for raw_ev in events:
         ev = normalize_sheet_event(raw_ev)
-        qid = clean_text(ev.get("queue_id", ""))
-        if qid:
-            if qid in seen_queue_ids:
-                continue
-            seen_queue_ids.add(qid)
+        event_key = sheet_event_unique_key(ev)
+        if event_key in seen_event_keys:
+            continue
+        seen_event_keys.add(event_key)
         normalized.append(ev)
 
     def key(ev):
@@ -5235,13 +5207,6 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             if code not in anuladas:
                 picking_lists[code]["estado"] = "IMPRESA"
             picking_lists[code]["printed_at"] = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", ""))
-            # Desde esta versión, el evento de impresión también trae snapshot de items.
-            # Si el evento de creación no existiera en Sheets, igual se puede reconstruir
-            # la asignación que salió impresa.
-            if ev.get("items"):
-                picking_lists[code]["raw_items"] = ev.get("items") or picking_lists[code].get("raw_items", [])
-            if clean_text(ev.get("asignado_a", "")) and picking_lists[code].get("asignado_a") == "SIN_ASIGNAR":
-                picking_lists[code]["asignado_a"] = clean_text(ev.get("asignado_a", ""))
         elif et in {"picking_lista_completada", "PICKING_LISTA_COMPLETADA"}:
             picking_lists.setdefault(code, {"id": _stable_negative_id(f"PL:{target}:{code}", used_ids), "lote_id": target, "codigo_lista": code, "asignado_a": "SIN_ASIGNAR", "estado": "CREADA", "created_by": "SIN_USUARIO", "comentario": "", "created_at": clean_text(ev.get("created_at", "")), "printed_at": "", "completed_at": "", "anulada_at": "", "anulada_by": "", "anulada_motivo": "", "raw_items": []})
             if code not in anuladas:
@@ -5255,30 +5220,26 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             picking_lists[code]["anulada_by"] = clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
             picking_lists[code]["anulada_motivo"] = clean_text(ev.get("comentario", ""))
 
-    # 3) Agregar productos faltantes desde picking.
-    # Importante: una lista anulada NO elimina el producto del FULL; solo anula esa
-    # asignación. Por eso sus items sirven como evidencia del universo FULL, pero
-    # luego no bloquean disponibilidad porque get_picking_assigned_qty ignora ANULADA.
+    # 3) Agregar productos faltantes desde picking como evidencia del universo FULL.
+    # Anular una lista anula la asignación, NO elimina el producto del FULL. Por eso
+    # incluso una lista ANULADA puede alimentar el universo del lote y la reserva Kame,
+    # pero su asignación no debe bloquear productos disponibles para nuevas listas.
     picking_item_rows = []
     fallback_from_picking = 0
     fallback_from_cancelled_picking = 0
     for code, pl in picking_lists.items():
-        lista_anulada = clean_text(pl.get("estado", "")) == "ANULADA"
+        estado_pl = clean_text(pl.get("estado", "CREADA")) or "CREADA"
         for pit in pl.get("raw_items") or []:
             if not isinstance(pit, dict):
                 continue
             before_count = len(items_by_id)
-            note_estado = "ANULADA" if lista_anulada else "VIGENTE"
-            item_id = add_or_update_item(
-                {**pit, "unidades": pit.get("cantidad", 0), "created_at": pl.get("created_at", "")},
-                "PICKING_EVIDENCE",
-                f"producto evidenciado en lista {code}; estado_asignacion={note_estado}",
-            )
+            note = f"producto reconstruido desde lista {code}; estado_asignacion={estado_pl}"
+            item_id = add_or_update_item({**pit, "unidades": pit.get("cantidad", 0), "created_at": pl.get("created_at", "")}, "PICKING_EVIDENCE", note)
             if item_id is None:
                 continue
             if len(items_by_id) > before_count:
                 fallback_from_picking += 1
-                if lista_anulada:
+                if estado_pl == "ANULADA":
                     fallback_from_cancelled_picking += 1
             picking_item_rows.append({
                 "picking_list_id": int(pl["id"]),
@@ -5503,7 +5464,6 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
 
     integrity = {
         "fallback_from_picking": fallback_from_picking,
-        "fallback_from_cancelled_picking": fallback_from_cancelled_picking,
         "unmatched_scans": unmatched_scans,
         "ambiguous_scans": ambiguous_scans,
         "warnings": warnings,
@@ -5716,9 +5676,9 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
         f"{len(state.get('auditoria', []))} evento(s) auditoría."
     )
     if integ.get("fallback_from_picking"):
-        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde evidencia de picking porque no estaban en lote_item."
+        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde picking porque no estaban en lote_item."
     if integ.get("fallback_from_cancelled_picking"):
-        msg += f" De esos, {integ.get('fallback_from_cancelled_picking')} venían desde listas anuladas; alimentan el universo FULL, pero no cuentan como asignación activa."
+        msg += f" De esos, {integ.get('fallback_from_cancelled_picking')} venían de listas anuladas usadas solo como evidencia del FULL, no como asignación vigente."
     if integ.get("unmatched_scans") or integ.get("ambiguous_scans"):
         msg += f" Scans sin match inicial: {integ.get('unmatched_scans',0)}; ambiguos: {integ.get('ambiguous_scans',0)}."
     return True, msg
