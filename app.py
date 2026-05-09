@@ -643,30 +643,6 @@ def local_lote_ids() -> set[int]:
     return {int(r["id"]) for r in rows}
 
 
-
-def sheet_event_unique_key(ev: dict) -> tuple:
-    """Llave estable para no perder eventos después de reboot.
-
-    Antes se deduplicaba solo por queue_id; eso es frágil porque SQLite puede
-    reiniciar su contador después de un reboot. Esta llave evita descartar un
-    picking/scan real por chocar con un queue_id viejo.
-    """
-    ev = ev or {}
-    return (
-        clean_text(ev.get("event_type", "")),
-        clean_text(ev.get("queue_id", "")),
-        clean_text(ev.get("queued_at", "")),
-        clean_text(ev.get("created_at", "")),
-        clean_text(ev.get("received_at", "")),
-        clean_text(ev.get("lote_id", "")),
-        clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
-        clean_text(ev.get("picking_list_id", "")),
-        clean_text(ev.get("item_id", "")),
-        norm_code(ev.get("codigo_ml", "")),
-        norm_code(ev.get("codigo_universal", "")),
-        norm_code(ev.get("sku", "")),
-    )
-
 def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: bool = False, only_lote_id: int | None = None, replace_existing: bool = False):
     """Restaura/sincroniza base local desde Sheets.
 
@@ -698,13 +674,14 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
         return base
 
     normalized_events = []
-    seen_event_keys = set()
+    seen_queue_ids = set()
     for raw_ev in events:
         ev = normalize_event(raw_ev)
-        event_key = sheet_event_unique_key(ev)
-        if event_key in seen_event_keys:
-            continue
-        seen_event_keys.add(event_key)
+        qid = clean_text(ev.get("queue_id", ""))
+        if qid:
+            if qid in seen_queue_ids:
+                continue
+            seen_queue_ids.add(qid)
         normalized_events.append(ev)
 
     def event_order_key(ev):
@@ -3583,67 +3560,26 @@ def get_picking_assigned_qty(lote_id: int) -> pd.DataFrame:
 def get_picking_available_items(lote_id: int) -> pd.DataFrame:
     """Productos disponibles para listas de picking.
 
-    Regla operacional: producto en lista CREADA/IMPRESA/COMPLETADA queda asignado;
-    producto en lista ANULADA vuelve a estar disponible.
-
-    Blindaje: no dependemos solo de item_id, porque al rescatar desde Sheets puede
-    cambiar o quedar histórico. La asignación se cruza por item_id y, dentro del
-    mismo lote, por Código ML / Código Universal / SKU.
+    Regla operacional: un producto/SKU se asigna completo a una sola lista activa.
+    No se permite dividir cantidades del mismo producto entre listas, porque eso
+    desordena el papel y la trazabilidad. Si ya tiene cualquier cantidad asignada
+    en una lista no anulada, queda bloqueado para nuevas listas.
     """
     items = get_items(lote_id)
     if items.empty:
         return items
-    with db() as c:
-        assigned_rows = pd.read_sql_query(
-            """
-            SELECT pli.id AS pli_id, pli.item_id, pli.codigo_ml, pli.codigo_universal, pli.sku,
-                   pli.cantidad, pl.estado, pl.codigo_lista
-            FROM picking_list_items pli
-            JOIN picking_lists pl ON pl.id=pli.picking_list_id
-            WHERE pli.lote_id=? AND COALESCE(pl.estado,'CREADA') <> 'ANULADA'
-            """,
-            c,
-            params=(int(lote_id),),
-        )
-    view = items.copy()
-    assigned_map = {}
-    assigned_codes_map = {}
-    if not assigned_rows.empty:
-        assigned_rows["cantidad"] = assigned_rows["cantidad"].fillna(0).astype(int)
-        # Para cada item del lote, sumar filas únicas de picking que hagan match.
-        for item in view.itertuples(index=False):
-            matched_ids = set()
-            item_id = int(getattr(item, "id"))
-            ml = norm_code(getattr(item, "codigo_ml", ""))
-            ean = norm_code(getattr(item, "codigo_universal", ""))
-            sku = norm_code(getattr(item, "sku", ""))
-            for pr in assigned_rows.itertuples(index=False):
-                ok = False
-                try:
-                    ok = ok or int(getattr(pr, "item_id") or 0) == item_id
-                except Exception:
-                    pass
-                ok = ok or (ml and norm_code(getattr(pr, "codigo_ml", "")) == ml)
-                ok = ok or (ean and ean != "N/A" and norm_code(getattr(pr, "codigo_universal", "")) == ean)
-                ok = ok or (sku and norm_code(getattr(pr, "sku", "")) == sku)
-                if ok:
-                    matched_ids.add(int(getattr(pr, "pli_id")))
-            if matched_ids:
-                rows = assigned_rows[assigned_rows["pli_id"].isin(matched_ids)]
-                assigned_map[item_id] = int(rows["cantidad"].sum())
-                assigned_codes_map[item_id] = ", ".join(sorted(set(rows["codigo_lista"].astype(str))))
-    view["asignado"] = view["id"].map(lambda x: int(assigned_map.get(int(x), 0))).astype(int)
-    view["listas_asignadas"] = view["id"].map(lambda x: assigned_codes_map.get(int(x), ""))
+    assigned = get_picking_assigned_qty(lote_id)
+    view = items.merge(assigned, left_on="id", right_on="item_id", how="left")
+    view["asignado"] = view["asignado"].fillna(0).astype(int)
     view["ya_asignado"] = view["asignado"].astype(int) > 0
     view["disponible_asignar"] = view.apply(
         lambda r: int(r["unidades"]) if not bool(r["ya_asignado"]) else 0,
         axis=1,
     )
-    view["estado_asignacion"] = view.apply(
-        lambda r: f"YA ASIGNADO ({r['listas_asignadas']})" if bool(r["ya_asignado"]) and clean_text(r.get("listas_asignadas", "")) else ("YA ASIGNADO" if bool(r["ya_asignado"]) else "DISPONIBLE"),
-        axis=1,
-    )
+    view["estado_asignacion"] = view["ya_asignado"].map(lambda x: "YA ASIGNADO" if x else "DISPONIBLE")
     return view
+
+
 
 def apply_picking_operational_sort(df: pd.DataFrame, units_desc: bool = True) -> pd.DataFrame:
     """Orden operacional para armar listas de picking.
@@ -3765,24 +3701,18 @@ def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentar
     if not rows_clean:
         return False, "Selecciona al menos un producto disponible."
 
-    # Validación defensiva contra datos desactualizados en pantalla: ningún producto
+    # Validación defensiva contra datos desactualizados en pantalla: ningún item
     # seleccionado puede estar ya asignado a otra lista activa/no anulada.
-    # Se valida por item_id y también por Código ML / Universal / SKU dentro del mismo lote.
     with db() as c:
         for item_id, _cantidad in rows_clean:
-            item_row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
-            ml = norm_code(item_row["codigo_ml"] if item_row else "")
-            ean = norm_code(item_row["codigo_universal"] if item_row else "")
-            sku = norm_code(item_row["sku"] if item_row else "")
             row = c.execute(
                 """
                 SELECT COALESCE(SUM(pli.cantidad),0) AS n
                 FROM picking_list_items pli
                 JOIN picking_lists pl ON pl.id=pli.picking_list_id
-                WHERE pli.lote_id=? AND COALESCE(pl.estado,'CREADA') <> 'ANULADA'
-                  AND (pli.item_id=? OR COALESCE(pli.codigo_ml,'')=? OR COALESCE(pli.codigo_universal,'')=? OR COALESCE(pli.sku,'')=?)
+                WHERE pli.lote_id=? AND pli.item_id=? AND pl.estado <> 'ANULADA'
                 """,
-                (int(lote_id), int(item_id), ml, ean, sku),
+                (int(lote_id), int(item_id)),
             ).fetchone()
             if int(row["n"] or 0) > 0:
                 return False, f"El producto item {item_id} ya fue asignado a otra lista activa."
@@ -3862,22 +3792,23 @@ def mark_picking_printed(picking_list_id: int, usuario: str = ""):
             (now, int(picking_list_id)),
         )
         c.commit()
-    # Snapshot completo de productos también en el evento de impresión.
-    # Si el evento de creación se pierde por un problema de deduplicación/cola,
-    # la lista igual se puede reconstruir desde Sheets.
+    # La impresión también respalda snapshot completo de productos.
+    # Esto permite reconstruir la lista desde Sheets incluso si el evento
+    # picking_lista_creada no fue leído por un choque antiguo de queue_id.
     items_df = get_picking_items(int(picking_list_id))
     items_payload = []
-    if not items_df.empty:
+    if items_df is not None and not items_df.empty:
         for r in items_df.itertuples(index=False):
             items_payload.append({
-                "item_id": int(r.item_id),
-                "codigo_ml": norm_code(r.codigo_ml),
-                "codigo_universal": norm_code(r.codigo_universal),
-                "sku": norm_code(r.sku),
-                "descripcion": clean_text(r.descripcion),
-                "cantidad": int(r.cantidad),
-                "area": clean_text(r.area),
-                "nro": clean_text(r.nro),
+                "item_id": int(getattr(r, "item_id")),
+                "codigo_ml": norm_code(getattr(r, "codigo_ml", "")),
+                "codigo_universal": norm_code(getattr(r, "codigo_universal", "")),
+                "sku": norm_code(getattr(r, "sku", "")),
+                "descripcion": clean_text(getattr(r, "descripcion", "")),
+                "cantidad": int(getattr(r, "cantidad", 0) or 0),
+                "area": clean_text(getattr(r, "area", "")),
+                "nro": clean_text(getattr(r, "nro", "")),
+                "identificacion": clean_text(getattr(r, "identificacion", "")),
             })
     enqueue_backup_event("picking_lista_impresa", {
         **build_lote_payload(int(meta["lote_id"])),
@@ -3889,7 +3820,7 @@ def mark_picking_printed(picking_list_id: int, usuario: str = ""):
         "usuario": usuario,
         "estado": "IMPRESA",
         "productos": len(items_payload),
-        "cantidad": sum(int(x.get("cantidad", 0)) for x in items_payload),
+        "cantidad": sum(int(x.get("cantidad") or 0) for x in items_payload),
         "items": items_payload,
         "tipo": "PICKING",
         "modo": "PICKING",
@@ -4659,20 +4590,50 @@ def get_sheet_events_normalized() -> tuple[bool, list[dict], str]:
     ok, events, msg = get_backup_events_from_sheets()
     if not ok:
         return False, [], msg
+
+    def dedupe_key(ev: dict) -> tuple:
+        """Llave semántica de rescate.
+
+        No se usa solo queue_id porque Streamlit/SQLite puede reiniciarse y volver a
+        partir desde 1. Eso ya provocó pérdida o mezcla de eventos en rescates.
+        Esta llave deduplica el mismo evento leído desde hoja madre + hoja estructurada,
+        pero no elimina eventos distintos que compartan queue_id.
+        """
+        et = clean_text(ev.get("event_type", ""))
+        lid = clean_text(ev.get("lote_id", ""))
+        ts = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", ""))
+        item_id = clean_text(ev.get("item_id", ""))
+        code = clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", ""))
+        plid = clean_text(ev.get("picking_list_id", ""))
+        sku = norm_code(ev.get("sku", ""))
+        ml = norm_code(ev.get("codigo_ml", ""))
+        qty = clean_text(ev.get("cantidad", ev.get("unidades", "")))
+        estado = clean_text(ev.get("estado", ""))
+        event_key = clean_text(ev.get("event_key", ""))
+        if event_key:
+            return ("EVENT_KEY", event_key)
+        if et == "lote_item":
+            return (et, lid, item_id, ml, sku)
+        if et in {"picking_lista_creada", "PICKING_LISTA_CREADA", "picking_lista_impresa", "PICKING_LISTA_IMPRESA", "picking_lista_anulada", "PICKING_LISTA_ANULADA", "picking_lista_completada", "PICKING_LISTA_COMPLETADA"}:
+            return (et.lower(), lid, code, plid, estado, ts)
+        if et in {"scan_agregado", "scan_deshacer"}:
+            return (et, lid, item_id, ml, sku, qty, code, ts)
+        return (et, lid, item_id, ml, sku, qty, code, plid, ts, clean_text(ev.get("queue_id", "")))
+
     normalized = []
-    seen_event_keys = set()
+    seen = set()
     for raw_ev in events:
         ev = normalize_sheet_event(raw_ev)
-        event_key = sheet_event_unique_key(ev)
-        if event_key in seen_event_keys:
+        k = dedupe_key(ev)
+        if k in seen:
             continue
-        seen_event_keys.add(event_key)
+        seen.add(k)
         normalized.append(ev)
 
     def key(ev):
         qid = clean_text(ev.get("queue_id", ""))
         try:
-            return (0, int(qid))
+            return (0, int(float(qid)))
         except Exception:
             return (1, sheet_event_timestamp(ev))
 
@@ -4925,7 +4886,9 @@ def render_rescate_sheets():
     events_df = get_sheet_lote_events_df(events, selected_lote_id)
     integ_preview = state_preview.get("integrity", {}) or {}
     if integ_preview.get("fallback_from_picking"):
-        st.warning(f"Este rescate incorporará {integ_preview.get('fallback_from_picking')} producto(s) que están en eventos de picking pero no aparecían en lote_item. Quedarán marcados como PICKING_FALLBACK para trazabilidad.")
+        st.warning(f"Este rescate incorporará {integ_preview.get('fallback_from_picking')} producto(s) desde picking porque no hay snapshot primario suficiente.")
+    if integ_preview.get("picking_orphan_count"):
+        st.info(f"{integ_preview.get('picking_orphan_count')} línea(s) de picking no calzan contra lote_item. Se restauran como historial de lista, pero NO aumentan las unidades solicitadas.")
     if integ_preview.get("unmatched_scans") or integ_preview.get("ambiguous_scans"):
         st.info(f"Escaneos por reconciliar: sin match inicial {integ_preview.get('unmatched_scans',0)}, ambiguos {integ_preview.get('ambiguous_scans',0)}. La app resolverá solo dentro de este lote.")
 
@@ -5220,27 +5183,66 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             picking_lists[code]["anulada_by"] = clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
             picking_lists[code]["anulada_motivo"] = clean_text(ev.get("comentario", ""))
 
-    # 3) Agregar productos faltantes desde picking como evidencia del universo FULL.
-    # Anular una lista anula la asignación, NO elimina el producto del FULL. Por eso
-    # incluso una lista ANULADA puede alimentar el universo del lote y la reserva Kame,
-    # pero su asignación no debe bloquear productos disponibles para nuevas listas.
+    # 3) Picking: asignación operativa, no fuente primaria del solicitado si existe snapshot.
+    # Regla crítica:
+    # - Si hay lote_item/lote_snapshot_chunk, esa es la cantidad solicitada oficial.
+    # - Picking sirve para saber qué está asignado y para reconstruir listas.
+    # - Solo si NO existe snapshot primario, se permite reconstruir productos desde picking.
+    has_primary_snapshot = any(clean_text(it.get("fuente_rescate", "")) == "LOTE_ITEM" for it in items_by_id.values())
+
+    def resolve_existing_item_id(raw: dict) -> int | None:
+        original_id = to_int(raw.get("item_id", 0))
+        if original_id and original_id in items_by_id:
+            return int(original_id)
+        for key in [
+            _product_key_from_values(raw.get("codigo_ml", ""), "", "", ""),
+            _product_key_from_values("", raw.get("codigo_universal", ""), "", ""),
+            _product_key_from_values("", "", raw.get("sku", ""), ""),
+            _product_key_from_values(raw.get("codigo_ml", ""), raw.get("codigo_universal", ""), raw.get("sku", ""), raw.get("item_id", "")),
+        ]:
+            if key and key in key_to_id:
+                return int(key_to_id[key])
+        return None
+
     picking_item_rows = []
     fallback_from_picking = 0
-    fallback_from_cancelled_picking = 0
+    picking_orphan_count = 0
+    picking_orphan_units = 0
+    picking_orphan_lists = set()
+
     for code, pl in picking_lists.items():
-        estado_pl = clean_text(pl.get("estado", "CREADA")) or "CREADA"
+        list_state = clean_text(pl.get("estado", "CREADA")) or "CREADA"
         for pit in pl.get("raw_items") or []:
             if not isinstance(pit, dict):
                 continue
-            before_count = len(items_by_id)
-            note = f"producto reconstruido desde lista {code}; estado_asignacion={estado_pl}"
-            item_id = add_or_update_item({**pit, "unidades": pit.get("cantidad", 0), "created_at": pl.get("created_at", "")}, "PICKING_EVIDENCE", note)
+
+            item_id = resolve_existing_item_id(pit)
+
+            # Si no hay snapshot oficial, podemos reconstruir universo desde picking.
+            # Si sí hay snapshot oficial, NO se agregan productos nuevos al solicitado:
+            # quedan como referencia huérfana de picking para diagnóstico, pero no inflan el FULL.
             if item_id is None:
-                continue
-            if len(items_by_id) > before_count:
-                fallback_from_picking += 1
-                if estado_pl == "ANULADA":
-                    fallback_from_cancelled_picking += 1
+                if not has_primary_snapshot:
+                    before_count = len(items_by_id)
+                    item_id = add_or_update_item(
+                        {**pit, "unidades": pit.get("cantidad", 0), "created_at": pl.get("created_at", "")},
+                        "PICKING_EVIDENCE",
+                        f"producto reconstruido desde lista {code}; estado_asignacion={list_state}",
+                    )
+                    if item_id is None:
+                        continue
+                    if len(items_by_id) > before_count:
+                        fallback_from_picking += 1
+                else:
+                    item_id = to_int(pit.get("item_id", 0)) or _stable_negative_id(
+                        f"ORPHAN_PICK:{target}:{code}:{_product_key_from_values(pit.get('codigo_ml',''), pit.get('codigo_universal',''), pit.get('sku',''), pit.get('item_id',''))}",
+                        used_ids,
+                    )
+                    used_ids.add(int(item_id))
+                    picking_orphan_count += 1
+                    picking_orphan_units += to_int(pit.get("cantidad", 0))
+                    picking_orphan_lists.add(code)
+
             picking_item_rows.append({
                 "picking_list_id": int(pl["id"]),
                 "lote_id": target,
@@ -5252,7 +5254,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
                 "cantidad": to_int(pit.get("cantidad", 0)),
                 "area": clean_text(pit.get("area", "")),
                 "nro": clean_text(pit.get("nro", "")),
-                "estado": "PENDIENTE",
+                "estado": "ANULADA" if list_state == "ANULADA" else "PENDIENTE",
                 "created_at": clean_text(pl.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
 
@@ -5290,10 +5292,15 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
                 ambiguous_scans += 1
                 status = "AMBIGUOUS_SAME_LOTE"
         if resolved_id is None:
-            before_count = len(items_by_id)
-            resolved_id = add_or_update_item({**ev, "unidades": max(qty, 0)}, "SCAN_FALLBACK", "producto reconstruido desde scan sin snapshot") or original_id or 0
-            if len(items_by_id) > before_count:
-                warnings.append("Se creó producto SCAN_FALLBACK desde un escaneo sin snapshot.")
+            if not has_primary_snapshot:
+                before_count = len(items_by_id)
+                resolved_id = add_or_update_item({**ev, "unidades": max(qty, 0)}, "SCAN_EVIDENCE", "producto reconstruido desde scan sin snapshot") or original_id or 0
+                if len(items_by_id) > before_count:
+                    warnings.append("Se creó producto SCAN_EVIDENCE desde un escaneo sin snapshot.")
+            else:
+                # Con snapshot oficial, un scan sin match se conserva para trazabilidad,
+                # pero no crea productos nuevos ni infla el solicitado del FULL.
+                resolved_id = original_id or 0
             unmatched_scans += 1
         if et == "scan_agregado" and qty > 0:
             movement_by_item[resolved_id] = movement_by_item.get(resolved_id, 0) + qty
@@ -5464,6 +5471,10 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
 
     integrity = {
         "fallback_from_picking": fallback_from_picking,
+        "picking_orphan_count": picking_orphan_count,
+        "picking_orphan_units": picking_orphan_units,
+        "picking_orphan_lists": sorted(picking_orphan_lists),
+        "has_primary_snapshot": 1 if has_primary_snapshot else 0,
         "unmatched_scans": unmatched_scans,
         "ambiguous_scans": ambiguous_scans,
         "warnings": warnings,
@@ -5676,9 +5687,9 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
         f"{len(state.get('auditoria', []))} evento(s) auditoría."
     )
     if integ.get("fallback_from_picking"):
-        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde picking porque no estaban en lote_item."
-    if integ.get("fallback_from_cancelled_picking"):
-        msg += f" De esos, {integ.get('fallback_from_cancelled_picking')} venían de listas anuladas usadas solo como evidencia del FULL, no como asignación vigente."
+        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde picking porque no había snapshot primario completo."
+    if integ.get("picking_orphan_count"):
+        msg += f" {integ.get('picking_orphan_count')} línea(s) de picking no calzaron contra lote_item y se conservaron solo como historial, sin inflar el solicitado."
     if integ.get("unmatched_scans") or integ.get("ambiguous_scans"):
         msg += f" Scans sin match inicial: {integ.get('unmatched_scans',0)}; ambiguos: {integ.get('ambiguous_scans',0)}."
     return True, msg
