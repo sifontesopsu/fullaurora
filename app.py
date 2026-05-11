@@ -1606,27 +1606,98 @@ def get_items(lote_id):
     return apply_quantity_adjustments_df(lote_id, df, item_col="id", qty_col="unidades")
 
 
-def get_last_scans(lote_id):
+def get_scans_deduped(lote_id: int, limit: int | None = None) -> pd.DataFrame:
+    """Lee escaneos del lote eliminando duplicados técnicos de rescate.
+
+    Motivo: al rescatar desde Sheets podemos recibir el mismo scan desde la hoja
+    madre `eventos` y desde hojas estructuradas como `picking_validaciones`.
+    Eso no es doble acopio real; es el mismo evento visto por dos rutas.
+
+    No se usa `queue_id` como identidad porque puede repetirse después de reboot.
+    Se deduplica por una firma semántica del scan dentro del mismo lote.
+    """
+    try:
+        lote_id = int(lote_id)
+    except Exception:
+        return pd.DataFrame()
+    sql = """
+        SELECT id, lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
+               operador_validador, picking_list_id, picking_code, picker_asignado,
+               original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status
+        FROM scans
+        WHERE lote_id=?
+        ORDER BY id DESC
+    """
+    if limit:
+        # Leemos más que el límite para que la deduplicación no esconda filas recientes.
+        sql += f" LIMIT {max(int(limit) * 5, int(limit) + 20)}"
     with db() as c:
-        return pd.read_sql_query("""
-            SELECT item_id, MAX(created_at) procesado_at, SUM(cantidad) escaneado_total
-            FROM scans
-            WHERE lote_id=?
-            GROUP BY item_id
-        """, c, params=(lote_id,))
+        df = pd.read_sql_query(sql, c, params=(lote_id,))
+    if df.empty:
+        return df
+
+    out = df.copy()
+    for col in ["created_at", "scan_primario", "scan_secundario", "modo", "operador_validador", "picking_code", "picker_asignado", "codigo_ml", "codigo_universal", "sku", "descripcion", "restore_match_status"]:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].map(clean_text)
+    for col in ["scan_primario", "scan_secundario", "codigo_ml", "codigo_universal", "sku"]:
+        out[col] = out[col].map(norm_code)
+    for col in ["item_id", "original_item_id", "picking_list_id", "cantidad"]:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = out[col].map(to_int)
+
+    # Preferimos la fila que logró match con item oficial si existe.
+    status_rank = {"MATCH_ITEM_ID": 0, "MATCH_CODE_SAME_LOTE": 1, "ACOPIO_RECUPERADO_SHEETS": 2, "NO_MATCH_SNAPSHOT": 2, "AMBIGUOUS_SAME_LOTE": 3}
+    out["_status_rank"] = out["restore_match_status"].map(lambda x: status_rank.get(clean_text(x), 5))
+    out["_sig_item"] = out.apply(lambda r: str(int(r.get("original_item_id") or r.get("item_id") or 0)), axis=1)
+    out["_sig_code"] = out.apply(lambda r: norm_code(r.get("codigo_ml", "")) or norm_code(r.get("scan_primario", "")) or norm_code(r.get("codigo_universal", "")) or norm_code(r.get("sku", "")), axis=1)
+    out["_scan_sig"] = out.apply(lambda r: "|".join([
+        str(lote_id),
+        clean_text(r.get("created_at", "")),
+        clean_text(r.get("_sig_item", "")),
+        clean_text(r.get("_sig_code", "")),
+        norm_code(r.get("sku", "")),
+        str(to_int(r.get("cantidad", 0))),
+        clean_text(r.get("modo", "")),
+        clean_text(r.get("operador_validador", "")),
+        clean_text(r.get("picking_code", "")),
+        clean_text(r.get("picker_asignado", "")),
+    ]), axis=1)
+    out = out.sort_values(["_scan_sig", "_status_rank", "id"], ascending=[True, True, False], kind="mergesort")
+    out = out.drop_duplicates(subset=["_scan_sig"], keep="first")
+    out = out.sort_values("id", ascending=False, kind="mergesort")
+    out = out.drop(columns=["_status_rank", "_sig_item", "_sig_code", "_scan_sig"], errors="ignore")
+    if limit:
+        out = out.head(int(limit))
+    return out.reset_index(drop=True)
+
+
+def get_last_scans(lote_id):
+    scans = get_scans_deduped(lote_id)
+    if scans.empty:
+        return pd.DataFrame(columns=["item_id", "procesado_at", "escaneado_total"])
+    scans = scans.copy()
+    scans["cantidad"] = scans["cantidad"].map(to_int)
+    grouped = scans.groupby("item_id", as_index=False).agg(
+        procesado_at=("created_at", "max"),
+        escaneado_total=("cantidad", "sum"),
+    )
+    return grouped
 
 
 def get_scanned_total(lote_id: int) -> int:
-    """Total acopiado real según tabla scans.
+    """Total acopiado real según scans deduplicados.
 
-    En rescates desde Sheets, puede haber scans cuyo item_id histórico no calza con
-    el snapshot local. Por eso el total operativo se calcula desde scans, no solo
-    desde items.acopiadas.
+    Evita contar dos veces un mismo scan cuando el rescate lo trae desde
+    `eventos` y también desde hojas estructuradas.
     """
-    with db() as c:
-        row = c.execute("SELECT COALESCE(SUM(cantidad),0) AS n FROM scans WHERE lote_id=?", (int(lote_id),)).fetchone()
+    scans = get_scans_deduped(lote_id)
+    if scans.empty:
+        return 0
     try:
-        return max(0, int(row["n"] or 0)) if row else 0
+        return max(0, int(scans["cantidad"].map(to_int).sum()))
     except Exception:
         return 0
 
@@ -2768,28 +2839,30 @@ def get_audit_events(lote_id=None, limit=300) -> pd.DataFrame:
 
 
 def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
+    scans = get_scans_deduped(lote_id, limit=max(int(limit), 8))
+    if scans.empty:
+        return pd.DataFrame(columns=["created_at", "descripcion", "codigo_ml", "sku", "cantidad", "modo", "operador_validador", "picking_code", "picker_asignado", "estado_rescate"])
+
     with db() as c:
-        return pd.read_sql_query(
-            """
-            SELECT s.created_at,
-                   COALESCE(i.descripcion, s.descripcion) AS descripcion,
-                   COALESCE(i.codigo_ml, s.codigo_ml) AS codigo_ml,
-                   COALESCE(i.sku, s.sku) AS sku,
-                   s.cantidad, s.modo,
-                   s.operador_validador, s.picking_code, s.picker_asignado,
-                   CASE
-                       WHEN COALESCE(s.restore_match_status,'')='NO_MATCH_SNAPSHOT' THEN 'ACOPIO_RECUPERADO_SHEETS'
-                       ELSE COALESCE(s.restore_match_status,'')
-                   END AS estado_rescate
-            FROM scans s
-            LEFT JOIN items i ON i.id=s.item_id AND i.lote_id=s.lote_id
-            WHERE s.lote_id=?
-            ORDER BY s.id DESC
-            LIMIT ?
-            """,
+        items = pd.read_sql_query(
+            "SELECT id AS item_id, descripcion AS item_descripcion, codigo_ml AS item_codigo_ml, sku AS item_sku FROM items WHERE lote_id=?",
             c,
-            params=(int(lote_id), int(limit)),
+            params=(int(lote_id),),
         )
+    out = scans.copy()
+    if not items.empty:
+        out = out.merge(items, on="item_id", how="left")
+    else:
+        out["item_descripcion"] = ""
+        out["item_codigo_ml"] = ""
+        out["item_sku"] = ""
+
+    out["descripcion"] = out.apply(lambda r: clean_text(r.get("item_descripcion", "")) or clean_text(r.get("descripcion", "")), axis=1)
+    out["codigo_ml"] = out.apply(lambda r: norm_code(r.get("item_codigo_ml", "")) or norm_code(r.get("codigo_ml", "")), axis=1)
+    out["sku"] = out.apply(lambda r: norm_code(r.get("item_sku", "")) or norm_code(r.get("sku", "")), axis=1)
+    out["estado_rescate"] = out["restore_match_status"].map(lambda x: "ACOPIO_RECUPERADO_SHEETS" if clean_text(x) == "NO_MATCH_SNAPSHOT" else clean_text(x))
+    cols = ["created_at", "descripcion", "codigo_ml", "sku", "cantidad", "modo", "operador_validador", "picking_code", "picker_asignado", "estado_rescate"]
+    return out[cols].head(int(limit)).reset_index(drop=True)
 
 
 def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=None):
@@ -3782,17 +3855,23 @@ def get_picking_validation_summary(picking_list_id: int) -> pd.DataFrame:
     items = get_picking_items(picking_list_id)
     if items.empty:
         return items
-    with db() as c:
-        scans = pd.read_sql_query(
-            """
-            SELECT item_id, SUM(cantidad) AS validado_pda, MAX(created_at) AS ultimo_validado
-            FROM scans
-            WHERE picking_list_id=?
-            GROUP BY item_id
-            """,
-            c,
-            params=(int(picking_list_id),),
-        )
+    try:
+        lote_id = int(items["lote_id"].iloc[0])
+    except Exception:
+        lote_id = 0
+    scans_all = get_scans_deduped(lote_id) if lote_id else pd.DataFrame()
+    if scans_all.empty:
+        scans = pd.DataFrame(columns=["item_id", "validado_pda", "ultimo_validado"])
+    else:
+        scans_all = scans_all[scans_all["picking_list_id"].map(to_int) == int(picking_list_id)].copy()
+        if scans_all.empty:
+            scans = pd.DataFrame(columns=["item_id", "validado_pda", "ultimo_validado"])
+        else:
+            scans_all["cantidad"] = scans_all["cantidad"].map(to_int)
+            scans = scans_all.groupby("item_id", as_index=False).agg(
+                validado_pda=("cantidad", "sum"),
+                ultimo_validado=("created_at", "max"),
+            )
     if scans.empty:
         items["validado_pda"] = 0
         items["ultimo_validado"] = ""
@@ -3840,15 +3919,16 @@ def picking_pending_for_item(picking_list_id, item_id) -> dict:
         ).fetchone()
         if not item:
             return {"cantidad": 0, "validado_pda": 0, "pendiente": 0}
-        val = c.execute(
-            "SELECT COALESCE(SUM(cantidad),0) AS n FROM scans WHERE picking_list_id=? AND item_id=?",
-            (int(picking_list_id), int(item_id)),
-        ).fetchone()
     cantidad = int(item["cantidad"] or 0)
     effective = get_effective_item_units(int(item["lote_id"] or 0), int(item_id), cantidad)
     if effective is not None:
         cantidad = int(effective)
-    validado = int(val["n"] or 0) if val else 0
+    scans = get_scans_deduped(int(item["lote_id"] or 0))
+    if scans.empty:
+        validado = 0
+    else:
+        scans = scans[(scans["picking_list_id"].map(to_int) == int(picking_list_id)) & (scans["item_id"].map(to_int) == int(item_id))].copy()
+        validado = int(scans["cantidad"].map(to_int).sum()) if not scans.empty else 0
     return {"cantidad": cantidad, "validado_pda": validado, "pendiente": max(cantidad - validado, 0)}
 
 
