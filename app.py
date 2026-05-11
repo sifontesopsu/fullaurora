@@ -6,10 +6,12 @@ import json
 import os
 import time
 import uuid
+import socket
 import sqlite3
 import threading
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -610,9 +612,14 @@ def enqueue_backup_event(event_type: str, payload: dict):
     return event_id
 
 
-def send_webhook_event(url: str, event: dict) -> tuple[bool, str]:
+def send_webhook_event(url: str, event: dict, timeout: int = 25) -> tuple[bool, str]:
     """Envía un evento a Apps Script y valida que la respuesta sea JSON con ok=true.
-    Esto evita marcar como enviado cuando Google responde una página HTML de error/autorización.
+
+    Importante:
+    - Un timeout de respuesta no siempre significa que Sheets no escribió el evento.
+      Apps Script puede haber alcanzado a guardar y demorarse en responder.
+    - Por eso esta función nunca deja que Streamlit reviente con pantalla roja: devuelve
+      (False, detalle) para que la cola/reintentos decidan qué hacer.
     """
     body = json.dumps(event, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -621,9 +628,21 @@ def send_webhook_event(url: str, event: dict) -> tuple[bool, str]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        status = getattr(resp, "status", None) or resp.getcode()
-        response_text = resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=int(timeout)) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            response_text = resp.read().decode("utf-8", errors="replace")
+    except (TimeoutError, socket.timeout) as e:
+        return False, (
+            "Timeout esperando respuesta de Apps Script. "
+            "Si el evento aparece en Sheets, el respaldo sí se escribió; "
+            "solo se demoró la confirmación HTTP. Reintenta la prueba o revisa la hoja eventos. "
+            f"Detalle: {type(e).__name__}: {e}"
+        )
+    except urllib.error.URLError as e:
+        return False, f"Error de conexión con Apps Script: {e}"
+    except Exception as e:
+        return False, f"Error inesperado enviando webhook: {type(e).__name__}: {e}"
 
     if status < 200 or status >= 300:
         return False, f"HTTP {status}: {response_text[:300]}"
@@ -1481,9 +1500,10 @@ def test_backup_webhook() -> tuple[bool, str]:
     url = get_backup_webhook_url()
     if not url:
         return False, "No hay SHEETS_WEBHOOK_URL configurada."
+    created_at = now_cl().isoformat(timespec="seconds")
     event = {
         "event_type": "test_webhook",
-        "created_at": now_cl().isoformat(timespec="seconds"),
+        "created_at": created_at,
         "lote_id": "TEST",
         "lote_nombre": "Prueba manual desde Streamlit",
         "archivo": "test",
@@ -1502,7 +1522,8 @@ def test_backup_webhook() -> tuple[bool, str]:
         "operador": "",
         "dispositivo": "",
     }
-    return send_webhook_event(url, event)
+    event = attach_event_identity("test_webhook", event, created_at)
+    return send_webhook_event(url, event, timeout=25)
 
 
 def build_lote_payload(lote_id: int) -> dict:
