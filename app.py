@@ -665,6 +665,7 @@ def enqueue_backup_events_batch(events):
         stop_for_backup_failure("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
 
     # Reintentos cortos automáticos para cargas masivas de eventos.
+    # Corta apenas todos los eventos quedan enviados para no frenar la carga de lotes grandes.
     rows_status = []
     for attempt_wait in [0, 1, 3]:
         if attempt_wait:
@@ -673,9 +674,11 @@ def enqueue_backup_events_batch(events):
         with db() as c:
             qmarks = ",".join("?" for _ in ids)
             rows_status = c.execute(
-            f"SELECT id, event_type, status, last_error FROM backup_queue WHERE id IN ({qmarks})",
-            ids,
-        ).fetchall()
+                f"SELECT id, event_type, status, last_error FROM backup_queue WHERE id IN ({qmarks})",
+                ids,
+            ).fetchall()
+        if rows_status and all(clean_text(r["status"]) == "sent" for r in rows_status):
+            break
     failed = [r for r in rows_status if clean_text(r["status"]) != "sent"]
     if failed:
         sample = failed[0]
