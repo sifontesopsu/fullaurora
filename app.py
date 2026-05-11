@@ -1590,7 +1590,10 @@ def get_unmatched_scans_operational_rows(lote_id: int) -> pd.DataFrame:
     df["lote_id"] = int(lote_id)
     df["area"] = ""
     df["nro"] = ""
-    df["unidades"] = 0
+    # En la tabla operativa mostramos la cantidad escaneada como referencia visible.
+    # IMPORTANTE: esto NO infla el solicitado oficial, porque las métricas del lote
+    # siguen saliendo solo desde items/lote_item. Es solo una fila visual de rescate.
+    df["unidades"] = pd.to_numeric(df["acopiadas"], errors="coerce").fillna(0).astype(int)
     df["pendiente"] = 0
     df["estado"] = "ACOPIO_RECUPERADO"
     df["identificacion"] = "Escaneo recuperado desde Sheets"
@@ -1645,7 +1648,9 @@ def build_control_operativo_view(lote_id: int, include_unmatched_scans: bool = T
                     view[col] = ""
                 if col not in extra.columns:
                     extra[col] = ""
-            view = pd.concat([view[common_cols], extra[common_cols]], ignore_index=True)
+            # Los acopios recuperados deben quedar arriba para que operación los vea
+            # inmediatamente. Antes quedaban al final de la tabla y parecía que no existían.
+            view = pd.concat([extra[common_cols], view[common_cols]], ignore_index=True)
     return view
 
 
@@ -5920,7 +5925,7 @@ def render_control_integrado(active_lote: int):
             pass
     st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
 
-    filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"], key="sup_control_filtro")
+    filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado", "Acopios recuperados"], key="sup_control_filtro")
     show = view
     if filtro == "Pendientes":
         show = view[view["pendiente"] > 0]
@@ -5928,6 +5933,8 @@ def render_control_integrado(active_lote: int):
         show = view[view["pendiente"] == 0]
     elif filtro == "Supermercado":
         show = view[view["identificacion"].map(is_supermercado)]
+    elif filtro == "Acopios recuperados":
+        show = view[view.get("fuente_rescate", "").astype(str).eq("SCAN_SIN_MATCH")]
 
     option_rows = []
     option_map = {"": None}
