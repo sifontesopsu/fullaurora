@@ -1529,6 +1529,126 @@ def get_unmatched_scan_rows(lote_id: int) -> pd.DataFrame:
     return df
 
 
+
+def get_scan_item_totals(lote_id: int) -> pd.DataFrame:
+    """Resumen de scans que sí tienen item_id operativo.
+
+    Se usa para que las tablas operativas no dependan únicamente de
+    items.acopiadas, especialmente después de un rescate desde Sheets.
+    """
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT item_id,
+                   COALESCE(SUM(cantidad),0) AS scan_acopiadas,
+                   MAX(created_at) AS procesado_at
+            FROM scans
+            WHERE lote_id=?
+              AND item_id IS NOT NULL
+              AND item_id > 0
+              AND COALESCE(restore_match_status,'MATCH_ITEM_ID') NOT IN ('NO_MATCH_SNAPSHOT','AMBIGUOUS_SAME_LOTE')
+            GROUP BY item_id
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    return df
+
+
+def get_unmatched_scans_operational_rows(lote_id: int) -> pd.DataFrame:
+    """Convierte scans sin match en filas visibles de control operativo.
+
+    No inflan el solicitado oficial del FULL. Son filas de trazabilidad para que
+    operación pueda ver el producto acopiado aunque el snapshot lote_item no lo
+    haya podido asociar con seguridad.
+    """
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                COALESCE(codigo_ml,'') AS codigo_ml,
+                COALESCE(codigo_universal,'') AS codigo_universal,
+                COALESCE(sku,'') AS sku,
+                COALESCE(descripcion,'') AS descripcion,
+                COALESCE(SUM(cantidad),0) AS acopiadas,
+                MAX(created_at) AS procesado_at,
+                COALESCE(MAX(picking_code),'') AS picking_code,
+                COALESCE(MAX(picker_asignado),'') AS picker_asignado,
+                COALESCE(MAX(restore_match_status),'NO_MATCH_SNAPSHOT') AS restore_match_status
+            FROM scans
+            WHERE lote_id=?
+              AND COALESCE(restore_match_status,'') IN ('NO_MATCH_SNAPSHOT','AMBIGUOUS_SAME_LOTE')
+            GROUP BY COALESCE(codigo_ml,''), COALESCE(codigo_universal,''), COALESCE(sku,''), COALESCE(descripcion,'')
+            ORDER BY procesado_at DESC
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    if df.empty:
+        return df
+    df["id"] = [-(i + 1) for i in range(len(df))]
+    df["lote_id"] = int(lote_id)
+    df["area"] = ""
+    df["nro"] = ""
+    df["unidades"] = 0
+    df["pendiente"] = 0
+    df["estado"] = "ACOPIO_RECUPERADO"
+    df["identificacion"] = "Escaneo recuperado desde Sheets"
+    df["vence"] = ""
+    df["instrucciones"] = ""
+    df["dia"] = ""
+    df["hora"] = ""
+    df["created_at"] = df["procesado_at"]
+    df["updated_at"] = df["procesado_at"]
+    df["fuente_rescate"] = "SCAN_SIN_MATCH"
+    df["rescue_note"] = "Acopio real recuperado desde scans; no aumenta solicitado oficial"
+    return df
+
+
+def build_control_operativo_view(lote_id: int, include_unmatched_scans: bool = True) -> pd.DataFrame:
+    """Vista fiel para Control Operativo.
+
+    - El solicitado oficial sale de items/lote_item.
+    - Las acopiadas por producto se recalculan desde scans cuando hay match.
+    - Los scans sin match se agregan como filas visibles de trazabilidad, sin
+      aumentar el solicitado oficial.
+    """
+    items = get_items(lote_id)
+    if items.empty:
+        return items
+    view = items.copy()
+    for col in ["unidades", "acopiadas"]:
+        view[col] = pd.to_numeric(view[col], errors="coerce").fillna(0).astype(int)
+
+    matched = get_scan_item_totals(lote_id)
+    if not matched.empty:
+        matched["item_id"] = pd.to_numeric(matched["item_id"], errors="coerce").fillna(0).astype(int)
+        matched["scan_acopiadas"] = pd.to_numeric(matched["scan_acopiadas"], errors="coerce").fillna(0).astype(int)
+        view = view.merge(matched, left_on="id", right_on="item_id", how="left")
+        view["scan_acopiadas"] = pd.to_numeric(view["scan_acopiadas"], errors="coerce").fillna(0).astype(int)
+        view["acopiadas"] = view[["acopiadas", "scan_acopiadas"]].max(axis=1)
+    else:
+        view["procesado_at"] = ""
+
+    view["pendiente"] = (view["unidades"] - view["acopiadas"]).clip(lower=0)
+    view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
+    if "fuente_rescate" not in view.columns:
+        view["fuente_rescate"] = "LOTE_ITEM"
+    view["fuente_rescate"] = view["fuente_rescate"].fillna("LOTE_ITEM").replace("", "LOTE_ITEM")
+
+    if include_unmatched_scans:
+        extra = get_unmatched_scans_operational_rows(lote_id)
+        if not extra.empty:
+            common_cols = list(dict.fromkeys(list(view.columns) + list(extra.columns)))
+            for col in common_cols:
+                if col not in view.columns:
+                    view[col] = ""
+                if col not in extra.columns:
+                    extra[col] = ""
+            view = pd.concat([view[common_cols], extra[common_cols]], ignore_index=True)
+    return view
+
+
 def create_lote(nombre, archivo, hoja, df):
     now = now_cl().isoformat(timespec="seconds")
     with db() as c:
@@ -5777,17 +5897,13 @@ def render_control_integrado(active_lote: int):
         st.warning("El lote no tiene productos.")
         return
 
-    view = items.copy()
-    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-    view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
-    scans = get_last_scans(active_lote)
-    if not scans.empty:
-        view = view.merge(scans, left_on="id", right_on="item_id", how="left")
-    else:
-        view["procesado_at"] = ""
+    # Vista operativa fiel:
+    # - items mantiene el solicitado oficial del FULL.
+    # - view agrega acopios recuperados desde scans sin inflar el solicitado.
+    view = build_control_operativo_view(active_lote, include_unmatched_scans=True)
 
     c1, c2, c3, c4 = st.columns(4)
-    total = int(view["unidades"].sum())
+    total = int(pd.to_numeric(items["unidades"], errors="coerce").fillna(0).sum())
     done = min(total, get_scanned_total(active_lote))
     c1.metric("Unidades", total)
     c2.metric("Acopiadas", done)
@@ -5836,7 +5952,12 @@ def render_control_integrado(active_lote: int):
     if selected_id:
         show = show[show["id"].astype(int) == int(selected_id)]
 
-    st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
+    base_lineas = len(items)
+    extra_lineas = max(len(view) - base_lineas, 0)
+    if extra_lineas:
+        st.caption(f"Mostrando {len(show)} fila(s). Snapshot oficial: {base_lineas} línea(s). Acopios recuperados visibles sin aumentar solicitado: {extra_lineas}.")
+    else:
+        st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
     modo_vista = st.radio("Vista", ["Tarjetas operativas", "Tabla"], horizontal=True, key="sup_control_modo_vista")
 
     if modo_vista == "Tabla":
@@ -5853,7 +5974,8 @@ def render_control_integrado(active_lote: int):
             "vence": "Vence",
             "procesado_at": "Último escaneo",
         })
-        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo"]
+        out = out.rename(columns={"fuente_rescate": "Fuente"})
+        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo", "Fuente"]
         st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
         return
 
@@ -5867,6 +5989,9 @@ def render_control_integrado(active_lote: int):
             f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
             f"<span class='badge'>{esc(r['estado'])}</span>",
         ]
+        fuente_badge = clean_text(r.get("fuente_rescate", ""))
+        if fuente_badge:
+            badges_parts.append(f"<span class='badge'>Fuente: {esc(fuente_badge)}</span>")
         if is_supermercado(ident):
             badges_parts.append("<span class='badge badge-alert'>SUPERMERCADO</span>")
         if ident:
