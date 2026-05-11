@@ -1506,6 +1506,29 @@ def get_unmatched_scan_count(lote_id: int) -> int:
     return int(row["n"] or 0) if row else 0
 
 
+def get_unmatched_scan_rows(lote_id: int) -> pd.DataFrame:
+    """Escaneos recuperados desde Sheets que no calzan contra lote_item.
+
+    Se muestran para trazabilidad y sí cuentan en el acopio operativo general,
+    pero no se fuerzan contra un producto si el match no es seguro.
+    """
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT created_at AS Fecha, descripcion AS Producto, codigo_ml AS [Código ML],
+                   codigo_universal AS [Código Universal], sku AS SKU, cantidad AS Cantidad,
+                   modo AS Modo, operador_validador AS Operador, picking_code AS [Lista picking],
+                   picker_asignado AS Picker, restore_match_status AS [Estado rescate]
+            FROM scans
+            WHERE lote_id=? AND COALESCE(restore_match_status,'') IN ('NO_MATCH_SNAPSHOT','AMBIGUOUS_SAME_LOTE')
+            ORDER BY created_at DESC, id DESC
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    return df
+
+
 def create_lote(nombre, archivo, hoja, df):
     now = now_cl().isoformat(timespec="seconds")
     with db() as c:
@@ -3375,8 +3398,10 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
         issues.append("El lote no tiene productos.")
         return False, issues, {}
     view = items.copy()
+    total_units = int(view["unidades"].astype(int).sum())
+    done_units = min(total_units, get_scanned_total(lote_id))
+    pending_units = max(total_units - done_units, 0)
     view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-    pending_units = int(view["pendiente"].sum())
     if pending_units > 0:
         issues.append(f"Quedan {pending_units} unidades pendientes de acopio/escaneo.")
 
@@ -5263,11 +5288,23 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
     scan_rows = []
     unmatched_scans = 0
     ambiguous_scans = 0
+    seen_scan_keys = set()
     for ev in lote_events:
         et = clean_text(ev.get("event_type", ""))
         if et not in {"scan_agregado", "scan_deshacer"}:
             continue
         qty = to_int(ev.get("cantidad", 0))
+        # Apps Script puede devolver el mismo scan desde hoja madre eventos y desde
+        # picking_validaciones. Deduplicamos por contenido operativo, no por queue_id.
+        scan_key = (
+            et, target, to_int(ev.get("item_id", 0)), norm_code(ev.get("codigo_ml", "")),
+            norm_code(ev.get("codigo_universal", "")), norm_code(ev.get("sku", "")),
+            qty, clean_text(ev.get("picking_code", "")),
+            clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")),
+        )
+        if scan_key in seen_scan_keys:
+            continue
+        seen_scan_keys.add(scan_key)
         sign = -1 if et == "scan_deshacer" else 1
         original_id = to_int(ev.get("item_id", 0))
         resolved_id = None
@@ -5751,11 +5788,20 @@ def render_control_integrado(active_lote: int):
 
     c1, c2, c3, c4 = st.columns(4)
     total = int(view["unidades"].sum())
-    done = int(view["acopiadas"].sum())
+    done = min(total, get_scanned_total(active_lote))
     c1.metric("Unidades", total)
     c2.metric("Acopiadas", done)
     c3.metric("Pendientes", max(total - done, 0))
     c4.metric("Avance", f"{(done / total * 100) if total else 0:.1f}%")
+    unmatched = get_unmatched_scan_count(active_lote)
+    if unmatched:
+        st.info(f"Hay {unmatched} escaneo(s) recuperados desde Sheets que no calzan con el snapshot lote_item. Cuentan en el acopio operativo, pero se muestran abajo como trazabilidad sin alterar el solicitado oficial.")
+        try:
+            um = get_unmatched_scan_rows(active_lote)
+            if not um.empty:
+                st.dataframe(um, use_container_width=True, hide_index=True, height=180)
+        except Exception:
+            pass
     st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
 
     filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"], key="sup_control_filtro")
@@ -6109,7 +6155,10 @@ elif page == "Escaneo":
         lote_cerrado = clean_text(lote_scan.get("status", "ACTIVO")).upper() == "CERRADO"
         items = get_items(active_lote)
         total = int(items["unidades"].sum()) if not items.empty else 0
-        done = int(items["acopiadas"].sum()) if not items.empty else 0
+        # En rescates desde Sheets, algunos scans históricos pueden no calzar con
+        # item_id del snapshot. El acopio operativo se mide desde scans, no desde
+        # items.acopiadas solamente.
+        done = min(total, get_scanned_total(active_lote))
         st.progress(done / total if total else 0)
         a, b, c = st.columns(3)
         a.metric("Solicitado", total)
@@ -6469,10 +6518,11 @@ elif page == "Supervisor":
             view = items.copy()
             if not view.empty:
                 view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
+                msum = supervisor_metrics(active_lote)
                 resumen = pd.DataFrame([{
-                    "Unidades solicitadas": int(view["unidades"].sum()),
-                    "Unidades acopiadas": int(view["acopiadas"].sum()),
-                    "Unidades pendientes": int(view["pendiente"].sum()),
+                    "Unidades solicitadas": int(msum.get("total", 0)),
+                    "Unidades acopiadas": int(msum.get("done", 0)),
+                    "Unidades pendientes": int(msum.get("pending", 0)),
                     "Líneas totales": int(len(view)),
                     "Líneas pendientes": int((view["pendiente"] > 0).sum()),
                     "Bloques impresos": cierre_data.get("printed_blocks", 0),
@@ -7076,7 +7126,7 @@ elif page == "Control":
             else:
                 view["procesado_at"] = ""
             c1, c2, c3, c4 = st.columns(4)
-            total = int(view["unidades"].sum()); done = int(view["acopiadas"].sum())
+            total = int(view["unidades"].sum()); done = min(total, get_scanned_total(active_lote))
             c1.metric("Unidades", total)
             c2.metric("Acopiadas", done)
             c3.metric("Pendientes", max(total-done, 0))
