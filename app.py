@@ -414,6 +414,7 @@ def init_db():
                 packs_expandidos INTEGER NOT NULL DEFAULT 0,
                 lineas_csv INTEGER NOT NULL DEFAULT 0,
                 archivo_nombre TEXT,
+                csv_hash TEXT,
                 usuario TEXT,
                 created_at TEXT NOT NULL
             )
@@ -451,6 +452,8 @@ def init_db():
         ensure_column(c, "avisos_operacionales", "confirmado_ml_by", "TEXT")
         ensure_column(c, "avisos_operacionales", "confirmado_inventario_at", "TEXT")
         ensure_column(c, "avisos_operacionales", "confirmado_inventario_by", "TEXT")
+        # La reserva Kame se registra como archivo generado/resumen, no producto por producto.
+        ensure_column(c, "reservas_kame", "csv_hash", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
@@ -2917,6 +2920,10 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
             comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, mal embalaje, etc.")
             submit_inc = st.form_submit_button("Guardar incidencia", type="primary")
 
+        last_msg = clean_text(st.session_state.pop("scan_inc_last_msg", ""))
+        if last_msg:
+            st.success(last_msg)
+
         if submit_inc:
             ok_inc, msg_inc = create_incidencia_por_codigo(
                 lote_id,
@@ -2924,10 +2931,10 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
                 tipo_inc,
                 int(qty_inc),
                 comentario_inc,
-                "SIN_USUARIO",
+                get_operator_name(),
             )
             if ok_inc:
-                st.success(msg_inc)
+                st.session_state["scan_inc_last_msg"] = msg_inc
                 st.rerun()
             else:
                 st.error(msg_inc)
@@ -3054,15 +3061,81 @@ def find_item_for_incidencia(lote_id: int, codigo: str) -> dict:
     return dict(row) if row else {}
 
 
-def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentario: str, usuario: str):
-    now = now_cl().isoformat(timespec="seconds")
+
+def _snapshot_codigo_incidencia(codigo_reportado: str, item: dict | None = None) -> dict:
+    """Arma los datos visibles de una incidencia creada desde Escaneo.
+
+    Regla operativa:
+    - Si el código existe en el lote, la incidencia queda asociada al item.
+    - Si el código NO existe o justamente no valida, igual debe guardarse como incidencia
+      por código reportado. Esto permite reportar errores de etiqueta/EAN/SKU aunque el
+      producto no pueda validarse en PDA.
+    """
+    item = item or {}
+    codigo_norm = norm_code(codigo_reportado)
+    if item:
+        return {
+            "codigo_ml": norm_code(item.get("codigo_ml", "")),
+            "codigo_universal": norm_code(item.get("codigo_universal", "")),
+            "sku": norm_code(item.get("sku", "")),
+            "descripcion": clean_text(item.get("descripcion", "")),
+            "codigo_reportado": codigo_norm,
+            "match_status": "MATCH_ITEM",
+        }
+
+    # Sin match: se repite el código en las columnas principales para que sea visible
+    # en Supervisor, exportación, auditoría y Sheets, sin depender de item_id.
+    return {
+        "codigo_ml": codigo_norm,
+        "codigo_universal": codigo_norm,
+        "sku": codigo_norm,
+        "descripcion": f"Código reportado no asociado a producto del lote: {codigo_norm}" if codigo_norm else "Incidencia por código sin producto asociado",
+        "codigo_reportado": codigo_norm,
+        "match_status": "NO_MATCH_CODE",
+    }
+
+
+def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentario: str, usuario: str, codigo_reportado: str = ""):
+    """Crea una incidencia y su auditoría como una sola operación lógica.
+
+    Importante para Escaneo:
+    - No exige que item_id exista. Si el código no valida o no está en el lote, igual se guarda
+      la incidencia con el código reportado para que Supervisor pueda resolverla.
+    - Guarda incidencia y auditoría local antes de enviar a Sheets.
+    - Envía ambos eventos juntos para que aparezcan en eventos, incidencias y auditoría.
+    """
+    if is_lote_closed(lote_id):
+        return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de registrar incidencias."
+
+    tipo_clean = clean_text(tipo)
+    comentario_clean = clean_text(comentario)
+    usuario_clean = clean_text(usuario) or "SIN_USUARIO"
+    qty_clean = max(0, int(cantidad or 0))
+    if len(comentario_clean) < 3:
+        return False, "Agrega un comentario mínimo para que la incidencia sea útil."
+
     item = {}
+    item_id_clean = None
     if item_id:
+        try:
+            item_id_clean = int(item_id)
+        except Exception:
+            item_id_clean = None
+    if item_id_clean:
         with db() as c:
-            row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
+            row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id_clean, int(lote_id))).fetchone()
             item = dict(row) if row else {}
+        if not item:
+            item_id_clean = None
+
+    snap = _snapshot_codigo_incidencia(codigo_reportado, item)
+    now = now_cl().isoformat(timespec="seconds")
+    detail_clean = f"{tipo_clean} · {comentario_clean}"
+    if clean_text(snap.get("match_status")) == "NO_MATCH_CODE":
+        detail_clean = f"{detail_clean} · Código reportado: {clean_text(snap.get('codigo_reportado'))} · SIN MATCH EN LOTE"
+
     with db() as c:
-        c.execute(
+        cur = c.execute(
             """
             INSERT INTO incidencias
             (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
@@ -3071,63 +3144,103 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
             """,
             (
                 int(lote_id),
-                int(item_id) if item_id else None,
-                clean_text(tipo),
-                max(0, int(cantidad or 0)),
-                clean_text(comentario),
-                clean_text(usuario) or "SIN_USUARIO",
+                item_id_clean,
+                tipo_clean,
+                qty_clean,
+                comentario_clean,
+                usuario_clean,
                 now,
-                norm_code(item.get("codigo_ml", "")),
-                norm_code(item.get("codigo_universal", "")),
-                norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")),
+                norm_code(snap.get("codigo_ml", "")),
+                norm_code(snap.get("codigo_universal", "")),
+                norm_code(snap.get("sku", "")),
+                clean_text(snap.get("descripcion", "")),
+            ),
+        )
+        incidencia_id = int(cur.lastrowid)
+        c.execute(
+            """
+            INSERT INTO audit_events
+            (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(lote_id),
+                item_id_clean,
+                "INCIDENCIA_ABIERTA",
+                detail_clean,
+                qty_clean,
+                norm_code(snap.get("codigo_ml", "")),
+                norm_code(snap.get("sku", "")),
+                usuario_clean,
+                now,
             ),
         )
         c.commit()
 
-    # Respaldo externo: antes las incidencias solo quedaban en SQLite/auditoría local.
-    # Este evento es el que el Apps Script usa para escribir en la hoja "incidencias".
-    enqueue_backup_event("incidencia_creada", {
-        **build_lote_payload(lote_id),
-        "item_id": int(item_id) if item_id else "",
-        "codigo_ml": norm_code(item.get("codigo_ml", "")),
-        "codigo_universal": norm_code(item.get("codigo_universal", "")),
-        "sku": norm_code(item.get("sku", "")),
-        "descripcion": clean_text(item.get("descripcion", "")),
-        "tipo": clean_text(tipo),
-        "cantidad": max(0, int(cantidad or 0)),
-        "comentario": clean_text(comentario),
-        "usuario": clean_text(usuario) or "SIN_USUARIO",
+    lote_payload = build_lote_payload(lote_id)
+    incidencia_payload = {
+        **lote_payload,
+        "incidencia_id": incidencia_id,
+        "item_id": item_id_clean or "",
+        "codigo_ml": norm_code(snap.get("codigo_ml", "")),
+        "codigo_universal": norm_code(snap.get("codigo_universal", "")),
+        "sku": norm_code(snap.get("sku", "")),
+        "descripcion": clean_text(snap.get("descripcion", "")),
+        "codigo_reportado": clean_text(snap.get("codigo_reportado", "")),
+        "match_status": clean_text(snap.get("match_status", "")),
+        "tipo": tipo_clean,
+        "cantidad": qty_clean,
+        "comentario": comentario_clean,
+        "usuario": usuario_clean,
         "status": "ABIERTA",
+        "estado": "ABIERTA",
         "created_at": now,
-    })
-
-    log_audit_event(
-        lote_id,
-        int(item_id) if item_id else None,
-        "INCIDENCIA_ABIERTA",
-        f"{clean_text(tipo)} · {clean_text(comentario)}",
-        max(0, int(cantidad or 0)),
-        item.get("codigo_ml", ""),
-        item.get("sku", ""),
-        clean_text(usuario) or "SIN_USUARIO",
-    )
+    }
+    audit_payload = {
+        **lote_payload,
+        "item_id": item_id_clean or "",
+        "event_type_audit": "INCIDENCIA_ABIERTA",
+        "detail": detail_clean,
+        "detalle": detail_clean,
+        "cantidad": qty_clean,
+        "codigo_ml": norm_code(snap.get("codigo_ml", "")),
+        "sku": norm_code(snap.get("sku", "")),
+        "modo": usuario_clean,
+        "tipo": "INCIDENCIA_ABIERTA",
+        "comentario": detail_clean,
+        "created_at": now,
+    }
+    enqueue_backup_events_batch([
+        ("incidencia_creada", incidencia_payload),
+        ("audit_event", audit_payload),
+    ])
+    return True, incidencia_id, snap
 
 
 def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad: int, comentario: str, usuario: str = "SIN_USUARIO"):
-    """Crea incidencia desde Escaneo usando Etiqueta ML / Código Universal / SKU."""
-    if is_lote_closed(lote_id):
-        return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de registrar incidencias."
+    """Crea incidencia desde Escaneo usando Etiqueta ML / Código Universal / SKU.
+
+    La búsqueda por código es independiente del producto escaneado. Si el código no calza
+    con ningún producto del lote, igualmente se registra la incidencia como NO_MATCH_CODE.
+    """
     codigo_norm = norm_code(codigo)
     if not codigo_norm:
         return False, "Ingresa una Etiqueta ML, Código Universal o SKU."
     item = find_item_for_incidencia(lote_id, codigo_norm)
-    if not item:
-        return False, "No encontré ese código en el lote activo. Revisa Etiqueta ML, Código Universal o SKU."
-    if len(clean_text(comentario)) < 3:
-        return False, "Agrega un comentario mínimo para que la incidencia sea útil."
-    create_incidencia(lote_id, int(item["id"]), tipo, int(cantidad or 0), comentario, usuario or "SIN_USUARIO")
-    return True, f"Incidencia registrada para SKU {clean_text(item.get('sku',''))}."
+    ok, incidencia_id, snap = create_incidencia(
+        lote_id,
+        int(item["id"]) if item else None,
+        tipo,
+        int(cantidad or 0),
+        comentario,
+        usuario or "SIN_USUARIO",
+        codigo_reportado=codigo_norm,
+    )
+    if not ok:
+        return False, incidencia_id
+    if item:
+        return True, f"Incidencia #{incidencia_id} registrada para SKU {clean_text(item.get('sku',''))}."
+    return True, f"Incidencia #{incidencia_id} registrada por código {codigo_norm} sin producto asociado. Supervisor debe revisar."
 
 
 def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
@@ -4653,17 +4766,19 @@ def register_reserva_kame(lote_id: int, folio: str, folio_auto: str, ficha: str,
     unidades_total = float(grouped["cantidad_reserva"].sum()) if not grouped.empty else 0.0
     packs_expandidos = int((expanded["tipo_origen"] == "PACK_EXPANDIDO").sum()) if not expanded.empty else 0
     productos_full = int(expanded["item_id"].nunique()) if not expanded.empty else 0
+    csv_bytes = build_kame_reserva_csv(grouped, folio, ficha, fecha_doc, glosa, bodega_salida, unidad_negocio, folio_auto) if not grouped.empty else b""
+    csv_hash = hashlib.sha256(csv_bytes).hexdigest() if csv_bytes else ""
 
     with db() as c:
         c.execute(
             """
             INSERT INTO reservas_kame
             (lote_id, folio, folio_auto, ficha, fecha, glosa, bodega_salida, unidad_negocio,
-             sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, usuario, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, csv_hash, usuario, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (int(lote_id), clean_text(folio), clean_text(folio_auto), clean_text(ficha), fecha_txt, clean_text(glosa), clean_text(bodega_salida), clean_text(unidad_negocio),
-             sku_count, unidades_total, productos_full, packs_expandidos, int(len(grouped)), clean_text(archivo_nombre), usuario, created_at),
+             sku_count, unidades_total, productos_full, packs_expandidos, int(len(grouped)), clean_text(archivo_nombre), csv_hash, usuario, created_at),
         )
         c.commit()
 
@@ -4683,25 +4798,14 @@ def register_reserva_kame(lote_id: int, folio: str, folio_auto: str, ficha: str,
         "packs_expandidos": packs_expandidos,
         "lineas_csv": int(len(grouped)),
         "archivo_nombre": clean_text(archivo_nombre),
+        "csv_hash": csv_hash,
         "usuario": usuario,
+        "detalle_guardado": "RESUMEN_SIN_ITEMS",
     })]
 
-    for r in grouped.itertuples(index=False):
-        events.append(("reserva_kame_item", {
-            **lote_payload,
-            "created_at": created_at,
-            "folio": clean_text(folio),
-            "ficha": clean_text(ficha),
-            "fecha": fecha_txt,
-            "sku": clean_text(getattr(r, "sku_reserva", "")),
-            "descripcion": clean_text(getattr(r, "descripcion_reserva", "")),
-            "cantidad": clean_text(getattr(r, "cantidad_kame", format_kame_qty(getattr(r, "cantidad_reserva", 0)))),
-            "lineas_origen": int(getattr(r, "lineas_origen", 0) or 0),
-            "packs_expandidos": int(getattr(r, "packs_expandidos", 0) or 0),
-            "archivo_nombre": clean_text(archivo_nombre),
-            "usuario": usuario,
-        }))
-
+    # No se envía reserva_kame_item producto por producto.
+    # La reserva Kame es un archivo exportado: la trazabilidad queda en el evento resumen
+    # + nombre de archivo + hash del CSV generado + totales.
     enqueue_backup_events_batch(events)
     log_audit_event(lote_id, event_type="RESERVA_KAME_GENERADA", detail=f"Reserva Kame folio {clean_text(folio)} · {sku_count} SKU · {format_kame_qty(unidades_total)} unidades", qty=int(round(unidades_total)), mode=usuario)
 
@@ -4801,7 +4905,7 @@ def render_reservas_kame_module(active_lote: int):
     with db() as c:
         hist = pd.read_sql_query(
             """
-            SELECT created_at, folio, ficha, fecha, sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, usuario
+            SELECT created_at, folio, ficha, fecha, sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, csv_hash, usuario
             FROM reservas_kame
             WHERE lote_id=?
             ORDER BY id DESC
@@ -4814,6 +4918,8 @@ def render_reservas_kame_module(active_lote: int):
         with st.expander("Historial local de reservas Kame generadas", expanded=False):
             hist["created_at"] = hist["created_at"].map(fmt_dt)
             hist["unidades_total"] = hist["unidades_total"].map(format_kame_qty)
+            if "csv_hash" in hist.columns:
+                hist["csv_hash"] = hist["csv_hash"].astype(str).str.slice(0, 12)
             st.dataframe(hist, use_container_width=True, hide_index=True, height=220)
 
 
