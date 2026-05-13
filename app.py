@@ -2904,7 +2904,7 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
             default_code = ""
 
     with st.expander("Reportar incidencia por código", expanded=False):
-        st.caption("Escanea o ingresa Etiqueta ML, Código Universal/EAN o SKU. La incidencia quedará asociada al producto encontrado en el lote activo.")
+        st.caption("Escanea o ingresa Etiqueta ML, Código Universal/EAN o SKU. Si el código no calza, igual se registrará para revisión de Supervisor.")
         with st.form("scan_incident_form", clear_on_submit=True):
             codigo_inc = st.text_input(
                 "Etiqueta ML / Código Universal / SKU",
@@ -3105,14 +3105,14 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
     - Envía ambos eventos juntos para que aparezcan en eventos, incidencias y auditoría.
     """
     if is_lote_closed(lote_id):
-        return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de registrar incidencias."
+        return False, "Este lote está cerrado. Reabre el lote desde Supervisor antes de registrar incidencias.", {}
 
     tipo_clean = clean_text(tipo)
     comentario_clean = clean_text(comentario)
     usuario_clean = clean_text(usuario) or "SIN_USUARIO"
     qty_clean = max(0, int(cantidad or 0))
     if len(comentario_clean) < 3:
-        return False, "Agrega un comentario mínimo para que la incidencia sea útil."
+        return False, "Agrega un comentario mínimo para que la incidencia sea útil.", {}
 
     item = {}
     item_id_clean = None
@@ -3227,7 +3227,7 @@ def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad:
     if not codigo_norm:
         return False, "Ingresa una Etiqueta ML, Código Universal o SKU."
     item = find_item_for_incidencia(lote_id, codigo_norm)
-    ok, incidencia_id, snap = create_incidencia(
+    result = create_incidencia(
         lote_id,
         int(item["id"]) if item else None,
         tipo,
@@ -3236,8 +3236,19 @@ def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad:
         usuario or "SIN_USUARIO",
         codigo_reportado=codigo_norm,
     )
+
+    # Defensa: create_incidencia debe devolver (ok, incidencia_id_o_msg, snap),
+    # pero esto evita pantalla roja si alguna rama antigua devuelve solo (ok, msg).
+    if isinstance(result, tuple) and len(result) == 3:
+        ok, incidencia_id, snap = result
+    elif isinstance(result, tuple) and len(result) == 2:
+        ok, incidencia_id = result
+        snap = {}
+    else:
+        return False, "No se pudo registrar la incidencia: respuesta interna inválida."
+
     if not ok:
-        return False, incidencia_id
+        return False, clean_text(incidencia_id) or "No se pudo registrar la incidencia."
     if item:
         return True, f"Incidencia #{incidencia_id} registrada para SKU {clean_text(item.get('sku',''))}."
     return True, f"Incidencia #{incidencia_id} registrada por código {codigo_norm} sin producto asociado. Supervisor debe revisar."
