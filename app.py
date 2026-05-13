@@ -798,6 +798,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     movement_by_item = {}
     scan_rows = []
     incidencias_rows = []
+    incidencias_status_updates = {}
     reimpresiones_rows = []
     avisos_rows = {}
     avisos_status_updates = {}
@@ -943,13 +944,14 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
             except Exception:
                 item_id = None
             incidencias_rows.append({
+                "id": to_int(ev.get("incidencia_id", 0)) or None,
                 "lote_id": lote_id,
                 "item_id": item_id,
                 "tipo": clean_text(ev.get("tipo", "")) or "Otro",
                 "cantidad": max(0, to_int(ev.get("cantidad", 0))),
                 "comentario": clean_text(ev.get("comentario", "")),
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
-                "status": clean_text(ev.get("status", "ABIERTA")) or "ABIERTA",
+                "status": clean_text(ev.get("status", "ABIERTA")) or clean_text(ev.get("estado", "ABIERTA")) or "ABIERTA",
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
                 "codigo_universal": norm_code(ev.get("codigo_universal", "")),
@@ -957,8 +959,14 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 "descripcion": clean_text(ev.get("descripcion", "")),
             })
         elif et == "incidencia_resuelta" or et == "INCIDENCIA_RESUELTA":
-            # Se deja listo para futuros eventos de resolución; si no existe id estable, se resuelve por producto/tipo/comentario.
-            pass
+            inc_id = to_int(ev.get("incidencia_id", 0))
+            if inc_id:
+                incidencias_status_updates[inc_id] = {
+                    "status": "RESUELTA",
+                    "resolved_at": clean_text(ev.get("resolved_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "resolved_by": clean_text(ev.get("resolved_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "resolution_comment": clean_text(ev.get("resolution_comment", "")) or clean_text(ev.get("comentario", "")),
+                }
         elif et == "reimpresion_controlada" or et == "REIMPRESION_CONTROLADA":
             try:
                 item_id_raw = ev.get("item_id", "")
@@ -1274,16 +1282,36 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 restored_scans += 1
         for inc in incidencias_rows:
             if inc["lote_id"] in active_lote_ids:
-                c.execute(
-                    """
-                    INSERT INTO incidencias
-                    (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
-                     codigo_ml, codigo_universal, sku, descripcion)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (inc["lote_id"], inc["item_id"], inc["tipo"], inc["cantidad"], inc["comentario"], inc["usuario"], inc["status"], inc["created_at"], inc["codigo_ml"], inc["codigo_universal"], inc["sku"], inc["descripcion"]),
-                )
+                if inc.get("id"):
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO incidencias
+                        (id, lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
+                         codigo_ml, codigo_universal, sku, descripcion)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (inc["id"], inc["lote_id"], inc["item_id"], inc["tipo"], inc["cantidad"], inc["comentario"], inc["usuario"], inc["status"], inc["created_at"], inc["codigo_ml"], inc["codigo_universal"], inc["sku"], inc["descripcion"]),
+                    )
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO incidencias
+                        (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
+                         codigo_ml, codigo_universal, sku, descripcion)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (inc["lote_id"], inc["item_id"], inc["tipo"], inc["cantidad"], inc["comentario"], inc["usuario"], inc["status"], inc["created_at"], inc["codigo_ml"], inc["codigo_universal"], inc["sku"], inc["descripcion"]),
+                    )
                 restored_incidencias += 1
+        for inc_id, upd in incidencias_status_updates.items():
+            c.execute(
+                """
+                UPDATE incidencias
+                SET status=?, resolved_at=?, resolved_by=?, resolution_comment=?
+                WHERE id=?
+                """,
+                (upd["status"], upd["resolved_at"], upd["resolved_by"], upd["resolution_comment"], int(inc_id)),
+            )
         for rep in reimpresiones_rows:
             if rep["lote_id"] in active_lote_ids:
                 c.execute(
@@ -3255,6 +3283,11 @@ def create_incidencia_por_codigo(lote_id: int, codigo: str, tipo: str, cantidad:
 
 
 def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
+    usuario_clean = clean_text(usuario) or "SIN_USUARIO"
+    comentario_clean = clean_text(comentario)
+    if len(comentario_clean) < 3:
+        return False, "Agrega un comentario de resolución."
+
     now = now_cl().isoformat(timespec="seconds")
     with db() as c:
         inc = c.execute("SELECT * FROM incidencias WHERE id=?", (int(incidencia_id),)).fetchone()
@@ -3262,16 +3295,74 @@ def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
             return False, "Incidencia no encontrada."
         if clean_text(inc["status"]) == "RESUELTA":
             return False, "La incidencia ya estaba resuelta."
+
+        inc_dict = dict(inc)
         c.execute(
             """
             UPDATE incidencias
             SET status='RESUELTA', resolved_at=?, resolved_by=?, resolution_comment=?
             WHERE id=?
             """,
-            (now, clean_text(usuario) or "SIN_USUARIO", clean_text(comentario), int(incidencia_id)),
+            (now, usuario_clean, comentario_clean, int(incidencia_id)),
+        )
+        c.execute(
+            """
+            INSERT INTO audit_events
+            (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(inc_dict["lote_id"]),
+                inc_dict.get("item_id"),
+                "INCIDENCIA_RESUELTA",
+                comentario_clean,
+                int(inc_dict.get("cantidad") or 0),
+                norm_code(inc_dict.get("codigo_ml", "")),
+                norm_code(inc_dict.get("sku", "")),
+                usuario_clean,
+                now,
+            ),
         )
         c.commit()
-    log_audit_event(int(inc["lote_id"]), inc["item_id"], "INCIDENCIA_RESUELTA", clean_text(comentario), inc["cantidad"], mode=clean_text(usuario) or "SIN_USUARIO")
+
+    lote_payload = build_lote_payload(int(inc_dict["lote_id"]))
+    incidencia_payload = {
+        **lote_payload,
+        "incidencia_id": int(incidencia_id),
+        "item_id": int(inc_dict["item_id"]) if inc_dict.get("item_id") else "",
+        "codigo_ml": norm_code(inc_dict.get("codigo_ml", "")),
+        "codigo_universal": norm_code(inc_dict.get("codigo_universal", "")),
+        "sku": norm_code(inc_dict.get("sku", "")),
+        "descripcion": clean_text(inc_dict.get("descripcion", "")),
+        "tipo": clean_text(inc_dict.get("tipo", "")),
+        "cantidad": int(inc_dict.get("cantidad") or 0),
+        "comentario": comentario_clean,
+        "usuario": usuario_clean,
+        "status": "RESUELTA",
+        "estado": "RESUELTA",
+        "resolved_at": now,
+        "resolved_by": usuario_clean,
+        "resolution_comment": comentario_clean,
+        "created_at": now,
+    }
+    audit_payload = {
+        **lote_payload,
+        "item_id": int(inc_dict["item_id"]) if inc_dict.get("item_id") else "",
+        "event_type_audit": "INCIDENCIA_RESUELTA",
+        "detail": comentario_clean,
+        "detalle": comentario_clean,
+        "cantidad": int(inc_dict.get("cantidad") or 0),
+        "codigo_ml": norm_code(inc_dict.get("codigo_ml", "")),
+        "sku": norm_code(inc_dict.get("sku", "")),
+        "modo": usuario_clean,
+        "tipo": "INCIDENCIA_RESUELTA",
+        "comentario": comentario_clean,
+        "created_at": now,
+    }
+    enqueue_backup_events_batch([
+        ("incidencia_resuelta", incidencia_payload),
+        ("audit_event", audit_payload),
+    ])
     return True, "Incidencia resuelta."
 
 
@@ -6793,13 +6884,49 @@ elif page == "Supervisor":
                     st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_incid:
-            inc = get_incidencias(active_lote)
-            if inc.empty:
-                st.success("Sin incidencias registradas.")
-            else:
-                out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
-                cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "SKU", "Producto", "Comentario", "Usuario"]
-                st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
+            st.info("Aquí puedes revisar y cerrar incidencias del lote activo. Las abiertas bloquean el cierre del lote.")
+            sub_inc_abiertas, sub_inc_historial = st.tabs(["Abiertas / resolver", "Historial"])
+            with sub_inc_abiertas:
+                inc_open = get_incidencias(active_lote, status="ABIERTA")
+                if inc_open.empty:
+                    st.success("No hay incidencias abiertas.")
+                else:
+                    st.warning(f"Hay {len(inc_open)} incidencia(s) abierta(s). Resuélvelas para poder cerrar el lote.")
+                    for _, r in inc_open.iterrows():
+                        inc_id = int(r["id"])
+                        titulo_prod = clean_text(r.get("descripcion", "")) or clean_text(r.get("codigo_ml", "")) or clean_text(r.get("sku", "")) or "Código sin match / revisar"
+                        st.markdown(f"""
+                        <div class='control-card'>
+                            <div class='control-title'>#{inc_id} · {esc(r.get('tipo',''))} · {esc(titulo_prod)}</div>
+                            <div class='control-meta'>
+                                <b>Fecha:</b> {esc(fmt_dt(r.get('created_at','')))} ·
+                                <b>Cantidad:</b> {int(r.get('cantidad') or 0)} ·
+                                <b>Usuario:</b> {esc(r.get('usuario',''))}
+                            </div>
+                            <div class='control-meta'>
+                                <b>ML:</b> {esc(r.get('codigo_ml',''))} ·
+                                <b>EAN:</b> {esc(r.get('codigo_universal',''))} ·
+                                <b>SKU:</b> {esc(r.get('sku',''))}
+                            </div>
+                            <div>{esc(r.get('comentario',''))}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        with st.expander(f"Resolver incidencia #{inc_id}", expanded=False):
+                            res_user = st.text_input("Resuelto por", value=get_operator_name(), key=f"sup_res_user_{inc_id}")
+                            res_comment = st.text_area("Comentario de resolución", key=f"sup_res_comment_{inc_id}", placeholder="Ej: se corrigió etiqueta / se separó producto / se ajustó cantidad / se confirmó con bodega.")
+                            if st.button("Marcar como resuelta", key=f"sup_resolve_{inc_id}", type="primary"):
+                                ok_res, msg_res = resolve_incidencia(inc_id, res_user, res_comment)
+                                st.success(msg_res) if ok_res else st.error(msg_res)
+                                if ok_res:
+                                    st.rerun()
+            with sub_inc_historial:
+                inc = get_incidencias(active_lote)
+                if inc.empty:
+                    st.success("Sin incidencias registradas.")
+                else:
+                    out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "resolved_at": "Fecha resolución", "resolved_by": "Resuelto por", "resolution_comment": "Comentario resolución", "codigo_ml": "Código ML", "codigo_universal": "Código Universal", "sku": "SKU", "descripcion": "Producto"})
+                    cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "Código Universal", "SKU", "Producto", "Comentario", "Usuario", "Fecha resolución", "Resuelto por", "Comentario resolución"]
+                    st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_avisos:
             st.info("Los avisos operacionales los crea Supervisor/Admin. El operador solo los ve al escanear el producto.")
