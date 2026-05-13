@@ -4623,6 +4623,127 @@ def get_picking_validation_summary(picking_list_id: int) -> pd.DataFrame:
     return items
 
 
+def render_scan_picking_progress_dropdown(picking_list_id: int):
+    """Muestra en Escaneo el avance de la lista picking activa.
+
+    Es solo visual: no cambia estado, no escribe eventos y no toca Sheets.
+    Sirve para que el operador vea rápido qué productos de SU lista ya están
+    completos, cuáles van parcial y cuáles faltan por validar.
+    """
+    if not picking_list_id:
+        return
+    try:
+        pick_id = int(picking_list_id)
+    except Exception:
+        return
+
+    meta = get_picking_list_meta(pick_id)
+    summary = get_picking_validation_summary(pick_id)
+    if summary.empty:
+        st.caption("La lista de picking activa no tiene productos asignados.")
+        return
+
+    summary = summary.copy()
+    for col in ["cantidad", "validado_pda", "pendiente_picking"]:
+        if col in summary.columns:
+            summary[col] = summary[col].map(to_int)
+
+    total_productos = int(len(summary))
+    productos_completos = int((summary["estado_validacion"].astype(str) == "COMPLETO").sum())
+    productos_pendientes = int((summary["pendiente_picking"].map(to_int) > 0).sum())
+    total_unidades = int(summary["cantidad"].sum())
+    validado_unidades = int(summary["validado_pda"].sum())
+    pendiente_unidades = int(summary["pendiente_picking"].sum())
+    codigo_lista = clean_text(meta.get("codigo_lista", "")) or f"Lista {pick_id}"
+    asignado_a = clean_text(meta.get("asignado_a", ""))
+
+    title = f"📋 Avance lista {codigo_lista}"
+    if asignado_a:
+        title += f" · {asignado_a}"
+    title += f" · faltan {pendiente_unidades}/{total_unidades}"
+
+    with st.expander(title, expanded=False):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Productos", total_productos)
+        m2.metric("Completos", productos_completos)
+        m3.metric("Pendientes", productos_pendientes)
+        m4.metric("Unidades faltantes", pendiente_unidades)
+
+        estado_vista = st.selectbox(
+            "Ver productos",
+            ["Faltan validar", "Validados completos", "Parciales", "Todos"],
+            key=f"scan_pick_progress_view_{pick_id}",
+            help="Vista rápida de la lista activa. No modifica escaneos ni cantidades.",
+        )
+
+        if estado_vista == "Faltan validar":
+            view = summary[summary["pendiente_picking"].map(to_int) > 0].copy()
+        elif estado_vista == "Validados completos":
+            view = summary[summary["estado_validacion"].astype(str) == "COMPLETO"].copy()
+        elif estado_vista == "Parciales":
+            view = summary[summary["estado_validacion"].astype(str).isin(["PARCIAL", "SOBREVALIDADO"])].copy()
+        else:
+            view = summary.copy()
+
+        if view.empty:
+            st.success("No hay productos en esta vista.")
+            return
+
+        view = view.sort_values(["pendiente_picking", "sku"], ascending=[False, True])
+        cols = [
+            "estado_validacion", "codigo_ml", "codigo_universal", "sku", "descripcion",
+            "cantidad", "validado_pda", "pendiente_picking", "ultimo_validado"
+        ]
+        cols = [c for c in cols if c in view.columns]
+        show = view[cols].copy()
+        show = show.rename(columns={
+            "estado_validacion": "Estado",
+            "codigo_ml": "Código ML",
+            "codigo_universal": "Código universal",
+            "sku": "SKU",
+            "descripcion": "Descripción",
+            "cantidad": "Lista",
+            "validado_pda": "Validado",
+            "pendiente_picking": "Falta",
+            "ultimo_validado": "Último validado",
+        })
+        if "Último validado" in show.columns:
+            show["Último validado"] = show["Último validado"].map(fmt_dt)
+        st.dataframe(show, use_container_width=True, hide_index=True, height=320)
+
+        # Selector compacto para ver un producto puntual sin buscar en la tabla.
+        options = {}
+        for r in view.itertuples(index=False):
+            try:
+                estado = clean_text(getattr(r, "estado_validacion"))
+                falta = to_int(getattr(r, "pendiente_picking"))
+                sku = clean_text(getattr(r, "sku"))
+                ml = clean_text(getattr(r, "codigo_ml"))
+                desc = clean_text(getattr(r, "descripcion"))
+                iid = int(getattr(r, "item_id"))
+                label = f"{estado} · Falta {falta} · {sku or ml} · {desc[:70]}"
+                options[label] = iid
+            except Exception:
+                continue
+        if options:
+            selected_label = st.selectbox(
+                "Producto rápido",
+                ["Seleccionar..."] + list(options.keys()),
+                key=f"scan_pick_progress_product_{pick_id}_{estado_vista}",
+            )
+            if selected_label != "Seleccionar...":
+                selected_id = options[selected_label]
+                selected = view[view["item_id"].map(to_int) == int(selected_id)]
+                if not selected.empty:
+                    row = selected.iloc[0]
+                    st.info(
+                        f"{clean_text(row.get('descripcion',''))} · "
+                        f"ML {norm_code(row.get('codigo_ml',''))} · SKU {norm_code(row.get('sku',''))} · "
+                        f"Validado {to_int(row.get('validado_pda',0))}/{to_int(row.get('cantidad',0))} · "
+                        f"Falta {to_int(row.get('pendiente_picking',0))}"
+                    )
+
+
 def item_in_picking_list(picking_list_id, item_id) -> bool:
     if not picking_list_id:
         return True
@@ -7511,6 +7632,10 @@ elif page == "Escaneo":
                     st.session_state["scan_picking_list_id"] = 0
                     st.warning("No hay listas de picking activas para este lote. Crea una lista en el módulo Picking antes de escanear.")
 
+        # Vista rápida desplegable del avance de la lista activa:
+        # muestra qué productos ya están completos y cuáles faltan por validar.
+        if int(st.session_state.get("scan_picking_list_id") or 0):
+            render_scan_picking_progress_dropdown(int(st.session_state.get("scan_picking_list_id") or 0))
 
         if lote_cerrado:
             st.error(f"Lote cerrado por {clean_text(lote_scan.get('closed_by',''))} el {fmt_dt(lote_scan.get('closed_at',''))}. No se permiten escaneos ni incidencias nuevas.")
