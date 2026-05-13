@@ -800,6 +800,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     incidencias_rows = []
     incidencias_status_updates = {}
     reimpresiones_rows = []
+    label_print_events = []
     avisos_rows = {}
     avisos_status_updates = {}
     picking_rows = {}
@@ -984,6 +985,29 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
+        elif et == "zpl_etiquetas_generado" or et == "ZPL_ETIQUETAS_GENERADO":
+            label_print_events.append({
+                "lote_id": lote_id,
+                "print_scope": clean_text(ev.get("print_scope", "")).upper(),
+                "print_kind": clean_text(ev.get("print_kind", "NORMAL")).upper() or "NORMAL",
+                "block_index": to_int(ev.get("block_index", 0)) or None,
+                "block_key": clean_text(ev.get("block_key", "")),
+                "picking_list_id": to_int(ev.get("picking_list_id", 0)) or None,
+                "picking_code": clean_text(ev.get("picking_code", "")),
+                "asignado_a": clean_text(ev.get("asignado_a", "")),
+                "item_id": to_int(ev.get("item_id", 0)) or None,
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion", "")),
+                "productos_count": to_int(ev.get("productos_count", 0)),
+                "cantidad_normal": to_int(ev.get("cantidad_normal", ev.get("normal_qty", 0))),
+                "cantidad_separadores": to_int(ev.get("cantidad_separadores", ev.get("separator_qty", 0))),
+                "cantidad_total": to_int(ev.get("cantidad_total", ev.get("total_qty", 0))),
+                "archivo_nombre": clean_text(ev.get("archivo_nombre", "")),
+                "zpl_hash": clean_text(ev.get("zpl_hash", "")),
+                "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+            })
         elif et == "aviso_operacional_creado" or et == "AVISO_OPERACIONAL_CREADO":
             try:
                 aviso_id_raw = ev.get("aviso_id", "")
@@ -1148,6 +1172,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     restored_scans = 0
     restored_incidencias = 0
     restored_reimpresiones = 0
+    restored_label_prints = 0
     restored_avisos = 0
     restored_picking = 0
 
@@ -1423,12 +1448,133 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                         (list_id_db, plist["lote_id"], item_id, norm_code(pit.get("codigo_ml", "")), norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion", "")), to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")), plist["created_at"]),
                     )
                 restored_picking += 1
+
+        # Restaura estado local de etiquetas desde eventos resumen zpl_etiquetas_generado.
+        # No guarda producto por producto en Sheets, pero reconstruye label_prints/label_blocks
+        # usando los productos/listas ya restaurados del mismo lote.
+        for evp in label_print_events:
+            lid = int(evp.get("lote_id") or 0)
+            if lid not in active_lote_ids:
+                continue
+            scope = clean_text(evp.get("print_scope", "")).upper()
+            kind = clean_text(evp.get("print_kind", "NORMAL")).upper() or "NORMAL"
+            is_reprint = 1 if kind == "REIMPRESION" else 0
+            created_at = clean_text(evp.get("created_at", "")) or now
+            try:
+                if scope == "BLOQUE":
+                    block_index = to_int(evp.get("block_index", 0))
+                    block_key = clean_text(evp.get("block_key", ""))
+                    if not block_index or not block_key:
+                        continue
+                    # Reconstrucción por block_key contra los bloques actuales del lote.
+                    labels_view_restore = label_control_view(lid)
+                    blocks_restore = build_label_blocks(labels_view_restore, ROLL_CAPACITY_DEFAULT) if not labels_view_restore.empty else []
+                    block = next((b for b in blocks_restore if int(b.get("block_index", 0)) == block_index and clean_text(b.get("block_key", "")) == block_key), None)
+                    if not block:
+                        continue
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO label_blocks
+                        (lote_id, block_index, block_key, products_count, normal_qty, separator_qty, total_qty,
+                         status, download_count, last_printed_at, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (lid, block_index, block_key, int(block.get("products_count", 0)), int(block.get("normal_qty", 0)),
+                         int(block.get("separator_qty", 0)), int(block.get("total_qty", 0)), "REIMPRESO" if is_reprint else "IMPRESO",
+                         created_at, created_at, created_at),
+                    )
+                    for item in block.get("items", []):
+                        c.execute(
+                            """
+                            INSERT INTO label_prints
+                            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+                             block_index, block_key, is_reprint, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'NORMAL', ?, ?, ?, ?)
+                            """,
+                            (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                             clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), block_index, block_key, is_reprint, created_at),
+                        )
+                        c.execute(
+                            """
+                            INSERT INTO label_prints
+                            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+                             block_index, block_key, is_reprint, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'SEPARADOR', ?, ?, ?, ?)
+                            """,
+                            (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, block_index, block_key, is_reprint, created_at),
+                        )
+                    restored_label_prints += 1
+                elif scope == "PICKING":
+                    picking_id = to_int(evp.get("picking_list_id", 0)) or to_int(evp.get("block_index", 0))
+                    block_key = clean_text(evp.get("block_key", ""))
+                    if not picking_id:
+                        continue
+                    items_df = pd.read_sql_query(
+                        "SELECT * FROM picking_list_items WHERE picking_list_id=? ORDER BY id", c, params=(int(picking_id),)
+                    )
+                    if items_df.empty:
+                        continue
+                    for _, item in items_df.iterrows():
+                        c.execute(
+                            """
+                            INSERT INTO label_prints
+                            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+                             block_index, block_key, is_reprint, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 'PICKING', 'NORMAL', ?, ?, ?, ?)
+                            """,
+                            (lid, int(item.get("item_id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                             clean_text(item.get("descripcion", "")), to_int(item.get("cantidad", 0)), picking_id, block_key, is_reprint, created_at),
+                        )
+                        c.execute(
+                            """
+                            INSERT INTO label_prints
+                            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+                             block_index, block_key, is_reprint, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 'PICKING', 'SEPARADOR', ?, ?, ?, ?)
+                            """,
+                            (lid, int(item.get("item_id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, picking_id, block_key, is_reprint, created_at),
+                        )
+                    restored_label_prints += 1
+                elif scope == "INDIVIDUAL":
+                    item_id = to_int(evp.get("item_id", 0))
+                    qty = max(1, to_int(evp.get("cantidad_normal", 1)))
+                    if not item_id:
+                        continue
+                    row_item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lid)).fetchone()
+                    item = dict(row_item) if row_item else {}
+                    c.execute(
+                        """
+                        INSERT INTO label_prints
+                        (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+                         block_index, block_key, is_reprint, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'INDIVIDUAL', 'NORMAL', NULL, NULL, ?, ?)
+                        """,
+                        (lid, item_id, norm_code(item.get("codigo_ml", evp.get("codigo_ml", ""))), norm_code(item.get("sku", evp.get("sku", ""))),
+                         clean_text(item.get("descripcion", evp.get("descripcion", ""))), qty, is_reprint, created_at),
+                    )
+                    c.execute(
+                        """
+                        INSERT INTO label_prints
+                        (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+                         block_index, block_key, is_reprint, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'INDIVIDUAL', 'SEPARADOR', NULL, NULL, ?, ?)
+                        """,
+                        (lid, item_id, norm_code(item.get("codigo_ml", evp.get("codigo_ml", ""))), norm_code(item.get("sku", evp.get("sku", ""))),
+                         clean_text(item.get("descripcion", evp.get("descripcion", ""))), LABEL_SEPARATOR_PER_PRODUCT, is_reprint, created_at),
+                    )
+                    restored_label_prints += 1
+            except Exception:
+                # El evento queda en Sheets aunque no se pueda reconstruir localmente por cambios de snapshot.
+                # No bloqueamos el rescate completo del lote.
+                continue
         c.commit()
 
     extra = ""
     if unmatched_scan_count or ambiguous_scan_count:
         extra = f" Atención: {unmatched_scan_count} acopio(s) recuperado(s) desde Sheets y {ambiguous_scan_count} ambiguo(s). Se conservan como scans válidos del mismo lote para trazabilidad."
-    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking.{extra}"
+    return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_label_prints} evento(s) de etiquetas, {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking.{extra}"
 
 def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
     """Envía eventos pendientes a Google Sheets.
@@ -2716,6 +2862,76 @@ def zpl_for_block(block: dict) -> str:
     return "".join(chunks)
 
 
+def zpl_content_hash(zpl_content) -> str:
+    """Huella SHA256 del ZPL generado para trazabilidad sin guardar el archivo completo en Sheets."""
+    if isinstance(zpl_content, bytes):
+        data = zpl_content
+    else:
+        data = clean_text(zpl_content).encode("utf-8")
+    return hashlib.sha256(data).hexdigest() if data else ""
+
+
+def register_zpl_label_event(
+    lote_id: int,
+    print_scope: str,
+    print_kind: str,
+    zpl_content,
+    archivo_nombre: str = "",
+    block_index=None,
+    block_key: str = "",
+    picking_list_id=None,
+    picking_code: str = "",
+    asignado_a: str = "",
+    item_id=None,
+    codigo_ml: str = "",
+    sku: str = "",
+    descripcion: str = "",
+    productos_count: int = 0,
+    cantidad_normal: int = 0,
+    cantidad_separadores: int = 0,
+    cantidad_total: int = 0,
+    usuario: str = "",
+):
+    """Registra un evento único para impresiones ZPL de etiquetas.
+
+    Este evento es la traza recuperable en Sheets para los tres modos:
+    BLOQUE, PICKING e INDIVIDUAL. No guarda producto por producto; guarda el
+    acto de generación/descarga del archivo con zpl_hash y totales.
+    """
+    lote = get_lote(lote_id)
+    now = now_cl().isoformat(timespec="seconds")
+    scope = clean_text(print_scope).upper() or "BLOQUE"
+    kind = clean_text(print_kind).upper() or "NORMAL"
+    enqueue_backup_event("zpl_etiquetas_generado", {
+        "lote_id": int(lote_id),
+        "lote_nombre": clean_text(lote.get("nombre", "")),
+        "archivo": clean_text(lote.get("archivo", "")),
+        "hoja": clean_text(lote.get("hoja", "")),
+        "print_scope": scope,
+        "print_kind": kind,
+        "block_index": clean_text(block_index if block_index is not None else ""),
+        "block_key": clean_text(block_key),
+        "picking_list_id": clean_text(picking_list_id if picking_list_id is not None else ""),
+        "picking_code": clean_text(picking_code),
+        "asignado_a": clean_text(asignado_a),
+        "item_id": clean_text(item_id if item_id is not None else ""),
+        "codigo_ml": norm_code(codigo_ml),
+        "sku": norm_code(sku),
+        "descripcion": clean_text(descripcion),
+        "productos_count": int(productos_count or 0),
+        "cantidad_normal": int(cantidad_normal or 0),
+        "cantidad_separadores": int(cantidad_separadores or 0),
+        "cantidad_total": int(cantidad_total or 0),
+        "zpl_hash": zpl_content_hash(zpl_content),
+        "archivo_nombre": clean_text(archivo_nombre),
+        "usuario": clean_text(usuario) or get_operator_name(),
+        "created_at": now,
+        "tipo": "ETIQUETAS",
+        "modo": scope,
+        "comentario": f"{scope} · {kind} · {clean_text(archivo_nombre)}",
+    })
+
+
 def get_label_block_record(lote_id: int, block_index: int, block_key: str) -> dict:
     with db() as c:
         row = c.execute(
@@ -2779,6 +2995,21 @@ def register_block_download(lote_id: int, block: dict):
             rows,
         )
         c.commit()
+    zpl_content = zpl_for_block(block)
+    register_zpl_label_event(
+        lote_id,
+        print_scope="BLOQUE",
+        print_kind="REIMPRESION" if is_reprint else "NORMAL",
+        zpl_content=zpl_content,
+        archivo_nombre=f"etiquetas_lote_{int(lote_id)}_bloque_{int(block['block_index'])}.zpl",
+        block_index=int(block["block_index"]),
+        block_key=clean_text(block["block_key"]),
+        productos_count=int(block.get("products_count", 0)),
+        cantidad_normal=int(block.get("normal_qty", 0)),
+        cantidad_separadores=int(block.get("separator_qty", 0)),
+        cantidad_total=int(block.get("total_qty", 0)),
+        usuario=get_operator_name(),
+    )
     log_audit_event(lote_id, event_type="ZPL_REIMPRESO" if is_reprint else "ZPL_DESCARGADO", detail=f"Bloque {int(block['block_index'])}", qty=int(block.get("total_qty", 0)), mode="BLOQUE")
 
 
@@ -2812,6 +3043,23 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
             rows,
         )
         c.commit()
+    zpl_content = zpl_for_item_with_separators(item, qty)
+    register_zpl_label_event(
+        lote_id,
+        print_scope="INDIVIDUAL",
+        print_kind="REIMPRESION" if is_reprint else "NORMAL",
+        zpl_content=zpl_content,
+        archivo_nombre=f"etiqueta_lote_{int(lote_id)}_{norm_code(item.get('codigo_ml','')) or norm_code(item.get('sku',''))}.zpl",
+        item_id=int(item.get("id")),
+        codigo_ml=item.get("codigo_ml", ""),
+        sku=item.get("sku", ""),
+        descripcion=item.get("descripcion", ""),
+        productos_count=1,
+        cantidad_normal=int(qty),
+        cantidad_separadores=LABEL_SEPARATOR_PER_PRODUCT,
+        cantidad_total=int(qty) + LABEL_SEPARATOR_PER_PRODUCT,
+        usuario=get_operator_name(),
+    )
     log_audit_event(lote_id, int(item.get("id")), "ZPL_INDIVIDUAL", clean_text(item.get("descripcion", "")), int(qty), item.get("codigo_ml", ""), item.get("sku", ""), "INDIVIDUAL")
 
 
@@ -2909,6 +3157,24 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
         )
         c.commit()
 
+    zpl_content = zpl_for_block(block)
+    register_zpl_label_event(
+        lote_id,
+        print_scope="PICKING",
+        print_kind="REIMPRESION" if is_reprint else "NORMAL",
+        zpl_content=zpl_content,
+        archivo_nombre=f"etiquetas_lote_{int(lote_id)}_{clean_text(block.get('picking_code','PICKING')).replace(' ', '_')}.zpl",
+        block_index=picking_id,
+        block_key=block_key,
+        picking_list_id=picking_id,
+        picking_code=clean_text(block.get("picking_code", "")),
+        asignado_a=clean_text(block.get("asignado_a", "")),
+        productos_count=int(block.get("products_count", 0)),
+        cantidad_normal=int(block.get("normal_qty", 0)),
+        cantidad_separadores=int(block.get("separator_qty", 0)),
+        cantidad_total=int(block.get("total_qty", 0)),
+        usuario=get_operator_name(),
+    )
     event_name = "ZPL_PICKING_REIMPRESO" if is_reprint else "ZPL_PICKING_DESCARGADO"
     detail = f"Lista {clean_text(block.get('picking_code','')) or picking_id} · {int(block.get('products_count',0))} productos"
     log_audit_event(lote_id, event_type=event_name, detail=detail, qty=int(block.get("total_qty", 0)), mode="PICKING")
