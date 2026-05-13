@@ -27,8 +27,10 @@ MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
 PACKS_PATH = DATA_DIR / "packs.xlsx"
 DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
 MAX_BACKUP_ATTEMPTS = 5
-SHEETS_STRICT_MODE = True  # Sheets es fuente única: no ocultar fallas de respaldo.
+SHEETS_STRICT_MODE = False  # Modo SQLite-first: Sheets es espejo/respaldo, no bloquea la operación.
 SCAN_OPERATORS = ["ERICK"]
+_BACKUP_SYNC_RUNNING = False
+_BACKUP_SYNC_LOCK = threading.Lock()
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
@@ -635,8 +637,8 @@ def stop_for_backup_failure(message: str):
     """
     msg = clean_text(message)
     try:
-        st.error("⚠️ Respaldo obligatorio en Sheets falló.")
-        st.warning("No continúes la operación hasta corregir el respaldo. El evento quedó en cola local, pero Sheets no lo confirmó.")
+        st.warning("⚠️ Respaldo Sheets no confirmó.")
+        st.info("La operación local en SQLite queda registrada. Revisa la cola de respaldo y sincroniza cuando sea posible.")
         if msg:
             st.code(msg[:1200])
         st.info("Revisa: Apps Script implementado como Nueva versión, URL webhook definitiva y hoja de errores del Apps Script.")
@@ -645,12 +647,12 @@ def stop_for_backup_failure(message: str):
         raise RuntimeError(msg or "Respaldo obligatorio en Sheets falló")
 
 def enqueue_backup_event(event_type: str, payload: dict):
-    """Registra un evento y exige respaldo inmediato en Google Sheets.
+    """Registra un evento en la cola local de respaldo sin bloquear la operación.
 
-    En este WMS, Sheets es la fuente única recuperable. Por eso no se permite
-    que una acción operativa quede silenciosamente solo en SQLite/Streamlit.
-    Si el webhook falla, el evento queda en cola local y se levanta un error
-    visible para que operación no crea que el respaldo externo quedó OK.
+    Arquitectura SQLite-first:
+    - SQLite es la base operativa inmediata.
+    - Sheets es espejo/auditoría y se sincroniza desde backup_queue.
+    - Ningún operador debe quedar detenido porque Apps Script/Sheets responda lento.
     """
     now = now_cl().isoformat(timespec="seconds")
     payload = attach_event_identity(event_type, payload, now)
@@ -663,28 +665,8 @@ def enqueue_backup_event(event_type: str, payload: dict):
         event_id = int(cur.lastrowid)
         c.commit()
 
-    webhook_url = get_backup_webhook_url()
-    if not webhook_url:
-        stop_for_backup_failure("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
-
-    # Reintentos cortos automáticos: evita frenar la operación por microcortes
-    # o demoras momentáneas de Apps Script/Sheets, sin relajar la regla Sheets-first.
-    last_row = None
-    for attempt_wait in [0, 1, 3]:
-        if attempt_wait:
-            time.sleep(attempt_wait)
-        flush_backup_queue_ids([event_id], webhook_url, include_failed=True)
-        with db() as c:
-            last_row = c.execute("SELECT status, last_error FROM backup_queue WHERE id=?", (event_id,)).fetchone()
-        if last_row and clean_text(last_row["status"]) == "sent":
-            break
-    row = last_row
-    if row is None:
-        with db() as c:
-            row = c.execute("SELECT status, last_error FROM backup_queue WHERE id=?", (event_id,)).fetchone()
-    if not row or clean_text(row["status"]) != "sent":
-        detail = clean_text(row["last_error"] if row else "Evento no encontrado en cola")
-        stop_for_backup_failure(f"Respaldo Sheets obligatorio falló para {event_type}: {detail}")
+    # Sincronización best-effort, no bloqueante. Si falla, el evento queda pendiente.
+    trigger_backup_sync_async(limit=50)
     return event_id
 
 
@@ -737,7 +719,7 @@ def send_webhook_event(url: str, event: dict, timeout: int = 25) -> tuple[bool, 
 
 
 def enqueue_backup_events_batch(events):
-    """Inserta muchos eventos y exige que todos queden enviados a Sheets."""
+    """Inserta muchos eventos en cola local sin esperar a Sheets."""
     if not events:
         return []
     now = now_cl().isoformat(timespec="seconds")
@@ -755,32 +737,8 @@ def enqueue_backup_events_batch(events):
             ids.append(int(cur.lastrowid))
         c.commit()
 
-    url = get_backup_webhook_url()
-    if not url:
-        stop_for_backup_failure("Respaldo Sheets obligatorio: no hay URL de webhook configurada.")
-
-    # Reintentos cortos automáticos para cargas masivas de eventos.
-    # Corta apenas todos los eventos quedan enviados para no frenar la carga de lotes grandes.
-    rows_status = []
-    for attempt_wait in [0, 1, 3]:
-        if attempt_wait:
-            time.sleep(attempt_wait)
-        flush_backup_queue_ids(ids, url, include_failed=True)
-        with db() as c:
-            qmarks = ",".join("?" for _ in ids)
-            rows_status = c.execute(
-                f"SELECT id, event_type, status, last_error FROM backup_queue WHERE id IN ({qmarks})",
-                ids,
-            ).fetchall()
-        if rows_status and all(clean_text(r["status"]) == "sent" for r in rows_status):
-            break
-    failed = [r for r in rows_status if clean_text(r["status"]) != "sent"]
-    if failed:
-        sample = failed[0]
-        stop_for_backup_failure(
-            f"Respaldo Sheets obligatorio falló: {len(failed)} evento(s) sin enviar. "
-            f"Ejemplo {sample['event_type']}: {clean_text(sample['last_error'])}"
-        )
+    # Best-effort en segundo plano; la operación ya quedó en SQLite.
+    trigger_backup_sync_async(limit=max(50, min(500, len(ids))))
     return ids
 
 
@@ -1792,6 +1750,36 @@ def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: 
                 )
                 c.commit()
 
+def _backup_sync_worker(limit: int = 50):
+    global _BACKUP_SYNC_RUNNING
+    try:
+        flush_backup_queue(limit=int(limit), include_failed=False)
+    except Exception:
+        # El error queda registrado por flush_backup_queue en backup_queue.last_error.
+        pass
+    finally:
+        with _BACKUP_SYNC_LOCK:
+            _BACKUP_SYNC_RUNNING = False
+
+
+def trigger_backup_sync_async(limit: int = 50):
+    """Lanza sincronización Sheets en segundo plano sin bloquear al operador."""
+    global _BACKUP_SYNC_RUNNING
+    if not clean_text(get_backup_webhook_url()):
+        return False
+    with _BACKUP_SYNC_LOCK:
+        if _BACKUP_SYNC_RUNNING:
+            return False
+        _BACKUP_SYNC_RUNNING = True
+    try:
+        t = threading.Thread(target=_backup_sync_worker, args=(int(limit),), daemon=True)
+        t.start()
+        return True
+    except Exception:
+        with _BACKUP_SYNC_LOCK:
+            _BACKUP_SYNC_RUNNING = False
+        return False
+
 
 def retry_failed_backups(limit: int = 1000):
     """Reintenta eventos fallidos sin perder su queue_id original."""
@@ -2073,6 +2061,113 @@ def get_unmatched_scan_count(lote_id: int) -> int:
     return int(row["n"] or 0) if row else 0
 
 
+
+def snapshot_items_from_sqlite(lote_id: int) -> list[dict]:
+    """Devuelve snapshot completo del lote desde SQLite.
+
+    Este snapshot es el seguro de restauración: Sheets copia SQLite, no gobierna la operación.
+    """
+    df_items = get_items(int(lote_id))
+    out = []
+    if df_items.empty:
+        return out
+    for r in df_items.itertuples(index=False):
+        out.append({
+            "item_id": int(r.id),
+            "area": clean_text(getattr(r, "area", "")),
+            "nro": clean_text(getattr(r, "nro", "")),
+            "codigo_ml": norm_code(getattr(r, "codigo_ml", "")),
+            "codigo_universal": norm_code(getattr(r, "codigo_universal", "")),
+            "sku": norm_code(getattr(r, "sku", "")),
+            "descripcion": clean_text(getattr(r, "descripcion", "")),
+            "descripcion_kame": clean_text(getattr(r, "descripcion_kame", "")) or clean_text(getattr(r, "descripcion", "")),
+            "descripcion_ml": clean_text(getattr(r, "descripcion_ml", "")) or clean_text(getattr(r, "descripcion", "")),
+            "descripcion_fuente": clean_text(getattr(r, "descripcion_fuente", "")),
+            "familia_kame": clean_text(getattr(r, "familia_kame", "")),
+            "maestro_match_status": clean_text(getattr(r, "maestro_match_status", "")),
+            "unidades": int(getattr(r, "unidades", 0) or 0),
+            "identificacion": clean_text(getattr(r, "identificacion", "")),
+            "vence": clean_text(getattr(r, "vence", "")),
+            "instrucciones": clean_text(getattr(r, "instrucciones", "")),
+            "dia": clean_text(getattr(r, "dia", "")),
+            "hora": clean_text(getattr(r, "hora", "")),
+            "item_created_at": clean_text(getattr(r, "created_at", "")),
+            "item_updated_at": clean_text(getattr(r, "updated_at", "")),
+        })
+    return out
+
+
+def queue_lote_snapshot_from_sqlite(lote_id: int, motivo: str = "AUTO", usuario: str = "SISTEMA", chunk_size: int = 50, force: bool = False):
+    """Encola snapshot completo del lote local hacia Sheets.
+
+    No bloquea la operación. Sirve para restaurar el FULL completo aunque algunos
+    eventos individuales queden pendientes o fallen temporalmente.
+    """
+    lid = int(lote_id)
+    now = now_cl().isoformat(timespec="seconds")
+    items = snapshot_items_from_sqlite(lid)
+    if not items:
+        return []
+    lote_payload = build_lote_payload(lid)
+    total_productos = len(items)
+    total_unidades = int(sum(int(x.get("unidades") or 0) for x in items))
+    snapshot_hash = hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    if not force:
+        try:
+            with db() as c:
+                row = c.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM backup_queue
+                    WHERE event_type='lote_snapshot_completo'
+                      AND payload_json LIKE ?
+                    """,
+                    (f"%{snapshot_hash}%",),
+                ).fetchone()
+            if row and int(row["n"] or 0) > 0:
+                return []
+        except Exception:
+            pass
+    chunk_size = max(10, int(chunk_size or 50))
+    chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+    events = []
+    for idx, chunk in enumerate(chunks, start=1):
+        events.append(("lote_snapshot_chunk", {
+            **lote_payload,
+            "created_at": now,
+            "motivo_snapshot": clean_text(motivo) or "AUTO",
+            "usuario": clean_text(usuario) or "SISTEMA",
+            "chunk_index": idx,
+            "chunk_total": len(chunks),
+            "productos_total": total_productos,
+            "unidades_total": total_unidades,
+            "snapshot_hash": snapshot_hash,
+            "items": chunk,
+        }))
+    events.append(("lote_snapshot_completo", {
+        **lote_payload,
+        "created_at": now,
+        "motivo_snapshot": clean_text(motivo) or "AUTO",
+        "usuario": clean_text(usuario) or "SISTEMA",
+        "productos_total": total_productos,
+        "unidades_total": total_unidades,
+        "chunk_total": len(chunks),
+        "snapshot_hash": snapshot_hash,
+    }))
+    return enqueue_backup_events_batch(events)
+
+
+def ensure_active_lote_snapshot_queued(lote_id: int):
+    """Encola automáticamente el snapshot del lote activo una sola vez por hash.
+
+    Esto blinda restauración desde Sheets sin bloquear al operador ni duplicar snapshots en cada rerun.
+    """
+    try:
+        return queue_lote_snapshot_from_sqlite(int(lote_id), motivo="AUTO_ACTIVE_LOTE", usuario="SISTEMA", force=False)
+    except Exception:
+        return []
+
+
 def create_lote(nombre, archivo, hoja, df):
     now = now_cl().isoformat(timespec="seconds")
     with db() as c:
@@ -2116,229 +2211,34 @@ def create_lote(nombre, archivo, hoja, df):
              identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
-        check = c.execute(
-            "SELECT COUNT(*) AS lineas, COALESCE(SUM(unidades),0) AS unidades FROM items WHERE lote_id=?",
-            (int(lote_id),),
-        ).fetchone()
-        expected_lines = int(len(df))
-        expected_units = int(df["unidades"].sum()) if "unidades" in df.columns else 0
-        inserted_lines = int(check["lineas"] or 0) if check else 0
-        inserted_units = int(check["unidades"] or 0) if check else 0
-        if inserted_lines != expected_lines or inserted_units != expected_units:
-            c.rollback()
-            raise RuntimeError(
-                f"Carga bloqueada por integridad: Excel={expected_lines} líneas/{expected_units} unidades, "
-                f"SQLite={inserted_lines} líneas/{inserted_units} unidades. No se creó el lote."
-            )
         c.commit()
 
     lote_payload = build_lote_payload(lote_id)
     inserted = get_items(lote_id)
 
-    snapshot_items = []
-    for r in inserted.itertuples(index=False):
-        snapshot_items.append({
-            "item_id": int(r.id),
-            "area": clean_text(r.area),
-            "nro": clean_text(r.nro),
-            "codigo_ml": norm_code(r.codigo_ml),
-            "codigo_universal": norm_code(r.codigo_universal),
-            "sku": norm_code(r.sku),
-            "descripcion": clean_text(r.descripcion),
-            "descripcion_kame": clean_text(getattr(r, "descripcion_kame", "")) or clean_text(r.descripcion),
-            "descripcion_ml": clean_text(getattr(r, "descripcion_ml", "")) or clean_text(r.descripcion),
-            "descripcion_fuente": clean_text(getattr(r, "descripcion_fuente", "")),
-            "familia_kame": clean_text(getattr(r, "familia_kame", "")),
-            "maestro_match_status": clean_text(getattr(r, "maestro_match_status", "")),
-            "unidades": int(r.unidades),
-            "identificacion": clean_text(r.identificacion),
-            "vence": clean_text(getattr(r, "vence", "")),
-            "instrucciones": clean_text(getattr(r, "instrucciones", "")),
-            "dia": clean_text(getattr(r, "dia", "")),
-            "hora": clean_text(r.hora),
-            "item_created_at": clean_text(r.created_at),
-            "item_updated_at": clean_text(r.updated_at),
-        })
-
-    events = [("lote_creado", {
-        **lote_payload,
-        "created_at": now,
-        "total_lineas": int(len(df)),
-        "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
-        "snapshot_mode": "lote_item+lote_snapshot_chunk",
-        "snapshot_count": int(len(snapshot_items)),
-    })]
-
-    # Respaldo redundante del snapshot completo por chunks.
-    # Si por cualquier razón faltan filas lote_item individuales en Sheets, este evento permite restaurar TODO el lote.
-    chunk_size = 80
-    chunk_count = max(1, (len(snapshot_items) + chunk_size - 1) // chunk_size)
-    for idx in range(chunk_count):
-        chunk = snapshot_items[idx * chunk_size:(idx + 1) * chunk_size]
-        events.append(("lote_snapshot_chunk", {
-            **lote_payload,
-            "created_at": now,
-            "chunk_index": idx + 1,
-            "chunk_count": chunk_count,
-            "items_count": len(chunk),
-            "items": chunk,
-        }))
-
-    # Respaldo de snapshot producto a producto.
-    # Esto mantiene auditoría legible; el chunk de arriba es el seguro de integridad.
-    for item in snapshot_items:
-        events.append(("lote_item", {
-            **lote_payload,
-            "created_at": now,
-            **item,
-        }))
-
-    enqueue_backup_events_batch(events)
-    flush_backup_queue(limit=max(1000, len(events) + 10))
-    log_audit_event(lote_id, event_type="LOTE_CREADO", detail=f"Lote creado desde {archivo} / {hoja}", qty=int(df["unidades"].sum()) if "unidades" in df.columns else 0)
-    return lote_id
-
-
-def lote_integrity_against_df(lote_id: int, df: pd.DataFrame) -> dict:
-    """Compara un lote local contra un Excel FULL por Código ML.
-
-    No modifica datos. Se usa para detectar carga parcial antes de que afecte picking/escaneo.
-    """
-    df_check = apply_kame_description_fields(df.copy()) if isinstance(df, pd.DataFrame) else pd.DataFrame()
-    if df_check.empty:
-        return {"ok": False, "expected_lines": 0, "existing_lines": 0, "missing_count": 0, "missing_df": pd.DataFrame(), "message": "Excel sin productos válidos."}
-    df_check = df_check.copy()
-    df_check["codigo_ml"] = df_check["codigo_ml"].map(norm_code)
-    df_check["sku"] = df_check["sku"].map(norm_code)
-    df_check = df_check[df_check["codigo_ml"].astype(str).str.strip().ne("")].reset_index(drop=True)
-    with db() as c:
-        existing = pd.read_sql_query(
-            "SELECT id, codigo_ml, codigo_universal, sku, descripcion, unidades FROM items WHERE lote_id=?",
-            c,
-            params=(int(lote_id),),
+    expected_productos = int(len(df))
+    expected_unidades = int(pd.to_numeric(df["unidades"], errors="coerce").fillna(0).sum()) if "unidades" in df.columns else 0
+    local_productos = int(len(inserted))
+    local_unidades = int(pd.to_numeric(inserted["unidades"], errors="coerce").fillna(0).sum()) if not inserted.empty else 0
+    if local_productos != expected_productos or local_unidades != expected_unidades:
+        raise RuntimeError(
+            f"Carga local incompleta. Excel={expected_productos} productos/{expected_unidades} unidades; "
+            f"SQLite={local_productos} productos/{local_unidades} unidades. No se habilita el lote."
         )
-    if existing.empty:
-        existing_codes = set()
-    else:
-        existing["codigo_ml"] = existing["codigo_ml"].map(norm_code)
-        existing_codes = set(existing["codigo_ml"].dropna().astype(str))
-    missing = df_check[~df_check["codigo_ml"].isin(existing_codes)].copy()
-    return {
-        "ok": missing.empty and len(existing_codes) >= len(df_check),
-        "expected_lines": int(len(df_check)),
-        "expected_units": int(df_check["unidades"].map(to_int).sum()) if "unidades" in df_check.columns else 0,
-        "existing_lines": int(len(existing_codes)),
-        "missing_count": int(len(missing)),
-        "missing_units": int(missing["unidades"].map(to_int).sum()) if not missing.empty and "unidades" in missing.columns else 0,
-        "missing_df": missing,
-        "message": f"Esperadas {len(df_check)} líneas; en lote local hay {len(existing_codes)} códigos ML; faltan {len(missing)}.",
-    }
 
-
-def repair_lote_missing_items_from_df(lote_id: int, df: pd.DataFrame, archivo: str = "", hoja: str = "", usuario: str = "SISTEMA") -> tuple[bool, str]:
-    """Agrega al lote activo productos que existen en el Excel FULL pero no están en items.
-
-    Es una reparación quirúrgica: no toca scans, picking, etiquetas ni productos existentes.
-    Los productos agregados quedan respaldados como lote_item y auditados en Sheets.
-    """
-    integ = lote_integrity_against_df(lote_id, df)
-    missing = integ.get("missing_df", pd.DataFrame())
-    if missing is None or missing.empty:
-        return True, f"Sin faltantes. {integ.get('message','')}"
-
-    now = now_cl().isoformat(timespec="seconds")
-    inserted_items = []
-    with db() as c:
-        for r in missing.itertuples(index=False):
-            desc_kame = clean_text(getattr(r, "descripcion_kame", "")) or clean_text(getattr(r, "descripcion", ""))
-            desc_ml = clean_text(getattr(r, "descripcion_ml", "")) or desc_kame
-            cur = c.execute(
-                """
-                INSERT INTO items
-                (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
-                 descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
-                 identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'REPARACION_EXCEL', ?)
-                """,
-                (
-                    int(lote_id),
-                    clean_text(getattr(r, "area", "")),
-                    clean_text(getattr(r, "nro", "")),
-                    norm_code(getattr(r, "codigo_ml", "")),
-                    norm_code(getattr(r, "codigo_universal", "")),
-                    norm_code(getattr(r, "sku", "")),
-                    desc_kame,
-                    desc_kame,
-                    desc_ml,
-                    clean_text(getattr(r, "descripcion_fuente", "")) or ("KAME" if desc_kame and desc_kame != desc_ml else "ML_FALLBACK"),
-                    clean_text(getattr(r, "familia_kame", "")),
-                    clean_text(getattr(r, "maestro_match_status", "")),
-                    int(to_int(getattr(r, "unidades", 0))),
-                    clean_text(getattr(r, "identificacion", "")),
-                    clean_text(getattr(r, "vence", "")),
-                    clean_text(getattr(r, "instrucciones", "")),
-                    clean_text(getattr(r, "dia", "")),
-                    clean_text(getattr(r, "hora", "")),
-                    now,
-                    now,
-                    f"Agregado desde reparación de integridad con Excel {clean_text(archivo)} / {clean_text(hoja)}",
-                ),
-            )
-            item_id = int(cur.lastrowid)
-            inserted_items.append({
-                "item_id": item_id,
-                "area": clean_text(getattr(r, "area", "")),
-                "nro": clean_text(getattr(r, "nro", "")),
-                "codigo_ml": norm_code(getattr(r, "codigo_ml", "")),
-                "codigo_universal": norm_code(getattr(r, "codigo_universal", "")),
-                "sku": norm_code(getattr(r, "sku", "")),
-                "descripcion": desc_kame,
-                "descripcion_kame": desc_kame,
-                "descripcion_ml": desc_ml,
-                "descripcion_fuente": clean_text(getattr(r, "descripcion_fuente", "")),
-                "familia_kame": clean_text(getattr(r, "familia_kame", "")),
-                "maestro_match_status": clean_text(getattr(r, "maestro_match_status", "")),
-                "unidades": int(to_int(getattr(r, "unidades", 0))),
-                "identificacion": clean_text(getattr(r, "identificacion", "")),
-                "vence": clean_text(getattr(r, "vence", "")),
-                "instrucciones": clean_text(getattr(r, "instrucciones", "")),
-                "dia": clean_text(getattr(r, "dia", "")),
-                "hora": clean_text(getattr(r, "hora", "")),
-                "item_created_at": now,
-                "item_updated_at": now,
-                "repair_source": "REPARACION_EXCEL_FALTANTES",
-            })
-        c.commit()
-
-    lote_payload = build_lote_payload(int(lote_id))
-    events = []
-    for item in inserted_items:
-        events.append(("lote_item", {
-            **lote_payload,
-            "created_at": now,
-            "repair_source": "REPARACION_EXCEL_FALTANTES",
-            "archivo_reparacion": clean_text(archivo),
-            "hoja_reparacion": clean_text(hoja),
-            **item,
-        }))
-    events.append(("lote_snapshot_chunk", {
+    # SQLite ya quedó validado. Sheets se sincroniza como espejo, no bloquea operación.
+    enqueue_backup_event("lote_creado", {
         **lote_payload,
         "created_at": now,
-        "chunk_index": 1,
-        "chunk_count": 1,
-        "items_count": len(inserted_items),
-        "repair_source": "REPARACION_EXCEL_FALTANTES",
-        "items": inserted_items,
-    }))
-    enqueue_backup_events_batch(events)
-    log_audit_event(
-        int(lote_id),
-        event_type="REPARACION_LOTE_FALTANTES",
-        detail=f"Se agregaron {len(inserted_items)} producto(s) faltantes desde Excel {clean_text(archivo)} / {clean_text(hoja)}",
-        qty=sum(int(x.get("unidades", 0)) for x in inserted_items),
-        mode=clean_text(usuario) or "SISTEMA",
-    )
-    return True, f"Reparación aplicada: se agregaron {len(inserted_items)} producto(s) faltantes y {sum(int(x.get('unidades',0)) for x in inserted_items)} unidades."
+        "total_lineas": expected_productos,
+        "total_unidades": expected_unidades,
+        "snapshot_mode": "sqlite_snapshot_chunks",
+        "sqlite_productos": local_productos,
+        "sqlite_unidades": local_unidades,
+    })
+    queue_lote_snapshot_from_sqlite(lote_id, motivo="LOTE_CREADO", usuario="SISTEMA")
+    log_audit_event(lote_id, event_type="LOTE_CREADO", detail=f"Lote creado desde {archivo} / {hoja}. SQLite OK: {local_productos} productos / {local_unidades} unidades", qty=expected_unidades)
+    return lote_id
 
 def delete_lote(lote_id):
     lote_payload = build_lote_payload(lote_id)
@@ -7769,19 +7669,30 @@ with st.sidebar:
     else:
         options = {f"{r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}": int(r.id) for r in lotes.itertuples(index=False)}
         active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
+        # Snapshot automático del lote activo hacia Sheets, sin esperar respuesta.
+        ensure_active_lote_snapshot_queued(active_lote)
+        with st.expander("Respaldo SQLite → Sheets", expanded=False):
+            st.caption("La operación usa SQLite. Sheets copia el snapshot y eventos desde la cola local.")
+            if st.button("Encolar snapshot completo del lote activo"):
+                ids_snap = queue_lote_snapshot_from_sqlite(active_lote, motivo="MANUAL_SNAPSHOT", usuario="ADMIN", force=True)
+                st.success(f"Snapshot encolado: {len(ids_snap)} evento(s).")
+                st.rerun()
 
     st.divider()
     bs = backup_status()
     pending_backup = int(bs.get("pending") or 0)
+    # Intento de sincronización automático y no bloqueante.
+    if pending_backup:
+        trigger_backup_sync_async(limit=100)
     failed_backup = int(bs.get("failed") or 0)
     sent_backup = int(bs.get("sent") or 0)
     if failed_backup:
-        st.error(f"Respaldo externo: {failed_backup} eventos fallidos")
+        st.warning(f"Respaldo Sheets: {failed_backup} eventos fallidos")
         if st.button("Reintentar fallidos"):
             retry_failed_backups(limit=1000)
             st.rerun()
     if pending_backup:
-        st.warning(f"Respaldo externo: {pending_backup} eventos pendientes")
+        st.info(f"Respaldo Sheets pendiente: {pending_backup} eventos en cola")
         if bs.get("last_error"):
             st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
         with st.expander("Últimos errores respaldo", expanded=False):
@@ -7790,11 +7701,11 @@ with st.sidebar:
                 st.caption("Sin errores registrados.")
             else:
                 st.dataframe(err_df, use_container_width=True, hide_index=True, height=220)
-        if st.button("Reintentar respaldo"):
+        if st.button("Sincronizar respaldo Sheets ahora"):
             flush_backup_queue(limit=1000)
             st.rerun()
     else:
-        st.success(f"Respaldo externo activo · enviados: {sent_backup}")
+        st.success(f"SQLite operativo · Sheets sincronizado · enviados: {sent_backup}")
     if bs.get("last_sent"):
         st.caption(f"Último respaldo: {fmt_dt(bs.get('last_sent'))}")
     if st.session_state.get("_auto_restore_msg"):
@@ -7812,51 +7723,6 @@ with st.sidebar:
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
-
-    with st.expander("🛠️ Reparar / verificar integridad de lote activo desde Excel", expanded=False):
-        st.warning("Usa esto solo si un lote activo quedó incompleto. No modifica escaneos, picking ni etiquetas: solo agrega productos que estén en el Excel y falten en el lote.")
-        if not active_lote:
-            st.info("Selecciona un lote activo en el menú lateral.")
-        else:
-            repair_file = st.file_uploader("Excel FULL para comparar contra el lote activo", type=["xlsx"], key="repair_lote_excel_upload")
-            if repair_file:
-                try:
-                    repair_names = sheet_names(repair_file)
-                    repair_default_idx = len(repair_names) - 1 if repair_names else 0
-                    repair_sheet = st.selectbox("Hoja del Excel de reparación", repair_names, index=repair_default_idx, key="repair_lote_sheet")
-                    repair_df, repair_warns = read_full_excel_sheet(repair_file, repair_sheet)
-                    for w in repair_warns:
-                        st.caption(w)
-                    integ = lote_integrity_against_df(active_lote, repair_df)
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Excel", int(integ.get("expected_lines", 0)))
-                    c2.metric("En lote local", int(integ.get("existing_lines", 0)))
-                    c3.metric("Faltantes", int(integ.get("missing_count", 0)))
-                    c4.metric("Unidades faltantes", int(integ.get("missing_units", 0)))
-                    missing_df = integ.get("missing_df", pd.DataFrame())
-                    if missing_df is not None and not missing_df.empty:
-                        st.error("El lote activo está incompleto frente al Excel seleccionado.")
-                        cols_show = [c for c in ["area", "nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_ml", "unidades", "identificacion"] if c in missing_df.columns]
-                        st.dataframe(missing_df[cols_show].head(120), use_container_width=True, hide_index=True, height=320)
-                        st.download_button(
-                            "Descargar CSV de faltantes",
-                            data=missing_df[cols_show].to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"faltantes_lote_{active_lote}.csv",
-                            mime="text/csv",
-                        )
-                        confirm_repair = st.checkbox("Confirmo que quiero agregar estos productos faltantes al lote activo", key="confirm_repair_lote_missing")
-                        if st.button("Agregar faltantes al lote activo", type="primary", disabled=not confirm_repair):
-                            ok_rep, msg_rep = repair_lote_missing_items_from_df(active_lote, repair_df, repair_file.name, repair_sheet, usuario=get_operator_name())
-                            if ok_rep:
-                                st.success(msg_rep)
-                                st.rerun()
-                            else:
-                                st.error(msg_rep)
-                    else:
-                        st.success("Integridad OK: no hay productos faltantes contra este Excel.")
-                except Exception as e:
-                    st.error(f"No pude verificar/reparar con este Excel: {e}")
-
     modo_carga = st.radio(
         "Origen del lote",
         ["Excel depurado", "PDF Mercado Libre"],
@@ -7882,8 +7748,6 @@ if page == "Cargar lote FULL":
                     c2.metric("Líneas", len(df))
                     c3.metric("Unidades", int(df["unidades"].sum()))
                     c4.metric("SKUs únicos", int(df["sku"].nunique()))
-                    if len(df) <= 0 or int(df["unidades"].sum()) <= 0:
-                        st.error("Integridad bloqueada: no hay productos/unidades válidas para crear lote.")
                     with st.expander("Revisión rápida de columnas leídas", expanded=True):
                         preview_cols_excel = ["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]
                         if "instrucciones" in df.columns and df["instrucciones"].astype(str).str.strip().ne("").any():
