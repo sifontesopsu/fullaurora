@@ -463,6 +463,12 @@ def init_db():
         ensure_column(c, "items", "instrucciones", "TEXT")
         ensure_column(c, "items", "fuente_rescate", "TEXT")
         ensure_column(c, "items", "rescue_note", "TEXT")
+        # Descripciones separadas: Kame para operación; ML para etiquetas.
+        ensure_column(c, "items", "descripcion_kame", "TEXT")
+        ensure_column(c, "items", "descripcion_ml", "TEXT")
+        ensure_column(c, "items", "descripcion_fuente", "TEXT")
+        ensure_column(c, "items", "familia_kame", "TEXT")
+        ensure_column(c, "items", "maestro_match_status", "TEXT")
         # Incidencias por código: se conserva lote_id para control/cierre, pero el operador registra por ML/EAN/SKU.
         ensure_column(c, "incidencias", "codigo_ml", "TEXT")
         ensure_column(c, "incidencias", "codigo_universal", "TEXT")
@@ -482,6 +488,10 @@ def init_db():
         ensure_column(c, "scans", "codigo_universal", "TEXT")
         ensure_column(c, "scans", "sku", "TEXT")
         ensure_column(c, "scans", "descripcion", "TEXT")
+        ensure_column(c, "scans", "descripcion_kame", "TEXT")
+        ensure_column(c, "scans", "descripcion_ml", "TEXT")
+        ensure_column(c, "scans", "familia_kame", "TEXT")
+        ensure_column(c, "scans", "maestro_match_status", "TEXT")
         ensure_column(c, "scans", "restore_match_status", "TEXT")
 
         # Confirmaciones externas de avisos operacionales: ML y Kame se pueden marcar después de crear el aviso.
@@ -504,6 +514,15 @@ def init_db():
         ensure_column(c, "postventa_full_errores", "anulado_at", "TEXT")
         ensure_column(c, "postventa_full_errores", "anulado_by", "TEXT")
         ensure_column(c, "postventa_full_errores", "anulado_motivo", "TEXT")
+        ensure_column(c, "picking_list_items", "descripcion_kame", "TEXT")
+        ensure_column(c, "picking_list_items", "descripcion_ml", "TEXT")
+        ensure_column(c, "picking_list_items", "familia_kame", "TEXT")
+        ensure_column(c, "picking_list_items", "maestro_match_status", "TEXT")
+        ensure_column(c, "postventa_full_errores", "descripcion_kame", "TEXT")
+        ensure_column(c, "postventa_full_errores", "descripcion_ml", "TEXT")
+        ensure_column(c, "postventa_full_errores", "familia_kame", "TEXT")
+        ensure_column(c, "label_prints", "descripcion_kame", "TEXT")
+        ensure_column(c, "label_prints", "descripcion_ml", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
@@ -898,7 +917,12 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
                 "codigo_universal": norm_code(ev.get("codigo_universal", "")),
                 "sku": norm_code(ev.get("sku", "")),
-                "descripcion": clean_text(ev.get("descripcion", "")),
+                "descripcion": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_kame": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_ml": clean_text(ev.get("descripcion_ml", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_fuente": clean_text(ev.get("descripcion_fuente", "")),
+                "familia_kame": clean_text(ev.get("familia_kame", "")),
+                "maestro_match_status": clean_text(ev.get("maestro_match_status", "")),
                 "unidades": to_int(ev.get("unidades", 0)),
                 "acopiadas": 0,
                 "identificacion": clean_text(ev.get("identificacion", "")),
@@ -936,7 +960,12 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     "codigo_ml": norm_code(item_ev.get("codigo_ml", "")),
                     "codigo_universal": norm_code(item_ev.get("codigo_universal", "")),
                     "sku": norm_code(item_ev.get("sku", "")),
-                    "descripcion": clean_text(item_ev.get("descripcion", "")),
+                    "descripcion": clean_text(item_ev.get("descripcion_kame", "")) or clean_text(item_ev.get("descripcion", "")),
+                    "descripcion_kame": clean_text(item_ev.get("descripcion_kame", "")) or clean_text(item_ev.get("descripcion", "")),
+                    "descripcion_ml": clean_text(item_ev.get("descripcion_ml", "")) or clean_text(item_ev.get("descripcion", "")),
+                    "descripcion_fuente": clean_text(item_ev.get("descripcion_fuente", "")),
+                    "familia_kame": clean_text(item_ev.get("familia_kame", "")),
+                    "maestro_match_status": clean_text(item_ev.get("maestro_match_status", "")),
                     "unidades": to_int(item_ev.get("unidades", 0)),
                     "acopiadas": 0,
                     "identificacion": clean_text(item_ev.get("identificacion", "")),
@@ -982,7 +1011,11 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
                 "codigo_universal": norm_code(ev.get("codigo_universal", "")),
                 "sku": norm_code(ev.get("sku", "")),
-                "descripcion": clean_text(ev.get("descripcion", "")),
+                "descripcion": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_kame": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_ml": clean_text(ev.get("descripcion_ml", "")) or clean_text(ev.get("descripcion", "")),
+                "familia_kame": clean_text(ev.get("familia_kame", "")),
+                "maestro_match_status": clean_text(ev.get("maestro_match_status", "")),
                 "restore_match_status": "PENDING",
             })
         elif et == "scan_deshacer":
@@ -1329,11 +1362,15 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 c.execute(
                     """
                     INSERT OR REPLACE INTO items
-                    (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
+                    (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+                     descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
                      identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item.get("instrucciones", ""), item["dia"], item["hora"], item["created_at"], item["updated_at"]),
+                    (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"],
+                     item["descripcion"], item.get("descripcion_kame", item["descripcion"]), item.get("descripcion_ml", item["descripcion"]),
+                     item.get("descripcion_fuente", ""), item.get("familia_kame", ""), item.get("maestro_match_status", ""),
+                     item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item.get("instrucciones", ""), item["dia"], item["hora"], item["created_at"], item["updated_at"]),
                 )
                 restored_items += 1
         for sr in resolved_scan_rows:
@@ -1345,8 +1382,8 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     INSERT INTO scans
                     (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
                      operador_validador, picking_list_id, picking_code, picker_asignado,
-                     original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     original_item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status, restore_match_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         lote_id, int(sr.get("item_id") or 0), norm_code(sr.get("scan_primario", "")), norm_code(sr.get("scan_secundario", "")),
@@ -1355,7 +1392,9 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                         sr.get("picking_list_id"), clean_text(sr.get("picking_code", "")), clean_text(sr.get("picker_asignado", "")),
                         to_int(sr.get("original_item_id", 0)) or None,
                         norm_code(sr.get("codigo_ml", "")), norm_code(sr.get("codigo_universal", "")), norm_code(sr.get("sku", "")),
-                        clean_text(sr.get("descripcion", "")), clean_text(sr.get("restore_match_status", "")),
+                        clean_text(sr.get("descripcion", "")), clean_text(sr.get("descripcion_kame", sr.get("descripcion", ""))),
+                        clean_text(sr.get("descripcion_ml", sr.get("descripcion", ""))), clean_text(sr.get("familia_kame", "")),
+                        clean_text(sr.get("maestro_match_status", "")), clean_text(sr.get("restore_match_status", "")),
                     ),
                 )
                 restored_scans += 1
@@ -1495,11 +1534,16 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     c.execute(
                         """
                         INSERT INTO picking_list_items
-                        (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                        (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status,
                          cantidad, area, nro, estado, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
                         """,
-                        (list_id_db, plist["lote_id"], item_id, norm_code(pit.get("codigo_ml", "")), norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion", "")), to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")), plist["created_at"]),
+                        (list_id_db, plist["lote_id"], item_id, norm_code(pit.get("codigo_ml", "")), norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")),
+                         clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")),
+                         clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")),
+                         clean_text(pit.get("descripcion_ml", "")) or clean_text(pit.get("descripcion", "")),
+                         clean_text(pit.get("familia_kame", "")), clean_text(pit.get("maestro_match_status", "")),
+                         to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")), plist["created_at"]),
                     )
                 restored_picking += 1
 
@@ -1546,7 +1590,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                             VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'NORMAL', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), block_index, block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), int(item.get("unidades", 0)), block_index, block_key, is_reprint, created_at),
                         )
                         c.execute(
                             """
@@ -1556,7 +1600,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                             VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'SEPARADOR', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, block_index, block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, block_index, block_key, is_reprint, created_at),
                         )
                     restored_label_prints += 1
                 elif scope == "PICKING":
@@ -1578,7 +1622,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                             VALUES (?, ?, ?, ?, ?, ?, 'PICKING', 'NORMAL', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("item_id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             clean_text(item.get("descripcion", "")), to_int(item.get("cantidad", 0)), picking_id, block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), to_int(item.get("cantidad", 0)), picking_id, block_key, is_reprint, created_at),
                         )
                         c.execute(
                             """
@@ -1588,7 +1632,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                             VALUES (?, ?, ?, ?, ?, ?, 'PICKING', 'SEPARADOR', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("item_id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, picking_id, block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, picking_id, block_key, is_reprint, created_at),
                         )
                     restored_label_prints += 1
                 elif scope == "INDIVIDUAL":
@@ -1606,7 +1650,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                         VALUES (?, ?, ?, ?, ?, ?, 'INDIVIDUAL', 'NORMAL', NULL, NULL, ?, ?)
                         """,
                         (lid, item_id, norm_code(item.get("codigo_ml", evp.get("codigo_ml", ""))), norm_code(item.get("sku", evp.get("sku", ""))),
-                         clean_text(item.get("descripcion", evp.get("descripcion", ""))), qty, is_reprint, created_at),
+                         descripcion_etiqueta_value(item) or clean_text(evp.get("descripcion", "")), qty, is_reprint, created_at),
                     )
                     c.execute(
                         """
@@ -1616,7 +1660,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                         VALUES (?, ?, ?, ?, ?, ?, 'INDIVIDUAL', 'SEPARADOR', NULL, NULL, ?, ?)
                         """,
                         (lid, item_id, norm_code(item.get("codigo_ml", evp.get("codigo_ml", ""))), norm_code(item.get("sku", evp.get("sku", ""))),
-                         clean_text(item.get("descripcion", evp.get("descripcion", ""))), LABEL_SEPARATOR_PER_PRODUCT, is_reprint, created_at),
+                         descripcion_etiqueta_value(item) or clean_text(evp.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, is_reprint, created_at),
                     )
                     restored_label_prints += 1
             except Exception:
@@ -1937,7 +1981,7 @@ def get_scans_deduped(lote_id: int, limit: int | None = None) -> pd.DataFrame:
     sql = """
         SELECT id, lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
                operador_validador, picking_list_id, picking_code, picker_asignado,
-               original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status
+               original_item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status, restore_match_status
         FROM scans
         WHERE lote_id=?
         ORDER BY id DESC
@@ -1951,7 +1995,7 @@ def get_scans_deduped(lote_id: int, limit: int | None = None) -> pd.DataFrame:
         return df
 
     out = df.copy()
-    for col in ["created_at", "scan_primario", "scan_secundario", "modo", "operador_validador", "picking_code", "picker_asignado", "codigo_ml", "codigo_universal", "sku", "descripcion", "restore_match_status"]:
+    for col in ["created_at", "scan_primario", "scan_secundario", "modo", "operador_validador", "picking_code", "picker_asignado", "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_kame", "descripcion_ml", "familia_kame", "maestro_match_status", "restore_match_status"]:
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].map(clean_text)
@@ -2037,8 +2081,11 @@ def create_lote(nombre, archivo, hoja, df):
             (nombre, archivo, hoja, now),
         )
         lote_id = cur.lastrowid
+        df = apply_kame_description_fields(df)
         rows = []
         for r in df.itertuples(index=False):
+            desc_kame = clean_text(getattr(r, "descripcion_kame", "")) or clean_text(getattr(r, "descripcion", ""))
+            desc_ml = clean_text(getattr(r, "descripcion_ml", "")) or desc_kame
             rows.append((
                 lote_id,
                 clean_text(r.area),
@@ -2046,7 +2093,12 @@ def create_lote(nombre, archivo, hoja, df):
                 norm_code(r.codigo_ml),
                 norm_code(r.codigo_universal),
                 norm_code(r.sku),
-                clean_text(r.descripcion),
+                desc_kame,
+                desc_kame,
+                desc_ml,
+                clean_text(getattr(r, "descripcion_fuente", "")) or ("KAME" if desc_kame and desc_kame != desc_ml else "ML_FALLBACK"),
+                clean_text(getattr(r, "familia_kame", "")),
+                clean_text(getattr(r, "maestro_match_status", "")),
                 int(r.unidades),
                 0,
                 clean_text(r.identificacion),
@@ -2059,10 +2111,25 @@ def create_lote(nombre, archivo, hoja, df):
             ))
         c.executemany("""
             INSERT INTO items
-            (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
+            (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+             descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
              identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
+        check = c.execute(
+            "SELECT COUNT(*) AS lineas, COALESCE(SUM(unidades),0) AS unidades FROM items WHERE lote_id=?",
+            (int(lote_id),),
+        ).fetchone()
+        expected_lines = int(len(df))
+        expected_units = int(df["unidades"].sum()) if "unidades" in df.columns else 0
+        inserted_lines = int(check["lineas"] or 0) if check else 0
+        inserted_units = int(check["unidades"] or 0) if check else 0
+        if inserted_lines != expected_lines or inserted_units != expected_units:
+            c.rollback()
+            raise RuntimeError(
+                f"Carga bloqueada por integridad: Excel={expected_lines} líneas/{expected_units} unidades, "
+                f"SQLite={inserted_lines} líneas/{inserted_units} unidades. No se creó el lote."
+            )
         c.commit()
 
     lote_payload = build_lote_payload(lote_id)
@@ -2078,6 +2145,11 @@ def create_lote(nombre, archivo, hoja, df):
             "codigo_universal": norm_code(r.codigo_universal),
             "sku": norm_code(r.sku),
             "descripcion": clean_text(r.descripcion),
+            "descripcion_kame": clean_text(getattr(r, "descripcion_kame", "")) or clean_text(r.descripcion),
+            "descripcion_ml": clean_text(getattr(r, "descripcion_ml", "")) or clean_text(r.descripcion),
+            "descripcion_fuente": clean_text(getattr(r, "descripcion_fuente", "")),
+            "familia_kame": clean_text(getattr(r, "familia_kame", "")),
+            "maestro_match_status": clean_text(getattr(r, "maestro_match_status", "")),
             "unidades": int(r.unidades),
             "identificacion": clean_text(r.identificacion),
             "vence": clean_text(getattr(r, "vence", "")),
@@ -2093,11 +2165,27 @@ def create_lote(nombre, archivo, hoja, df):
         "created_at": now,
         "total_lineas": int(len(df)),
         "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
-        "snapshot_mode": "lote_item",
+        "snapshot_mode": "lote_item+lote_snapshot_chunk",
+        "snapshot_count": int(len(snapshot_items)),
     })]
 
+    # Respaldo redundante del snapshot completo por chunks.
+    # Si por cualquier razón faltan filas lote_item individuales en Sheets, este evento permite restaurar TODO el lote.
+    chunk_size = 80
+    chunk_count = max(1, (len(snapshot_items) + chunk_size - 1) // chunk_size)
+    for idx in range(chunk_count):
+        chunk = snapshot_items[idx * chunk_size:(idx + 1) * chunk_size]
+        events.append(("lote_snapshot_chunk", {
+            **lote_payload,
+            "created_at": now,
+            "chunk_index": idx + 1,
+            "chunk_count": chunk_count,
+            "items_count": len(chunk),
+            "items": chunk,
+        }))
+
     # Respaldo de snapshot producto a producto.
-    # Esto es más largo en Sheets, pero es mucho más seguro y fácil de auditar/restaurar.
+    # Esto mantiene auditoría legible; el chunk de arriba es el seguro de integridad.
     for item in snapshot_items:
         events.append(("lote_item", {
             **lote_payload,
@@ -2109,6 +2197,148 @@ def create_lote(nombre, archivo, hoja, df):
     flush_backup_queue(limit=max(1000, len(events) + 10))
     log_audit_event(lote_id, event_type="LOTE_CREADO", detail=f"Lote creado desde {archivo} / {hoja}", qty=int(df["unidades"].sum()) if "unidades" in df.columns else 0)
     return lote_id
+
+
+def lote_integrity_against_df(lote_id: int, df: pd.DataFrame) -> dict:
+    """Compara un lote local contra un Excel FULL por Código ML.
+
+    No modifica datos. Se usa para detectar carga parcial antes de que afecte picking/escaneo.
+    """
+    df_check = apply_kame_description_fields(df.copy()) if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if df_check.empty:
+        return {"ok": False, "expected_lines": 0, "existing_lines": 0, "missing_count": 0, "missing_df": pd.DataFrame(), "message": "Excel sin productos válidos."}
+    df_check = df_check.copy()
+    df_check["codigo_ml"] = df_check["codigo_ml"].map(norm_code)
+    df_check["sku"] = df_check["sku"].map(norm_code)
+    df_check = df_check[df_check["codigo_ml"].astype(str).str.strip().ne("")].reset_index(drop=True)
+    with db() as c:
+        existing = pd.read_sql_query(
+            "SELECT id, codigo_ml, codigo_universal, sku, descripcion, unidades FROM items WHERE lote_id=?",
+            c,
+            params=(int(lote_id),),
+        )
+    if existing.empty:
+        existing_codes = set()
+    else:
+        existing["codigo_ml"] = existing["codigo_ml"].map(norm_code)
+        existing_codes = set(existing["codigo_ml"].dropna().astype(str))
+    missing = df_check[~df_check["codigo_ml"].isin(existing_codes)].copy()
+    return {
+        "ok": missing.empty and len(existing_codes) >= len(df_check),
+        "expected_lines": int(len(df_check)),
+        "expected_units": int(df_check["unidades"].map(to_int).sum()) if "unidades" in df_check.columns else 0,
+        "existing_lines": int(len(existing_codes)),
+        "missing_count": int(len(missing)),
+        "missing_units": int(missing["unidades"].map(to_int).sum()) if not missing.empty and "unidades" in missing.columns else 0,
+        "missing_df": missing,
+        "message": f"Esperadas {len(df_check)} líneas; en lote local hay {len(existing_codes)} códigos ML; faltan {len(missing)}.",
+    }
+
+
+def repair_lote_missing_items_from_df(lote_id: int, df: pd.DataFrame, archivo: str = "", hoja: str = "", usuario: str = "SISTEMA") -> tuple[bool, str]:
+    """Agrega al lote activo productos que existen en el Excel FULL pero no están en items.
+
+    Es una reparación quirúrgica: no toca scans, picking, etiquetas ni productos existentes.
+    Los productos agregados quedan respaldados como lote_item y auditados en Sheets.
+    """
+    integ = lote_integrity_against_df(lote_id, df)
+    missing = integ.get("missing_df", pd.DataFrame())
+    if missing is None or missing.empty:
+        return True, f"Sin faltantes. {integ.get('message','')}"
+
+    now = now_cl().isoformat(timespec="seconds")
+    inserted_items = []
+    with db() as c:
+        for r in missing.itertuples(index=False):
+            desc_kame = clean_text(getattr(r, "descripcion_kame", "")) or clean_text(getattr(r, "descripcion", ""))
+            desc_ml = clean_text(getattr(r, "descripcion_ml", "")) or desc_kame
+            cur = c.execute(
+                """
+                INSERT INTO items
+                (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+                 descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
+                 identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'REPARACION_EXCEL', ?)
+                """,
+                (
+                    int(lote_id),
+                    clean_text(getattr(r, "area", "")),
+                    clean_text(getattr(r, "nro", "")),
+                    norm_code(getattr(r, "codigo_ml", "")),
+                    norm_code(getattr(r, "codigo_universal", "")),
+                    norm_code(getattr(r, "sku", "")),
+                    desc_kame,
+                    desc_kame,
+                    desc_ml,
+                    clean_text(getattr(r, "descripcion_fuente", "")) or ("KAME" if desc_kame and desc_kame != desc_ml else "ML_FALLBACK"),
+                    clean_text(getattr(r, "familia_kame", "")),
+                    clean_text(getattr(r, "maestro_match_status", "")),
+                    int(to_int(getattr(r, "unidades", 0))),
+                    clean_text(getattr(r, "identificacion", "")),
+                    clean_text(getattr(r, "vence", "")),
+                    clean_text(getattr(r, "instrucciones", "")),
+                    clean_text(getattr(r, "dia", "")),
+                    clean_text(getattr(r, "hora", "")),
+                    now,
+                    now,
+                    f"Agregado desde reparación de integridad con Excel {clean_text(archivo)} / {clean_text(hoja)}",
+                ),
+            )
+            item_id = int(cur.lastrowid)
+            inserted_items.append({
+                "item_id": item_id,
+                "area": clean_text(getattr(r, "area", "")),
+                "nro": clean_text(getattr(r, "nro", "")),
+                "codigo_ml": norm_code(getattr(r, "codigo_ml", "")),
+                "codigo_universal": norm_code(getattr(r, "codigo_universal", "")),
+                "sku": norm_code(getattr(r, "sku", "")),
+                "descripcion": desc_kame,
+                "descripcion_kame": desc_kame,
+                "descripcion_ml": desc_ml,
+                "descripcion_fuente": clean_text(getattr(r, "descripcion_fuente", "")),
+                "familia_kame": clean_text(getattr(r, "familia_kame", "")),
+                "maestro_match_status": clean_text(getattr(r, "maestro_match_status", "")),
+                "unidades": int(to_int(getattr(r, "unidades", 0))),
+                "identificacion": clean_text(getattr(r, "identificacion", "")),
+                "vence": clean_text(getattr(r, "vence", "")),
+                "instrucciones": clean_text(getattr(r, "instrucciones", "")),
+                "dia": clean_text(getattr(r, "dia", "")),
+                "hora": clean_text(getattr(r, "hora", "")),
+                "item_created_at": now,
+                "item_updated_at": now,
+                "repair_source": "REPARACION_EXCEL_FALTANTES",
+            })
+        c.commit()
+
+    lote_payload = build_lote_payload(int(lote_id))
+    events = []
+    for item in inserted_items:
+        events.append(("lote_item", {
+            **lote_payload,
+            "created_at": now,
+            "repair_source": "REPARACION_EXCEL_FALTANTES",
+            "archivo_reparacion": clean_text(archivo),
+            "hoja_reparacion": clean_text(hoja),
+            **item,
+        }))
+    events.append(("lote_snapshot_chunk", {
+        **lote_payload,
+        "created_at": now,
+        "chunk_index": 1,
+        "chunk_count": 1,
+        "items_count": len(inserted_items),
+        "repair_source": "REPARACION_EXCEL_FALTANTES",
+        "items": inserted_items,
+    }))
+    enqueue_backup_events_batch(events)
+    log_audit_event(
+        int(lote_id),
+        event_type="REPARACION_LOTE_FALTANTES",
+        detail=f"Se agregaron {len(inserted_items)} producto(s) faltantes desde Excel {clean_text(archivo)} / {clean_text(hoja)}",
+        qty=sum(int(x.get("unidades", 0)) for x in inserted_items),
+        mode=clean_text(usuario) or "SISTEMA",
+    )
+    return True, f"Reparación aplicada: se agregaron {len(inserted_items)} producto(s) faltantes y {sum(int(x.get('unidades',0)) for x in inserted_items)} unidades."
 
 def delete_lote(lote_id):
     lote_payload = build_lote_payload(lote_id)
@@ -2173,8 +2403,8 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
             INSERT INTO scans
             (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
              operador_validador, picking_list_id, picking_code, picker_asignado,
-             original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             original_item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status, restore_match_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now,
             clean_text(operador_validador) or "SIN_USUARIO",
@@ -2185,7 +2415,11 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
             norm_code(item["codigo_ml"]),
             norm_code(item["codigo_universal"]),
             norm_code(item["sku"]),
-            clean_text(item["descripcion"]),
+            descripcion_operativa_value(item),
+            descripcion_operativa_value(item),
+            descripcion_etiqueta_value(item),
+            clean_text(item["familia_kame"] if "familia_kame" in item.keys() else ""),
+            clean_text(item["maestro_match_status"] if "maestro_match_status" in item.keys() else ""),
             "LIVE_MATCH",
         ))
         c.commit()
@@ -2196,7 +2430,11 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         "sku": clean_text(item["sku"]),
         "codigo_ml": clean_text(item["codigo_ml"]),
         "codigo_universal": clean_text(item["codigo_universal"]),
-        "descripcion": clean_text(item["descripcion"]),
+        "descripcion": descripcion_operativa_value(item),
+        "descripcion_kame": descripcion_operativa_value(item),
+        "descripcion_ml": descripcion_etiqueta_value(item),
+        "familia_kame": clean_text(item["familia_kame"] if "familia_kame" in item.keys() else ""),
+        "maestro_match_status": clean_text(item["maestro_match_status"] if "maestro_match_status" in item.keys() else ""),
         "cantidad": int(cantidad),
         "modo": clean_text(modo),
         "scan_primario": norm_code(scan_primario),
@@ -2207,7 +2445,7 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         "picking_code": clean_text(picking_meta.get("codigo_lista", "")),
         "picker_asignado": clean_text(picking_meta.get("asignado_a", "")),
     })
-    log_audit_event(lote_id, item_id, "SKU_ESCANEADO", clean_text(item["descripcion"]), int(cantidad), item["codigo_ml"], item["sku"], modo)
+    log_audit_event(lote_id, item_id, "SKU_ESCANEADO", descripcion_operativa_value(item), int(cantidad), item["codigo_ml"], item["sku"], modo)
     return True, "Cantidad agregada."
 
 
@@ -2229,7 +2467,11 @@ def undo_last_scan(lote_id):
         "sku": clean_text(item_payload.get("sku", "")),
         "codigo_ml": clean_text(item_payload.get("codigo_ml", "")),
         "codigo_universal": clean_text(item_payload.get("codigo_universal", "")),
-        "descripcion": clean_text(item_payload.get("descripcion", "")),
+        "descripcion": descripcion_operativa_value(item_payload),
+        "descripcion_kame": descripcion_operativa_value(item_payload),
+        "descripcion_ml": descripcion_etiqueta_value(item_payload),
+        "familia_kame": clean_text(item_payload.get("familia_kame", "")),
+        "maestro_match_status": clean_text(item_payload.get("maestro_match_status", "")),
         "cantidad": int(row["cantidad"]),
         "modo": clean_text(row["modo"]),
         "scan_primario": norm_code(row["scan_primario"]),
@@ -2240,7 +2482,7 @@ def undo_last_scan(lote_id):
         "picking_code": clean_text(row["picking_code"] if "picking_code" in row.keys() else ""),
         "picker_asignado": clean_text(row["picker_asignado"] if "picker_asignado" in row.keys() else ""),
     })
-    log_audit_event(lote_id, int(row["item_id"]), "SCAN_DESHECHO", clean_text(item_payload.get("descripcion", "")), int(row["cantidad"]), item_payload.get("codigo_ml", ""), item_payload.get("sku", ""), row["modo"])
+    log_audit_event(lote_id, int(row["item_id"]), "SCAN_DESHECHO", descripcion_operativa_value(item_payload), int(row["cantidad"]), item_payload.get("codigo_ml", ""), item_payload.get("sku", ""), row["modo"])
     return True, "Último escaneo deshecho."
 
 
@@ -2270,6 +2512,7 @@ def read_full_excel_sheet(uploaded_file, sheet_name):
     codigo_universal_col = col_exact(cols, ["Código Universal", "Codigo Universal", "COD UNIVERSAL", "Codigo de barras", "EAN"])
     sku_col = col_required(cols, "SKU", ["SKU", "SKU ML"])
     descripcion_col = col_required(cols, "Descripción", ["Descripción", "Descripcion", "DESCRIPCION", "Producto", "Título", "Titulo"])
+    descripcion_ml_col = col_exact(cols, ["Descripción ML", "Descripcion ML", "Título ML", "Titulo ML", "Producto ML", "Descripcion Mercado Libre", "Descripción Mercado Libre"])
     unidades_col = col_required(cols, "Unidades", ["Unidades", "CANT", "Cant", "Cantidad"])
 
     # Separación estricta: Identificación y Vence son columnas independientes.
@@ -2291,6 +2534,7 @@ def read_full_excel_sheet(uploaded_file, sheet_name):
         "codigo_universal": raw[codigo_universal_col] if codigo_universal_col else "",
         "sku": raw[sku_col],
         "descripcion": raw[descripcion_col],
+        "descripcion_ml": raw[descripcion_ml_col] if descripcion_ml_col else raw[descripcion_col],
         "unidades": raw[unidades_col],
         "identificacion": raw[identificacion_col] if identificacion_col else "",
         "vence": raw[vence_col] if vence_col else "",
@@ -2299,11 +2543,13 @@ def read_full_excel_sheet(uploaded_file, sheet_name):
         "hora": raw[hora_col] if hora_col else "",
     })
 
-    for k in ["area", "nro", "descripcion", "identificacion", "vence", "instrucciones", "dia", "hora"]:
-        df[k] = df[k].map(clean_text)
+    for k in ["area", "nro", "descripcion", "descripcion_ml", "identificacion", "vence", "instrucciones", "dia", "hora"]:
+        if k in df.columns:
+            df[k] = df[k].map(clean_text)
     for k in ["codigo_ml", "codigo_universal", "sku"]:
         df[k] = df[k].map(norm_code)
     df["unidades"] = df["unidades"].map(to_int)
+    df = apply_kame_description_fields(df)
 
     df = df[(df["unidades"] > 0) & ((df["sku"] != "") | (df["codigo_ml"] != "") | (df["codigo_universal"] != ""))]
     return df.reset_index(drop=True), warnings
@@ -2488,6 +2734,95 @@ def load_kame_master_maps(source=None) -> tuple[dict, dict, dict, int]:
     return desc_map, family_map, barcode_map, len(raw)
 
 
+def row_get_value(row, key, default=""):
+    """Lee valores desde dict, sqlite Row, pandas Series o namedtuple."""
+    try:
+        if isinstance(row, dict):
+            return row.get(key, default)
+        if hasattr(row, "get"):
+            return row.get(key, default)
+        if hasattr(row, key):
+            return getattr(row, key)
+        if hasattr(row, "keys") and key in row.keys():
+            return row[key]
+    except Exception:
+        pass
+    return default
+
+
+def descripcion_operativa_value(row) -> str:
+    """Descripción oficial para operación: Kame; fallback a descripcion."""
+    return clean_text(row_get_value(row, "descripcion_kame", "")) or clean_text(row_get_value(row, "descripcion", ""))
+
+
+def descripcion_etiqueta_value(row) -> str:
+    """Descripción oficial para etiquetas: ML; fallback a Kame/descripcion."""
+    return (
+        clean_text(row_get_value(row, "descripcion_ml", ""))
+        or clean_text(row_get_value(row, "descripcion_label", ""))
+        or clean_text(row_get_value(row, "descripcion", ""))
+        or clean_text(row_get_value(row, "descripcion_kame", ""))
+    )
+
+
+def apply_kame_description_fields(df: pd.DataFrame, master_source=None) -> pd.DataFrame:
+    """Normaliza descripciones sin perder la descripción ML.
+
+    Regla matriz:
+    - descripcion / descripcion_kame: idioma Kame para picking, escaneo y reserva.
+    - descripcion_ml: título original ML para etiquetas.
+    - Sheets debe recibir ambas para restaurar sin depender del maestro futuro.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "descripcion_ml" not in out.columns:
+        out["descripcion_ml"] = out["descripcion"] if "descripcion" in out.columns else ""
+    if "descripcion" not in out.columns:
+        out["descripcion"] = out["descripcion_ml"]
+
+    desc_map, family_map, barcode_map, _ = load_kame_master_maps(master_source)
+    desc_kame_list = []
+    fuente_list = []
+    familia_list = []
+    status_list = []
+    codigo_universal_list = []
+    for _, r in out.iterrows():
+        sku = norm_code(r.get("sku", ""))
+        desc_ml = clean_text(r.get("descripcion_ml", "")) or clean_text(r.get("descripcion", ""))
+        desc_kame = clean_text(desc_map.get(sku, "")) if sku else ""
+        familia = clean_text(family_map.get(sku, "")) if sku else ""
+        if desc_kame:
+            desc_final = desc_kame
+            fuente = "KAME"
+            status = "MATCH_SKU"
+        else:
+            desc_final = clean_text(r.get("descripcion", "")) or desc_ml
+            fuente = "ML_FALLBACK"
+            status = "SKU_NO_ENCONTRADO" if sku else "SKU_VACIO"
+        desc_kame_list.append(desc_final)
+        fuente_list.append(fuente)
+        familia_list.append(familia)
+        status_list.append(status)
+
+        cu = normalize_universal_code(r.get("codigo_universal", ""))
+        master_barcode = normalize_universal_code(barcode_map.get(sku, "")) if sku else "N/A"
+        if cu == "N/A" and master_barcode != "N/A":
+            codigo_universal_list.append(master_barcode)
+        else:
+            codigo_universal_list.append(cu)
+
+    out["descripcion_ml"] = out["descripcion_ml"].map(clean_text)
+    out["descripcion_kame"] = desc_kame_list
+    out["descripcion"] = desc_kame_list
+    out["descripcion_fuente"] = fuente_list
+    out["familia_kame"] = familia_list
+    out["maestro_match_status"] = status_list
+    if "codigo_universal" in out.columns:
+        out["codigo_universal"] = codigo_universal_list
+    return out
+
+
 def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.DataFrame, dict]:
     pdf_df, totals = parse_ml_full_pdf(uploaded_pdf)
     # En producción usamos el maestro fijo del repo: data/maestro_sku_ean.xlsx.
@@ -2499,6 +2834,8 @@ def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.Data
         sku = norm_code(r.get("sku", ""))
         alerts = []
         desc_kame = clean_text(desc_map.get(sku, ""))
+        maestro_status = "MATCH_SKU" if desc_kame else ("SKU_NO_ENCONTRADO" if sku else "SKU_VACIO")
+        descripcion_fuente = "KAME" if desc_kame else "ML_FALLBACK"
         if not desc_kame:
             alerts.append("SKU no encontrado en maestro Kame; se usa descripción ML")
         desc_final = desc_kame or clean_text(r.get("descripcion_ml", ""))
@@ -2535,6 +2872,9 @@ def build_full_input_from_pdf(uploaded_pdf, master_source=None) -> tuple[pd.Data
             "codigo_universal": codigo_universal,
             "sku": sku,
             "descripcion": desc_final,
+            "descripcion_kame": desc_final,
+            "descripcion_fuente": descripcion_fuente,
+            "maestro_match_status": maestro_status,
             "unidades": int(r.get("unidades", 0) or 0),
             "identificacion": clean_text(r.get("identificacion", "")),
             "vence": vence,
@@ -2567,6 +2907,9 @@ def full_input_excel_bytes(df: pd.DataFrame) -> bytes:
         ("codigo_universal", "Código Universal"),
         ("sku", "SKU"),
         ("descripcion", "Descripción"),
+        ("descripcion_kame", "Descripción Kame"),
+        ("descripcion_fuente", "Fuente Descripción"),
+        ("maestro_match_status", "Estado Maestro"),
         ("unidades", "Unidades"),
         ("identificacion", "Identificación"),
         ("vence", "Vence"),
@@ -2869,12 +3212,14 @@ def zpl_separator_50x30(tipo: str, codigo_ml, sku, descripcion) -> str:
 
 
 def zpl_for_item_with_separators(row, copies=None) -> str:
-    qty = int(copies if copies is not None else row.get("unidades", 0))
+    qty = int(copies if copies is not None else row_get_value(row, "unidades", 0))
     qty = max(1, qty)
+    # Regla matriz: las etiquetas usan descripción ML, no descripción Kame.
+    desc_label = descripcion_etiqueta_value(row)
     return (
-        zpl_separator_50x30("INICIO", row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""))
-        + zpl_ml_label_50x30(row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""), qty)
-        + zpl_separator_50x30("FIN", row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""))
+        zpl_separator_50x30("INICIO", row_get_value(row, "codigo_ml", ""), row_get_value(row, "sku", ""), desc_label)
+        + zpl_ml_label_50x30(row_get_value(row, "codigo_ml", ""), row_get_value(row, "sku", ""), desc_label, qty)
+        + zpl_separator_50x30("FIN", row_get_value(row, "codigo_ml", ""), row_get_value(row, "sku", ""), desc_label)
     )
 
 
@@ -3090,12 +3435,12 @@ def register_block_download(lote_id: int, block: dict):
         for item in block["items"]:
             rows.append((
                 int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
+                descripcion_etiqueta_value(item), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
                 int(block["block_index"]), clean_text(block["block_key"]), is_reprint, now,
             ))
             rows.append((
                 int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
+                descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
                 int(block["block_index"]), clean_text(block["block_key"]), is_reprint, now,
             ))
         c.executemany(
@@ -3142,9 +3487,9 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
     with db() as c:
         rows = [
             (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), qty, "INDIVIDUAL", "NORMAL", None, None, is_reprint, now),
+             descripcion_etiqueta_value(item), qty, "INDIVIDUAL", "NORMAL", None, None, is_reprint, now),
             (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, is_reprint, now),
+             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, is_reprint, now),
         ]
         c.executemany(
             """
@@ -3166,14 +3511,15 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
         item_id=int(item.get("id")),
         codigo_ml=item.get("codigo_ml", ""),
         sku=item.get("sku", ""),
-        descripcion=item.get("descripcion", ""),
+        descripcion=descripcion_etiqueta_value(item),
+        # Kame/ML quedan en raw_json si aplica por item en eventos futuros; el texto visible de etiqueta es ML.
         productos_count=1,
         cantidad_normal=int(qty),
         cantidad_separadores=LABEL_SEPARATOR_PER_PRODUCT,
         cantidad_total=int(qty) + LABEL_SEPARATOR_PER_PRODUCT,
         usuario=get_operator_name(),
     )
-    log_audit_event(lote_id, int(item.get("id")), "ZPL_INDIVIDUAL", clean_text(item.get("descripcion", "")), int(qty), item.get("codigo_ml", ""), item.get("sku", ""), "INDIVIDUAL")
+    log_audit_event(lote_id, int(item.get("id")), "ZPL_INDIVIDUAL", descripcion_etiqueta_value(item), int(qty), item.get("codigo_ml", ""), item.get("sku", ""), "INDIVIDUAL")
 
 
 def build_picking_label_block(picking_list_id: int) -> dict:
@@ -3195,7 +3541,11 @@ def build_picking_label_block(picking_list_id: int) -> dict:
                 "codigo_ml": norm_code(r.get("codigo_ml", "")),
                 "codigo_universal": norm_code(r.get("codigo_universal", "")),
                 "sku": norm_code(r.get("sku", "")),
-                "descripcion": clean_text(r.get("descripcion", "")),
+                "descripcion": clean_text(r.get("descripcion_kame", "")) or clean_text(r.get("descripcion", "")),
+                "descripcion_kame": clean_text(r.get("descripcion_kame", "")) or clean_text(r.get("descripcion", "")),
+                "descripcion_ml": clean_text(r.get("descripcion_ml", "")) or clean_text(r.get("descripcion", "")),
+                "familia_kame": clean_text(r.get("familia_kame", "")),
+                "maestro_match_status": clean_text(r.get("maestro_match_status", "")),
                 "unidades": qty,
                 "area": clean_text(r.get("area", "")),
                 "nro": clean_text(r.get("nro", "")),
@@ -3251,12 +3601,12 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
         for item in items:
             rows.append((
                 int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "PICKING", "NORMAL",
+                descripcion_etiqueta_value(item), int(item.get("unidades", 0)), "PICKING", "NORMAL",
                 picking_id, block_key, is_reprint, now,
             ))
             rows.append((
                 int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "PICKING", "SEPARADOR",
+                descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, "PICKING", "SEPARADOR",
                 picking_id, block_key, is_reprint, now,
             ))
         c.executemany(
@@ -3926,12 +4276,12 @@ def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, us
         for item in block["items"]:
             rows.append((
                 int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
+                descripcion_etiqueta_value(item), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
                 int(block["block_index"]), clean_text(block["block_key"]), 1, now,
             ))
             rows.append((
                 int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
+                descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
                 int(block["block_index"]), clean_text(block["block_key"]), 1, now,
             ))
         c.executemany(
@@ -4842,14 +5192,16 @@ def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentar
             c.execute(
                 """
                 INSERT INTO picking_list_items
-                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status,
                  cantidad, area, nro, estado, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
                 """,
                 (
                     list_id, int(lote_id), int(item_id), norm_code(item["codigo_ml"]), norm_code(item["codigo_universal"]),
-                    norm_code(item["sku"]), clean_text(item["descripcion"]), int(cantidad), clean_text(item["area"]),
-                    clean_text(item["nro"]), now,
+                    norm_code(item["sku"]), descripcion_operativa_value(item), descripcion_operativa_value(item), descripcion_etiqueta_value(item),
+                    clean_text(item["familia_kame"] if "familia_kame" in item.keys() else ""),
+                    clean_text(item["maestro_match_status"] if "maestro_match_status" in item.keys() else ""),
+                    int(cantidad), clean_text(item["area"]), clean_text(item["nro"]), now,
                 ),
             )
             inserted_items.append({
@@ -4857,7 +5209,11 @@ def create_picking_list(lote_id: int, asignado_a: str, created_by: str, comentar
                 "codigo_ml": norm_code(item["codigo_ml"]),
                 "codigo_universal": norm_code(item["codigo_universal"]),
                 "sku": norm_code(item["sku"]),
-                "descripcion": clean_text(item["descripcion"]),
+                "descripcion": descripcion_operativa_value(item),
+                "descripcion_kame": descripcion_operativa_value(item),
+                "descripcion_ml": descripcion_etiqueta_value(item),
+                "familia_kame": clean_text(item["familia_kame"] if "familia_kame" in item.keys() else ""),
+                "maestro_match_status": clean_text(item["maestro_match_status"] if "maestro_match_status" in item.keys() else ""),
                 "cantidad": int(cantidad),
                 "area": clean_text(item["area"]),
                 "nro": clean_text(item["nro"]),
@@ -5802,7 +6158,12 @@ def get_sheet_lote_items_from_events(events: list[dict], lote_id: int) -> pd.Dat
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
                 "codigo_universal": norm_code(ev.get("codigo_universal", "")),
                 "sku": norm_code(ev.get("sku", "")),
-                "descripcion": clean_text(ev.get("descripcion", "")),
+                "descripcion": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_kame": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_ml": clean_text(ev.get("descripcion_ml", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_fuente": clean_text(ev.get("descripcion_fuente", "")),
+                "familia_kame": clean_text(ev.get("familia_kame", "")),
+                "maestro_match_status": clean_text(ev.get("maestro_match_status", "")),
                 "unidades": to_int(ev.get("unidades", 0)),
                 "identificacion": clean_text(ev.get("identificacion", "")),
                 "vence": clean_text(ev.get("vence", "")),
@@ -6110,7 +6471,12 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
                     "codigo_ml": codigo_ml,
                     "codigo_universal": codigo_universal,
                     "sku": sku,
-                    "descripcion": descripcion or item.get("descripcion", ""),
+                    "descripcion": clean_text(raw.get("descripcion_kame", "")) or descripcion or item.get("descripcion", ""),
+                    "descripcion_kame": clean_text(raw.get("descripcion_kame", "")) or descripcion or item.get("descripcion", ""),
+                    "descripcion_ml": clean_text(raw.get("descripcion_ml", "")) or item.get("descripcion_ml", "") or descripcion,
+                    "descripcion_fuente": clean_text(raw.get("descripcion_fuente", item.get("descripcion_fuente", ""))),
+                    "familia_kame": clean_text(raw.get("familia_kame", item.get("familia_kame", ""))),
+                    "maestro_match_status": clean_text(raw.get("maestro_match_status", item.get("maestro_match_status", ""))),
                     "unidades": to_int(raw.get("unidades", raw.get("cantidad", 0))),
                     "identificacion": clean_text(raw.get("identificacion", item.get("identificacion", ""))),
                     "vence": clean_text(raw.get("vence", item.get("vence", ""))),
@@ -6141,7 +6507,12 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             "codigo_ml": codigo_ml,
             "codigo_universal": codigo_universal,
             "sku": sku,
-            "descripcion": descripcion,
+            "descripcion": clean_text(raw.get("descripcion_kame", "")) or descripcion,
+            "descripcion_kame": clean_text(raw.get("descripcion_kame", "")) or descripcion,
+            "descripcion_ml": clean_text(raw.get("descripcion_ml", "")) or descripcion,
+            "descripcion_fuente": clean_text(raw.get("descripcion_fuente", "")),
+            "familia_kame": clean_text(raw.get("familia_kame", "")),
+            "maestro_match_status": clean_text(raw.get("maestro_match_status", "")),
             "unidades": to_int(raw.get("unidades", raw.get("cantidad", 0))),
             "acopiadas": 0,
             "identificacion": clean_text(raw.get("identificacion", "")),
@@ -6501,6 +6872,10 @@ def get_sheet_lote_items_from_events(events: list[dict], lote_id: int) -> pd.Dat
             "codigo_universal": it.get("codigo_universal", ""),
             "sku": it.get("sku", ""),
             "descripcion": it.get("descripcion", ""),
+            "descripcion_kame": it.get("descripcion_kame", it.get("descripcion", "")),
+            "descripcion_ml": it.get("descripcion_ml", ""),
+            "familia_kame": it.get("familia_kame", ""),
+            "maestro_match_status": it.get("maestro_match_status", ""),
             "unidades": it.get("unidades", 0),
             "identificacion": it.get("identificacion", ""),
             "vence": it.get("vence", ""),
@@ -6556,14 +6931,17 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
             c.execute(
                 """
                 INSERT OR REPLACE INTO items
-                (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
+                (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+                 descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
                  identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(it.get("id")), int(lote_id), clean_text(it.get("area", "")), clean_text(it.get("nro", "")),
                     norm_code(it.get("codigo_ml", "")), norm_code(it.get("codigo_universal", "")), norm_code(it.get("sku", "")),
-                    clean_text(it.get("descripcion", "")), to_int(it.get("unidades", 0)), to_int(it.get("acopiadas", 0)),
+                    clean_text(it.get("descripcion", "")), clean_text(it.get("descripcion_kame", it.get("descripcion", ""))), clean_text(it.get("descripcion_ml", it.get("descripcion", ""))),
+                    clean_text(it.get("descripcion_fuente", "")), clean_text(it.get("familia_kame", "")), clean_text(it.get("maestro_match_status", "")),
+                    to_int(it.get("unidades", 0)), to_int(it.get("acopiadas", 0)),
                     clean_text(it.get("identificacion", "")), clean_text(it.get("vence", "")), clean_text(it.get("instrucciones", "")),
                     clean_text(it.get("dia", "")), clean_text(it.get("hora", "")),
                     clean_text(it.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
@@ -6592,13 +6970,15 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
             c.execute(
                 """
                 INSERT INTO picking_list_items
-                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status,
                  cantidad, area, nro, estado, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(pit.get("picking_list_id")), int(lote_id), int(pit.get("item_id")), norm_code(pit.get("codigo_ml", "")),
-                    norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion", "")),
+                    norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")),
+                    clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")), clean_text(pit.get("descripcion_ml", "")) or clean_text(pit.get("descripcion", "")),
+                    clean_text(pit.get("familia_kame", "")), clean_text(pit.get("maestro_match_status", "")),
                     to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")),
                     clean_text(pit.get("estado", "PENDIENTE")) or "PENDIENTE", clean_text(pit.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
                 ),
@@ -6609,15 +6989,16 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
                 INSERT INTO scans
                 (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
                  operador_validador, picking_list_id, picking_code, picker_asignado,
-                 original_item_id, codigo_ml, codigo_universal, sku, descripcion, restore_match_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 original_item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status, restore_match_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(lote_id), int(sr.get("item_id", 0)), norm_code(sr.get("scan_primario", "")), norm_code(sr.get("scan_secundario", "")),
                     to_int(sr.get("cantidad", 0)), clean_text(sr.get("modo", "")), clean_text(sr.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
                     clean_text(sr.get("operador_validador", "")) or "SIN_USUARIO", sr.get("picking_list_id"), clean_text(sr.get("picking_code", "")), clean_text(sr.get("picker_asignado", "")),
                     sr.get("original_item_id"), norm_code(sr.get("codigo_ml", "")), norm_code(sr.get("codigo_universal", "")), norm_code(sr.get("sku", "")),
-                    clean_text(sr.get("descripcion", "")), clean_text(sr.get("restore_match_status", "")),
+                    clean_text(sr.get("descripcion", "")), clean_text(sr.get("descripcion_kame", sr.get("descripcion", ""))), clean_text(sr.get("descripcion_ml", sr.get("descripcion", ""))),
+                    clean_text(sr.get("familia_kame", "")), clean_text(sr.get("maestro_match_status", "")), clean_text(sr.get("restore_match_status", "")),
                 ),
             )
         for inc in state.get("incidencias", []):
@@ -6749,7 +7130,11 @@ def get_item_snapshot_for_postventa(lote_id: int, item_id: int) -> dict:
         "codigo_ml": norm_code(item.get("codigo_ml", "")),
         "codigo_universal": norm_code(item.get("codigo_universal", "")),
         "sku": norm_code(item.get("sku", "")),
-        "descripcion": clean_text(item.get("descripcion", "")),
+        "descripcion": descripcion_operativa_value(item),
+        "descripcion_kame": descripcion_operativa_value(item),
+        "descripcion_ml": descripcion_etiqueta_value(item),
+        "familia_kame": clean_text(item.get("familia_kame", "")),
+        "maestro_match_status": clean_text(item.get("maestro_match_status", "")),
         "cantidad_solicitada": to_int(item.get("unidades", 0)),
         "cantidad_preparada": to_int(item.get("acopiadas", 0)),
     }
@@ -6798,10 +7183,10 @@ def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, can
         cur = c.execute(
             """
             INSERT INTO postventa_full_errores
-            (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, tipo_error,
+            (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, tipo_error,
              cantidad_solicitada, cantidad_preparada, cantidad_reportada_full, cantidad_diferencia,
              cantidad_afectada, comentario, usuario, estado, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?)
             """,
             (
                 lid,
@@ -6810,6 +7195,9 @@ def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, can
                 snap.get("codigo_universal", ""),
                 snap.get("sku", ""),
                 snap.get("descripcion", ""),
+                snap.get("descripcion_kame", snap.get("descripcion", "")),
+                snap.get("descripcion_ml", ""),
+                snap.get("familia_kame", ""),
                 tipo,
                 enviada,
                 preparada,
@@ -6832,6 +7220,10 @@ def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, can
         "codigo_universal": snap.get("codigo_universal", ""),
         "sku": snap.get("sku", ""),
         "descripcion": snap.get("descripcion", ""),
+        "descripcion_kame": snap.get("descripcion_kame", snap.get("descripcion", "")),
+        "descripcion_ml": snap.get("descripcion_ml", ""),
+        "familia_kame": snap.get("familia_kame", ""),
+        "maestro_match_status": snap.get("maestro_match_status", ""),
         "tipo_error": tipo,
         "tipo": tipo,
         "cantidad_solicitada": enviada,
@@ -7420,6 +7812,51 @@ with st.sidebar:
 
 if page == "Cargar lote FULL":
     st.subheader("Cargar lote FULL")
+
+    with st.expander("🛠️ Reparar / verificar integridad de lote activo desde Excel", expanded=False):
+        st.warning("Usa esto solo si un lote activo quedó incompleto. No modifica escaneos, picking ni etiquetas: solo agrega productos que estén en el Excel y falten en el lote.")
+        if not active_lote:
+            st.info("Selecciona un lote activo en el menú lateral.")
+        else:
+            repair_file = st.file_uploader("Excel FULL para comparar contra el lote activo", type=["xlsx"], key="repair_lote_excel_upload")
+            if repair_file:
+                try:
+                    repair_names = sheet_names(repair_file)
+                    repair_default_idx = len(repair_names) - 1 if repair_names else 0
+                    repair_sheet = st.selectbox("Hoja del Excel de reparación", repair_names, index=repair_default_idx, key="repair_lote_sheet")
+                    repair_df, repair_warns = read_full_excel_sheet(repair_file, repair_sheet)
+                    for w in repair_warns:
+                        st.caption(w)
+                    integ = lote_integrity_against_df(active_lote, repair_df)
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Excel", int(integ.get("expected_lines", 0)))
+                    c2.metric("En lote local", int(integ.get("existing_lines", 0)))
+                    c3.metric("Faltantes", int(integ.get("missing_count", 0)))
+                    c4.metric("Unidades faltantes", int(integ.get("missing_units", 0)))
+                    missing_df = integ.get("missing_df", pd.DataFrame())
+                    if missing_df is not None and not missing_df.empty:
+                        st.error("El lote activo está incompleto frente al Excel seleccionado.")
+                        cols_show = [c for c in ["area", "nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_ml", "unidades", "identificacion"] if c in missing_df.columns]
+                        st.dataframe(missing_df[cols_show].head(120), use_container_width=True, hide_index=True, height=320)
+                        st.download_button(
+                            "Descargar CSV de faltantes",
+                            data=missing_df[cols_show].to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"faltantes_lote_{active_lote}.csv",
+                            mime="text/csv",
+                        )
+                        confirm_repair = st.checkbox("Confirmo que quiero agregar estos productos faltantes al lote activo", key="confirm_repair_lote_missing")
+                        if st.button("Agregar faltantes al lote activo", type="primary", disabled=not confirm_repair):
+                            ok_rep, msg_rep = repair_lote_missing_items_from_df(active_lote, repair_df, repair_file.name, repair_sheet, usuario=get_operator_name())
+                            if ok_rep:
+                                st.success(msg_rep)
+                                st.rerun()
+                            else:
+                                st.error(msg_rep)
+                    else:
+                        st.success("Integridad OK: no hay productos faltantes contra este Excel.")
+                except Exception as e:
+                    st.error(f"No pude verificar/reparar con este Excel: {e}")
+
     modo_carga = st.radio(
         "Origen del lote",
         ["Excel depurado", "PDF Mercado Libre"],
@@ -7445,6 +7882,8 @@ if page == "Cargar lote FULL":
                     c2.metric("Líneas", len(df))
                     c3.metric("Unidades", int(df["unidades"].sum()))
                     c4.metric("SKUs únicos", int(df["sku"].nunique()))
+                    if len(df) <= 0 or int(df["unidades"].sum()) <= 0:
+                        st.error("Integridad bloqueada: no hay productos/unidades válidas para crear lote.")
                     with st.expander("Revisión rápida de columnas leídas", expanded=True):
                         preview_cols_excel = ["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]
                         if "instrucciones" in df.columns and df["instrucciones"].astype(str).str.strip().ne("").any():
