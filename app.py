@@ -28,7 +28,7 @@ PACKS_PATH = DATA_DIR / "packs.xlsx"
 DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
 MAX_BACKUP_ATTEMPTS = 5
 SHEETS_STRICT_MODE = True  # Sheets es fuente única: no ocultar fallas de respaldo.
-SCAN_OPERATORS = ["ERICK", "JUAN CARLOS"]
+SCAN_OPERATORS = ["ERICK"]
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
 
@@ -3004,7 +3004,19 @@ AVISO_OPERACIONAL_REQUIERE_CONFIRMACION = {
 
 
 def get_operator_name() -> str:
-    return clean_text(st.session_state.get("operator_name", "")) or "SIN_USUARIO"
+    """Usuario operativo actual.
+
+    En PDA solo queda ERICK como validador autorizado.
+    Se prefiere scan_operator porque es el selector visible en Escaneo;
+    operator_name se conserva como compatibilidad para otros módulos antiguos.
+    """
+    op = clean_text(st.session_state.get("scan_operator", "")) or clean_text(st.session_state.get("operator_name", ""))
+    op = op.upper()
+    if op not in SCAN_OPERATORS:
+        op = SCAN_OPERATORS[0]
+    st.session_state["scan_operator"] = op
+    st.session_state["operator_name"] = op
+    return op
 
 
 def get_lote_status(lote_id: int) -> str:
@@ -6529,16 +6541,11 @@ elif page == "Escaneo":
             st.markdown("**Sesión PDA**")
             sx1, sx2 = st.columns([1, 2])
             with sx1:
-                current_op = clean_text(st.session_state.get("scan_operator", "")).upper()
-                op_idx = SCAN_OPERATORS.index(current_op) if current_op in SCAN_OPERATORS else 0
-                op_selected = st.radio(
-                    "Validador",
-                    SCAN_OPERATORS,
-                    index=op_idx,
-                    horizontal=True,
-                    key="scan_operator_radio",
-                )
-                st.session_state["scan_operator"] = op_selected
+                # Solo ERICK queda habilitado como validador PDA.
+                st.session_state["scan_operator"] = SCAN_OPERATORS[0]
+                st.session_state["operator_name"] = SCAN_OPERATORS[0]
+                st.caption("Validador")
+                st.markdown(f"**{SCAN_OPERATORS[0]}**")
             with sx2:
                 if labels_pick:
                     chosen_pick = st.selectbox("Lista picking activa", labels_pick, index=default_idx_pick, key="scan_picking_select")
