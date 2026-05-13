@@ -419,6 +419,43 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS postventa_full_errores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                item_id INTEGER,
+                codigo_ml TEXT,
+                codigo_universal TEXT,
+                sku TEXT,
+                descripcion TEXT,
+                tipo_error TEXT NOT NULL,
+                cantidad_solicitada INTEGER NOT NULL DEFAULT 0,
+                cantidad_preparada INTEGER NOT NULL DEFAULT 0,
+                cantidad_reportada_full INTEGER,
+                cantidad_diferencia INTEGER NOT NULL DEFAULT 0,
+                cantidad_afectada INTEGER NOT NULL DEFAULT 0,
+                comentario TEXT,
+                usuario TEXT,
+                estado TEXT NOT NULL DEFAULT 'ACTIVO',
+                created_at TEXT NOT NULL,
+                anulado_at TEXT,
+                anulado_by TEXT,
+                anulado_motivo TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS postventa_full_cierres (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lote_id INTEGER NOT NULL,
+                lote_nombre TEXT,
+                total_errores INTEGER NOT NULL DEFAULT 0,
+                errores_activos INTEGER NOT NULL DEFAULT 0,
+                unidades_afectadas INTEGER NOT NULL DEFAULT 0,
+                cerrado_por TEXT,
+                comentario TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -454,6 +491,19 @@ def init_db():
         ensure_column(c, "avisos_operacionales", "confirmado_inventario_by", "TEXT")
         # La reserva Kame se registra como archivo generado/resumen, no producto por producto.
         ensure_column(c, "reservas_kame", "csv_hash", "TEXT")
+        ensure_column(c, "postventa_full_errores", "codigo_ml", "TEXT")
+        ensure_column(c, "postventa_full_errores", "codigo_universal", "TEXT")
+        ensure_column(c, "postventa_full_errores", "sku", "TEXT")
+        ensure_column(c, "postventa_full_errores", "descripcion", "TEXT")
+        ensure_column(c, "postventa_full_errores", "cantidad_solicitada", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "postventa_full_errores", "cantidad_preparada", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "postventa_full_errores", "cantidad_reportada_full", "INTEGER")
+        ensure_column(c, "postventa_full_errores", "cantidad_diferencia", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "postventa_full_errores", "cantidad_afectada", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "postventa_full_errores", "estado", "TEXT NOT NULL DEFAULT 'ACTIVO'")
+        ensure_column(c, "postventa_full_errores", "anulado_at", "TEXT")
+        ensure_column(c, "postventa_full_errores", "anulado_by", "TEXT")
+        ensure_column(c, "postventa_full_errores", "anulado_motivo", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
@@ -469,6 +519,10 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_picking_items_lote ON picking_list_items (lote_id, item_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_scans_picking ON scans (picking_list_id, item_id, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_reservas_kame_lote ON reservas_kame (lote_id, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_postventa_full_errores_lote ON postventa_full_errores (lote_id, estado, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_postventa_full_errores_tipo ON postventa_full_errores (tipo_error, estado)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_postventa_full_errores_sku ON postventa_full_errores (sku, estado)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_postventa_full_cierres_lote ON postventa_full_cierres (lote_id, created_at)")
 
         c.commit()
 
@@ -6512,6 +6566,481 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
     return True, msg
 
 
+
+# ============================================================
+# Postventa FULL: errores informados por bodega FULL
+# ============================================================
+
+POSTVENTA_FULL_TIPOS = [
+    "Diferencia de cantidad",
+    "Producto dañado",
+    "Etiqueta / código incorrecto",
+    "Producto rechazado",
+    "Producto no recibido por FULL",
+    "Producto sobrante",
+    "Otro",
+]
+
+
+def get_postventa_full_errores(lote_id=None, estado=None) -> pd.DataFrame:
+    with db() as c:
+        where = []
+        params = []
+        if lote_id:
+            where.append("p.lote_id=?")
+            params.append(int(lote_id))
+        if estado and clean_text(estado) != "Todos":
+            where.append("p.estado=?")
+            params.append(clean_text(estado))
+        sql_where = ("WHERE " + " AND ".join(where)) if where else ""
+        return pd.read_sql_query(
+            f"""
+            SELECT p.*, l.nombre AS lote_nombre
+            FROM postventa_full_errores p
+            LEFT JOIN lotes l ON l.id=p.lote_id
+            {sql_where}
+            ORDER BY p.id DESC
+            """,
+            c,
+            params=params,
+        )
+
+
+def get_postventa_full_cierres(lote_id=None) -> pd.DataFrame:
+    with db() as c:
+        if lote_id:
+            return pd.read_sql_query(
+                "SELECT * FROM postventa_full_cierres WHERE lote_id=? ORDER BY id DESC",
+                c,
+                params=(int(lote_id),),
+            )
+        return pd.read_sql_query("SELECT * FROM postventa_full_cierres ORDER BY id DESC", c)
+
+
+def get_item_snapshot_for_postventa(lote_id: int, item_id: int) -> dict:
+    with db() as c:
+        row = c.execute("SELECT * FROM items WHERE lote_id=? AND id=?", (int(lote_id), int(item_id))).fetchone()
+    if not row:
+        return {}
+    item = dict(row)
+    return {
+        "item_id": int(item.get("id") or 0),
+        "codigo_ml": norm_code(item.get("codigo_ml", "")),
+        "codigo_universal": norm_code(item.get("codigo_universal", "")),
+        "sku": norm_code(item.get("sku", "")),
+        "descripcion": clean_text(item.get("descripcion", "")),
+        "cantidad_solicitada": to_int(item.get("unidades", 0)),
+        "cantidad_preparada": to_int(item.get("acopiadas", 0)),
+    }
+
+
+def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, cantidad_reportada_full, cantidad_afectada, comentario: str, usuario: str):
+    """Crea un ítem de error postventa FULL.
+
+    No modifica escaneos, picking, etiquetas ni cantidades del lote. Solo registra
+    lo que FULL reportó después de recibir/revisar la carga.
+    """
+    try:
+        lid = int(lote_id)
+        iid = int(item_id)
+    except Exception:
+        return False, "Selecciona un lote y un producto válido del FULL."
+
+    tipo = clean_text(tipo_error)
+    if tipo not in POSTVENTA_FULL_TIPOS:
+        return False, "Selecciona un tipo de error válido."
+
+    comment = clean_text(comentario)
+    if len(comment) < 3:
+        return False, "Agrega un comentario breve para dejar trazabilidad."
+
+    snap = get_item_snapshot_for_postventa(lid, iid)
+    if not snap:
+        return False, "No encontré el producto dentro del lote seleccionado."
+
+    enviada = to_int(snap.get("cantidad_solicitada", 0))
+    preparada = to_int(snap.get("cantidad_preparada", 0))
+    reportada = None
+    if clean_text(cantidad_reportada_full) != "":
+        reportada = to_int(cantidad_reportada_full)
+    diferencia = (reportada - preparada) if reportada is not None else 0
+    afectada = to_int(cantidad_afectada)
+    if tipo == "Diferencia de cantidad" and reportada is not None:
+        afectada = abs(int(diferencia))
+    afectada = max(0, int(afectada))
+    if afectada <= 0:
+        return False, "La cantidad afectada debe ser mayor a 0."
+
+    user = clean_text(usuario) or get_operator_name()
+    now = now_cl().isoformat(timespec="seconds")
+    with db() as c:
+        cur = c.execute(
+            """
+            INSERT INTO postventa_full_errores
+            (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, tipo_error,
+             cantidad_solicitada, cantidad_preparada, cantidad_reportada_full, cantidad_diferencia,
+             cantidad_afectada, comentario, usuario, estado, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?)
+            """,
+            (
+                lid,
+                iid,
+                snap.get("codigo_ml", ""),
+                snap.get("codigo_universal", ""),
+                snap.get("sku", ""),
+                snap.get("descripcion", ""),
+                tipo,
+                enviada,
+                preparada,
+                reportada,
+                diferencia,
+                afectada,
+                comment,
+                user,
+                now,
+            ),
+        )
+        error_id = int(cur.lastrowid)
+        c.commit()
+
+    payload = build_lote_payload(lid)
+    payload.update({
+        "error_id": error_id,
+        "item_id": iid,
+        "codigo_ml": snap.get("codigo_ml", ""),
+        "codigo_universal": snap.get("codigo_universal", ""),
+        "sku": snap.get("sku", ""),
+        "descripcion": snap.get("descripcion", ""),
+        "tipo_error": tipo,
+        "tipo": tipo,
+        "cantidad_solicitada": enviada,
+        "cantidad_preparada": preparada,
+        "cantidad_reportada_full": reportada if reportada is not None else "",
+        "cantidad_diferencia": diferencia,
+        "cantidad_afectada": afectada,
+        "cantidad": afectada,
+        "comentario": comment,
+        "usuario": user,
+        "estado": "ACTIVO",
+        "created_at": now,
+    })
+    audit_payload = build_lote_payload(lid)
+    audit_payload.update({
+        "item_id": iid,
+        "event_type_audit": "POSTVENTA_FULL_ERROR_CREADO",
+        "detalle": f"{tipo} · {snap.get('sku','')} · afectadas {afectada}. {comment}",
+        "cantidad": afectada,
+        "codigo_ml": snap.get("codigo_ml", ""),
+        "sku": snap.get("sku", ""),
+        "modo": "POSTVENTA_FULL",
+        "tipo": "POSTVENTA_FULL_ERROR_CREADO",
+        "comentario": comment,
+        "created_at": now,
+    })
+    enqueue_backup_events_batch([
+        ("postventa_full_error_creado", payload),
+        ("audit_event", audit_payload),
+    ])
+    return True, f"Error postventa FULL #{error_id} registrado."
+
+
+def anular_postventa_full_error(error_id: int, motivo: str, usuario: str):
+    try:
+        eid = int(error_id)
+    except Exception:
+        return False, "ID inválido."
+    mot = clean_text(motivo)
+    if len(mot) < 3:
+        return False, "Indica un motivo de anulación."
+    user = clean_text(usuario) or get_operator_name()
+    now = now_cl().isoformat(timespec="seconds")
+    with db() as c:
+        row = c.execute("SELECT * FROM postventa_full_errores WHERE id=?", (eid,)).fetchone()
+        if not row:
+            return False, "No encontré el error postventa."
+        err = dict(row)
+        if clean_text(err.get("estado", "")) == "ANULADO":
+            return False, "Este error ya estaba anulado."
+        c.execute(
+            """
+            UPDATE postventa_full_errores
+            SET estado='ANULADO', anulado_at=?, anulado_by=?, anulado_motivo=?
+            WHERE id=?
+            """,
+            (now, user, mot, eid),
+        )
+        c.commit()
+
+    lid = int(err.get("lote_id") or 0)
+    payload = build_lote_payload(lid)
+    payload.update({
+        "error_id": eid,
+        "item_id": err.get("item_id") or "",
+        "codigo_ml": err.get("codigo_ml") or "",
+        "codigo_universal": err.get("codigo_universal") or "",
+        "sku": err.get("sku") or "",
+        "descripcion": err.get("descripcion") or "",
+        "tipo_error": err.get("tipo_error") or "",
+        "tipo": err.get("tipo_error") or "",
+        "cantidad_afectada": err.get("cantidad_afectada") or 0,
+        "cantidad": err.get("cantidad_afectada") or 0,
+        "estado": "ANULADO",
+        "comentario": mot,
+        "usuario": user,
+        "anulado_at": now,
+        "anulado_by": user,
+        "anulado_motivo": mot,
+        "created_at": now,
+    })
+    audit_payload = build_lote_payload(lid)
+    audit_payload.update({
+        "item_id": err.get("item_id") or "",
+        "event_type_audit": "POSTVENTA_FULL_ERROR_ANULADO",
+        "detalle": f"Anulado error postventa #{eid}: {mot}",
+        "cantidad": err.get("cantidad_afectada") or 0,
+        "codigo_ml": err.get("codigo_ml") or "",
+        "sku": err.get("sku") or "",
+        "modo": "POSTVENTA_FULL",
+        "tipo": "POSTVENTA_FULL_ERROR_ANULADO",
+        "comentario": mot,
+        "created_at": now,
+    })
+    enqueue_backup_events_batch([
+        ("postventa_full_error_anulado", payload),
+        ("audit_event", audit_payload),
+    ])
+    return True, f"Error postventa FULL #{eid} anulado."
+
+
+def cerrar_revision_postventa_full(lote_id: int, comentario: str, usuario: str):
+    try:
+        lid = int(lote_id)
+    except Exception:
+        return False, "Lote inválido."
+    comment = clean_text(comentario) or "Revisión postventa FULL cerrada."
+    user = clean_text(usuario) or get_operator_name()
+    now = now_cl().isoformat(timespec="seconds")
+    df = get_postventa_full_errores(lid)
+    activos = df[df["estado"].astype(str).str.upper() == "ACTIVO"] if not df.empty else pd.DataFrame()
+    total_errores = int(len(df[df["estado"].astype(str).str.upper() != "ANULADO"])) if not df.empty else 0
+    errores_activos = int(len(activos)) if not activos.empty else 0
+    unidades_afectadas = int(pd.to_numeric(activos.get("cantidad_afectada", pd.Series(dtype=int)), errors="coerce").fillna(0).sum()) if not activos.empty else 0
+    lote = get_lote(lid)
+    lote_nombre = clean_text(lote.get("nombre", f"Lote {lid}"))
+    with db() as c:
+        cur = c.execute(
+            """
+            INSERT INTO postventa_full_cierres
+            (lote_id, lote_nombre, total_errores, errores_activos, unidades_afectadas, cerrado_por, comentario, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (lid, lote_nombre, total_errores, errores_activos, unidades_afectadas, user, comment, now),
+        )
+        cierre_id = int(cur.lastrowid)
+        c.commit()
+    payload = build_lote_payload(lid)
+    payload.update({
+        "cierre_id": cierre_id,
+        "total_errores": total_errores,
+        "errores_activos": errores_activos,
+        "unidades_afectadas": unidades_afectadas,
+        "cerrado_por": user,
+        "comentario": comment,
+        "created_at": now,
+    })
+    audit_payload = build_lote_payload(lid)
+    audit_payload.update({
+        "event_type_audit": "POSTVENTA_FULL_REVISION_CERRADA",
+        "detalle": f"Revisión postventa cerrada. Errores activos: {errores_activos}. {comment}",
+        "cantidad": unidades_afectadas,
+        "modo": "POSTVENTA_FULL",
+        "tipo": "POSTVENTA_FULL_REVISION_CERRADA",
+        "comentario": comment,
+        "created_at": now,
+    })
+    enqueue_backup_events_batch([
+        ("postventa_full_revision_cerrada", payload),
+        ("audit_event", audit_payload),
+    ])
+    return True, "Revisión postventa FULL cerrada."
+
+
+def render_postventa_full_module(active_lote=None):
+    st.subheader("Postventa FULL")
+    st.caption("Registra errores informados por bodega FULL después del envío. No modifica acopios, picking ni etiquetas.")
+    lotes_df = list_lotes()
+    if lotes_df.empty:
+        st.warning("No hay lotes cargados.")
+        return
+
+    tab_reg, tab_full, tab_kpi = st.tabs(["Registrar error", "Errores por FULL", "KPI global"])
+
+    lote_options = {}
+    default_idx = 0
+    for idx, r in enumerate(lotes_df.itertuples(index=False)):
+        label = f"{int(r.id)} · {clean_text(r.nombre)} · {int(r.acopiadas)}/{int(r.unidades)}"
+        lote_options[label] = int(r.id)
+        if active_lote and int(r.id) == int(active_lote):
+            default_idx = idx
+
+    with tab_reg:
+        lote_label = st.selectbox("FULL / lote", list(lote_options.keys()), index=default_idx, key="postventa_lote_reg")
+        lote_id = lote_options[lote_label]
+        items = get_items(lote_id)
+        if items.empty:
+            st.warning("Este FULL no tiene productos.")
+        else:
+            search = st.text_input("Buscar producto", placeholder="Código ML, EAN, SKU o descripción", key="postventa_search_producto")
+            show_items = items.copy()
+            if clean_text(search):
+                q = clean_text(search).upper()
+                mask = (
+                    show_items["codigo_ml"].astype(str).str.upper().str.contains(q, na=False) |
+                    show_items["codigo_universal"].astype(str).str.upper().str.contains(q, na=False) |
+                    show_items["sku"].astype(str).str.upper().str.contains(q, na=False) |
+                    show_items["descripcion"].astype(str).str.upper().str.contains(q, na=False)
+                )
+                show_items = show_items[mask]
+            show_items = show_items.head(250)
+            if show_items.empty:
+                st.info("No encontré productos con ese criterio en el FULL seleccionado.")
+            else:
+                opt_map = {}
+                labels = []
+                for _, r in show_items.iterrows():
+                    label = f"{clean_text(r.get('descripcion',''))[:70]} | SKU {clean_text(r.get('sku',''))} | ML {clean_text(r.get('codigo_ml',''))} | EAN {clean_text(r.get('codigo_universal',''))} | Prep {to_int(r.get('acopiadas',0))}/{to_int(r.get('unidades',0))}"
+                    labels.append(label)
+                    opt_map[label] = int(r["id"])
+                selected = st.selectbox("Producto del FULL", labels, key="postventa_producto_select")
+                item_id = opt_map[selected]
+                snap = get_item_snapshot_for_postventa(lote_id, item_id)
+                st.info(f"Solicitado FULL: {snap.get('cantidad_solicitada',0)} · Preparado WMS: {snap.get('cantidad_preparada',0)}")
+
+                tipo = st.selectbox("Tipo de error", POSTVENTA_FULL_TIPOS, key="postventa_tipo_error")
+                cantidad_reportada = ""
+                cantidad_afectada = 1
+                if tipo == "Diferencia de cantidad":
+                    cantidad_reportada = st.number_input("Cantidad reportada por FULL", min_value=0, value=int(snap.get("cantidad_preparada", 0)), step=1, key="postventa_cantidad_reportada")
+                    diferencia = int(cantidad_reportada) - int(snap.get("cantidad_preparada", 0))
+                    cantidad_afectada = abs(diferencia)
+                    st.metric("Diferencia calculada", diferencia)
+                    st.caption("Negativo = FULL reporta menos de lo preparado. Positivo = FULL reporta más.")
+                else:
+                    cantidad_afectada = st.number_input("Cantidad afectada", min_value=1, value=1, step=1, key="postventa_cantidad_afectada")
+                comentario = st.text_area("Comentario", placeholder="Ej: FULL reporta 2 unidades dañadas en recepción", key="postventa_comentario")
+                usuario = get_operator_name()
+                st.caption(f"Usuario: {usuario}")
+                if st.button("Agregar error postventa FULL", type="primary", key="postventa_btn_crear"):
+                    ok, msg = create_postventa_full_error(lote_id, item_id, tipo, cantidad_reportada, cantidad_afectada, comentario, usuario)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    with tab_full:
+        lote_label2 = st.selectbox("Ver FULL", list(lote_options.keys()), index=default_idx, key="postventa_lote_ver")
+        lote_id2 = lote_options[lote_label2]
+        df = get_postventa_full_errores(lote_id2)
+        active_df = df[df["estado"].astype(str).str.upper() == "ACTIVO"] if not df.empty else pd.DataFrame()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Errores activos", int(len(active_df)))
+        c2.metric("Unidades afectadas", int(pd.to_numeric(active_df.get("cantidad_afectada", pd.Series(dtype=int)), errors="coerce").fillna(0).sum()) if not active_df.empty else 0)
+        c3.metric("Histórico lote", int(len(df)))
+        if df.empty:
+            st.info("Este FULL no tiene errores postventa registrados.")
+        else:
+            out = df.rename(columns={
+                "id": "ID",
+                "created_at": "Fecha",
+                "lote_nombre": "FULL",
+                "codigo_ml": "Código ML",
+                "codigo_universal": "EAN",
+                "sku": "SKU",
+                "descripcion": "Producto",
+                "tipo_error": "Tipo error",
+                "cantidad_solicitada": "Solicitado",
+                "cantidad_preparada": "Preparado WMS",
+                "cantidad_reportada_full": "Reportado FULL",
+                "cantidad_diferencia": "Diferencia",
+                "cantidad_afectada": "Afectadas",
+                "comentario": "Comentario",
+                "usuario": "Usuario",
+                "estado": "Estado",
+                "anulado_at": "Anulado",
+                "anulado_by": "Anulado por",
+                "anulado_motivo": "Motivo anulación",
+            })
+            cols = [c for c in ["ID", "Fecha", "Código ML", "EAN", "SKU", "Producto", "Tipo error", "Solicitado", "Preparado WMS", "Reportado FULL", "Diferencia", "Afectadas", "Comentario", "Usuario", "Estado", "Motivo anulación"] if c in out.columns]
+            st.dataframe(out[cols], use_container_width=True, hide_index=True, height=420)
+            active_rows = df[df["estado"].astype(str).str.upper() == "ACTIVO"]
+            if not active_rows.empty:
+                with st.expander("Anular error registrado"):
+                    error_opts = {f"#{int(r.id)} · {clean_text(r.tipo_error)} · SKU {clean_text(r.sku)} · {clean_text(r.descripcion)[:55]}": int(r.id) for r in active_rows.itertuples(index=False)}
+                    sel_error = st.selectbox("Error a anular", list(error_opts.keys()), key="postventa_anular_select")
+                    motivo = st.text_input("Motivo de anulación", key="postventa_anular_motivo")
+                    if st.button("Anular error", key="postventa_anular_btn"):
+                        ok, msg = anular_postventa_full_error(error_opts[sel_error], motivo, get_operator_name())
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+        st.divider()
+        with st.expander("Cerrar revisión postventa de este FULL"):
+            st.caption("Esto no borra errores. Solo deja constancia de que el FULL fue revisado para cierre y KPI.")
+            comentario_cierre = st.text_area("Comentario de cierre", value="Revisión postventa FULL cerrada.", key="postventa_cierre_comment")
+            if st.button("Cerrar revisión postventa FULL", key="postventa_cierre_btn"):
+                ok, msg = cerrar_revision_postventa_full(lote_id2, comentario_cierre, get_operator_name())
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        cierres = get_postventa_full_cierres(lote_id2)
+        if not cierres.empty:
+            with st.expander("Historial de cierres de revisión"):
+                st.dataframe(cierres.rename(columns={"created_at":"Fecha", "cerrado_por":"Cerrado por", "errores_activos":"Errores activos", "unidades_afectadas":"Unidades afectadas", "comentario":"Comentario"}), use_container_width=True, hide_index=True)
+
+    with tab_kpi:
+        df_all = get_postventa_full_errores()
+        cierres_all = get_postventa_full_cierres()
+        if df_all.empty and cierres_all.empty:
+            st.info("Aún no hay datos de postventa FULL para KPI.")
+            return
+        active = df_all[df_all["estado"].astype(str).str.upper() == "ACTIVO"] if not df_all.empty else pd.DataFrame()
+        valid = df_all[df_all["estado"].astype(str).str.upper() != "ANULADO"] if not df_all.empty else pd.DataFrame()
+        total_unidades_full = int(pd.to_numeric(lotes_df.get("unidades", pd.Series(dtype=int)), errors="coerce").fillna(0).sum()) if not lotes_df.empty else 0
+        unidades_afectadas = int(pd.to_numeric(active.get("cantidad_afectada", pd.Series(dtype=int)), errors="coerce").fillna(0).sum()) if not active.empty else 0
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("FULL revisados", int(cierres_all["lote_id"].nunique()) if not cierres_all.empty else 0)
+        k2.metric("FULL con errores", int(valid["lote_id"].nunique()) if not valid.empty else 0)
+        k3.metric("Errores activos", int(len(active)))
+        k4.metric("Unidades afectadas", unidades_afectadas)
+        tasa = (unidades_afectadas / total_unidades_full * 100) if total_unidades_full else 0
+        k5.metric("Afectadas / 100 uds", f"{tasa:.2f}")
+
+        if not valid.empty:
+            st.markdown("### Ranking global")
+            r1, r2 = st.columns(2)
+            with r1:
+                st.caption("Tipos de error")
+                tipo_rank = valid.groupby("tipo_error", dropna=False).agg(errores=("id", "count"), unidades_afectadas=("cantidad_afectada", "sum")).reset_index().sort_values(["errores", "unidades_afectadas"], ascending=False)
+                st.dataframe(tipo_rank.rename(columns={"tipo_error":"Tipo error", "errores":"Errores", "unidades_afectadas":"Unidades afectadas"}), use_container_width=True, hide_index=True)
+            with r2:
+                st.caption("SKU con más unidades afectadas")
+                sku_rank = valid.groupby(["sku", "descripcion"], dropna=False).agg(errores=("id", "count"), unidades_afectadas=("cantidad_afectada", "sum")).reset_index().sort_values(["unidades_afectadas", "errores"], ascending=False).head(20)
+                st.dataframe(sku_rank.rename(columns={"sku":"SKU", "descripcion":"Producto", "errores":"Errores", "unidades_afectadas":"Unidades afectadas"}), use_container_width=True, hide_index=True)
+            st.caption("FULL con más errores")
+            lote_rank = valid.groupby(["lote_id", "lote_nombre"], dropna=False).agg(errores=("id", "count"), unidades_afectadas=("cantidad_afectada", "sum")).reset_index().sort_values(["errores", "unidades_afectadas"], ascending=False)
+            st.dataframe(lote_rank.rename(columns={"lote_id":"Lote ID", "lote_nombre":"FULL", "errores":"Errores", "unidades_afectadas":"Unidades afectadas"}), use_container_width=True, hide_index=True)
+            with st.expander("Detalle completo"):
+                cols = ["created_at", "lote_nombre", "codigo_ml", "sku", "descripcion", "tipo_error", "cantidad_preparada", "cantidad_reportada_full", "cantidad_diferencia", "cantidad_afectada", "comentario", "usuario", "estado"]
+                st.dataframe(valid[[c for c in cols if c in valid.columns]].rename(columns={
+                    "created_at":"Fecha", "lote_nombre":"FULL", "codigo_ml":"Código ML", "sku":"SKU", "descripcion":"Producto", "tipo_error":"Tipo error", "cantidad_preparada":"Preparado", "cantidad_reportada_full":"Reportado FULL", "cantidad_diferencia":"Diferencia", "cantidad_afectada":"Afectadas", "comentario":"Comentario", "usuario":"Usuario", "estado":"Estado"
+                }), use_container_width=True, hide_index=True, height=500)
+
+
 # ============================================================
 # Exportación
 # ============================================================
@@ -6531,6 +7060,8 @@ def export_lote(lote_id):
     picking_lists = get_picking_lists(lote_id)
     with db() as c:
         picking_items = pd.read_sql_query("SELECT * FROM picking_list_items WHERE lote_id=? ORDER BY picking_list_id, id", c, params=(lote_id,))
+    postventa_errores = get_postventa_full_errores(lote_id)
+    postventa_cierres = get_postventa_full_cierres(lote_id)
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         items.to_excel(writer, sheet_name="control_full", index=False)
@@ -6541,6 +7072,8 @@ def export_lote(lote_id):
         avisos.to_excel(writer, sheet_name="avisos_operacionales", index=False)
         picking_lists.to_excel(writer, sheet_name="picking_listas", index=False)
         picking_items.to_excel(writer, sheet_name="picking_items", index=False)
+        postventa_errores.to_excel(writer, sheet_name="postventa_full_errores", index=False)
+        postventa_cierres.to_excel(writer, sheet_name="postventa_full_cierres", index=False)
     return out.getvalue()
 
 
@@ -6714,7 +7247,7 @@ div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
 
 with st.sidebar:
     st.header("Menú")
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Reservas Kame", "Rescate Sheets", "Supervisor", "Etiquetas"], label_visibility="collapsed")
+    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Picking", "Reservas Kame", "Postventa FULL", "Rescate Sheets", "Supervisor", "Etiquetas"], label_visibility="collapsed")
     st.divider()
     lotes = list_lotes()
     if lotes.empty:
@@ -7244,6 +7777,9 @@ elif page == "Reservas Kame":
         st.warning("No hay lote activo.")
     else:
         render_reservas_kame_module(active_lote)
+
+elif page == "Postventa FULL":
+    render_postventa_full_module(active_lote)
 
 elif page == "Rescate Sheets":
     render_rescate_sheets()
