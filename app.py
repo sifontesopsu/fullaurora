@@ -600,7 +600,7 @@ def enqueue_backup_event(event_type: str, payload: dict):
     for attempt_wait in [0, 1, 3]:
         if attempt_wait:
             time.sleep(attempt_wait)
-        flush_backup_queue(webhook_url, limit=5000, include_failed=True)
+        flush_backup_queue_ids([event_id], webhook_url, include_failed=True)
         with db() as c:
             last_row = c.execute("SELECT status, last_error FROM backup_queue WHERE id=?", (event_id,)).fetchone()
         if last_row and clean_text(last_row["status"]) == "sent":
@@ -692,7 +692,7 @@ def enqueue_backup_events_batch(events):
     for attempt_wait in [0, 1, 3]:
         if attempt_wait:
             time.sleep(attempt_wait)
-        flush_backup_queue(url, limit=max(5000, len(events) + 10), include_failed=True)
+        flush_backup_queue_ids(ids, url, include_failed=True)
         with db() as c:
             qmarks = ",".join("?" for _ in ids)
             rows_status = c.execute(
@@ -1621,6 +1621,65 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
                 )
                 c.commit()
 
+        except Exception as e:
+            attempts_next = int(row["attempts"] or 0) + 1
+            new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
+            with db() as c:
+                c.execute(
+                    """
+                    UPDATE backup_queue
+                    SET attempts=?, status=?, last_error=?
+                    WHERE id=?
+                    """,
+                    (attempts_next, new_status, str(e)[:500], int(row["id"])),
+                )
+                c.commit()
+
+
+def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: bool = True):
+    """Envía solo los eventos indicados a Google Sheets.
+
+    Esto evita que una acción crítica del operador, como registrar una incidencia
+    desde Escaneo, se quede esperando a que se reintenten cientos de eventos viejos
+    que puedan estar pendientes o fallidos en la cola.
+    """
+    ids = [int(x) for x in (ids or []) if x is not None]
+    if not ids:
+        return
+    url = clean_text(webhook_url or get_backup_webhook_url())
+    if not url:
+        return
+    statuses = ("'pending','failed'" if include_failed else "'pending'")
+    qmarks = ",".join("?" for _ in ids)
+    with db() as c:
+        rows = c.execute(
+            f"""
+            SELECT id, event_type, payload_json, attempts, created_at
+            FROM backup_queue
+            WHERE id IN ({qmarks}) AND status IN ({statuses})
+            ORDER BY id ASC
+            """,
+            ids,
+        ).fetchall()
+
+    for row in rows:
+        event = {
+            "event_type": row["event_type"],
+            "queue_id": int(row["id"]),
+            "queued_at": row["created_at"],
+            **json.loads(row["payload_json"]),
+        }
+        try:
+            ok, detail = send_webhook_event(url, event)
+            if not ok:
+                raise RuntimeError(detail)
+            sent_at = now_cl().isoformat(timespec="seconds")
+            with db() as c:
+                c.execute(
+                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
+                    (sent_at, int(row["id"])),
+                )
+                c.commit()
         except Exception as e:
             attempts_next = int(row["attempts"] or 0) + 1
             new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
@@ -3615,10 +3674,10 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
         "comentario": detail_clean,
         "created_at": now,
     }
-    enqueue_backup_events_batch([
-        ("incidencia_creada", incidencia_payload),
-        ("audit_event", audit_payload),
-    ])
+    # En Escaneo la rapidez es crítica: la auditoría ya quedó guardada localmente
+    # y Apps Script escribe la fila de auditoría estructurada desde este mismo evento.
+    # Así evitamos hacer dos llamadas HTTP consecutivas al registrar una incidencia.
+    enqueue_backup_event("incidencia_creada", incidencia_payload)
     return True, incidencia_id, snap
 
 
