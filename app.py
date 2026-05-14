@@ -667,7 +667,7 @@ def enqueue_backup_event(event_type: str, payload: dict):
         c.commit()
 
     # Sincronización best-effort, no bloqueante. Si falla, el evento queda pendiente.
-    trigger_backup_sync_async(limit=50)
+    trigger_backup_sync_async(limit=10)
     return event_id
 
 
@@ -714,6 +714,9 @@ def send_webhook_event(url: str, event: dict, timeout: int = 25) -> tuple[bool, 
     if parsed.get("ok") is True:
         return True, response_text[:300]
 
+    if parsed.get("transient") is True or parsed.get("retry") is True:
+        return False, f"TRANSIENT_APPS_SCRIPT: {response_text[:500]}"
+
     return False, f"Apps Script respondió ok=false: {response_text[:500]}"
 
 
@@ -739,7 +742,7 @@ def enqueue_backup_events_batch(events):
         c.commit()
 
     # Best-effort en segundo plano; la operación ya quedó en SQLite.
-    trigger_backup_sync_async(limit=max(50, min(500, len(ids))))
+    trigger_backup_sync_async(limit=max(10, min(100, len(ids))))
     return ids
 
 
@@ -1641,7 +1644,25 @@ def is_ambiguous_timeout_error(message: str) -> bool:
     fallidos aun cuando el evento ya llegó a Sheets.
     """
     msg = clean_text(message).lower()
-    return ("timeout esperando respuesta" in msg) or ("timed out" in msg) or ("timeouterror" in msg)
+    return (
+        ("timeout esperando respuesta" in msg)
+        or ("timed out" in msg)
+        or ("timeouterror" in msg)
+        or ("lock timeout" in msg)
+        or ("holding the lock" in msg)
+        or ("another process was holding the lock" in msg)
+        or ("lock_busy" in msg)
+        or ("apps script ocupado" in msg)
+        or ("script ocupado" in msg)
+        or ("service invoked too many times" in msg)
+    )
+
+
+
+
+def is_transient_backup_error(message: str) -> bool:
+    """Errores temporales de Sheets/App Script que no deben inflar fallidos."""
+    return is_ambiguous_timeout_error(message)
 
 
 def parse_iso_dt_safe(v):
@@ -1726,8 +1747,9 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
 
         except Exception as e:
             detail = str(e)[:500]
-            if is_ambiguous_timeout_error(detail):
-                # No aumentamos attempts ni lo pasamos a failed. Puede estar escrito en Sheets.
+            if is_transient_backup_error(detail):
+                # Apps Script está ocupado o respondió tarde. No cuenta como falla definitiva.
+                # Cortamos este ciclo para no golpear el candado de Apps Script en cascada.
                 with db() as c:
                     c.execute(
                         """
@@ -1738,7 +1760,7 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
                         (detail, int(row["id"])),
                     )
                     c.commit()
-                continue
+                break
 
             attempts_next = int(row["attempts"] or 0) + 1
             new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
@@ -1800,11 +1822,11 @@ def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: 
                 c.commit()
         except Exception as e:
             detail = str(e)[:500]
-            if is_ambiguous_timeout_error(detail):
+            if is_transient_backup_error(detail):
                 with db() as c:
                     c.execute("UPDATE backup_queue SET status='pending', last_error=? WHERE id=?", (detail, int(row["id"])))
                     c.commit()
-                continue
+                break
             attempts_next = int(row["attempts"] or 0) + 1
             new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
             with db() as c:
@@ -1932,7 +1954,8 @@ def retry_failed_backups(limit: int = 1000):
             """
         )
         c.commit()
-    flush_backup_queue(limit=limit, include_failed=True)
+    # Reintento gradual: si Apps Script está ocupado, flush corta al primer LOCK_BUSY/timeout.
+    flush_backup_queue(limit=min(int(limit), 100), include_failed=True)
 
 
 def get_backup_error_rows(limit: int = 20) -> pd.DataFrame:
@@ -7865,7 +7888,7 @@ with st.sidebar:
         # Sync liviano y con freno: evita lanzar 100 eventos en cada rerun/PDA.
         last_auto = float(st.session_state.get("_last_auto_backup_sync", 0) or 0)
         if time.time() - last_auto > 30:
-            trigger_backup_sync_async(limit=20)
+            trigger_backup_sync_async(limit=10)
             st.session_state["_last_auto_backup_sync"] = time.time()
     failed_backup = int(bs.get("failed") or 0)
     sent_backup = int(bs.get("sent") or 0)
