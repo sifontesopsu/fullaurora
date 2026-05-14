@@ -458,6 +458,7 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        ensure_column(c, "backup_queue", "last_attempt_at", "TEXT")
         ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
         ensure_column(c, "lotes", "closed_at", "TEXT")
         ensure_column(c, "lotes", "closed_by", "TEXT")
@@ -1632,38 +1633,84 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
         extra = f" Atención: {unmatched_scan_count} acopio(s) recuperado(s) desde Sheets y {ambiguous_scan_count} ambiguo(s). Se conservan como scans válidos del mismo lote para trazabilidad."
     return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_label_prints} evento(s) de etiquetas, {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking.{extra}"
 
-def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
-    """Envía eventos pendientes a Google Sheets.
 
-    Producción:
-    - no borra eventos si falla;
-    - después de MAX_BACKUP_ATTEMPTS deja el evento como failed;
-    - include_failed permite reintentar fallidos manualmente desde la UI.
+def is_ambiguous_timeout_error(message: str) -> bool:
+    """Timeout de Apps Script: puede haber escrito en Sheets aunque no respondió.
+
+    No debe contarse como falla definitiva de respaldo, porque eso infla eventos
+    fallidos aun cuando el evento ya llegó a Sheets.
+    """
+    msg = clean_text(message).lower()
+    return ("timeout esperando respuesta" in msg) or ("timed out" in msg) or ("timeouterror" in msg)
+
+
+def parse_iso_dt_safe(v):
+    s = clean_text(v)
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def should_skip_recent_timeout(row, cooldown_seconds: int = 90) -> bool:
+    """Evita reintentar el mismo timeout en cada rerun de Streamlit."""
+    last_error = clean_text(row["last_error"] if "last_error" in row.keys() else "")
+    if not is_ambiguous_timeout_error(last_error):
+        return False
+    last_attempt = parse_iso_dt_safe(row["last_attempt_at"] if "last_attempt_at" in row.keys() else "")
+    if not last_attempt:
+        return False
+    return (now_cl() - last_attempt).total_seconds() < int(cooldown_seconds)
+
+
+def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_failed: bool = False):
+    """Envía eventos pendientes a Google Sheets sin castigar timeouts ambiguos.
+
+    Si Apps Script demora más que el timeout, puede que Sheets sí haya escrito el
+    evento. En ese caso no lo mandamos directo a failed; queda pendiente para
+    reconciliar/reintentar con calma, evitando que el contador de fallidos suba
+    artificialmente durante la operación.
     """
     url = clean_text(webhook_url or get_backup_webhook_url())
     if not url:
         return
 
     statuses = ("'pending','failed'" if include_failed else "'pending'")
+    fetch_limit = max(int(limit) * 3, int(limit))
     with db() as c:
         rows = c.execute(
             f"""
-            SELECT id, event_type, payload_json, attempts, created_at
+            SELECT id, event_type, payload_json, attempts, created_at, status, last_error, last_attempt_at
             FROM backup_queue
             WHERE status IN ({statuses})
             ORDER BY id ASC
             LIMIT ?
             """,
-            (limit,),
+            (fetch_limit,),
         ).fetchall()
 
+    processed = 0
     for row in rows:
+        if processed >= int(limit):
+            break
+        if not include_failed and should_skip_recent_timeout(row, cooldown_seconds=90):
+            continue
+
         event = {
             "event_type": row["event_type"],
             "queue_id": int(row["id"]),
             "queued_at": row["created_at"],
             **json.loads(row["payload_json"]),
         }
+
+        attempt_at = now_cl().isoformat(timespec="seconds")
+        with db() as c:
+            c.execute("UPDATE backup_queue SET last_attempt_at=? WHERE id=?", (attempt_at, int(row["id"])))
+            c.commit()
+
+        processed += 1
         try:
             ok, detail = send_webhook_event(url, event)
             if not ok:
@@ -1678,6 +1725,21 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
                 c.commit()
 
         except Exception as e:
+            detail = str(e)[:500]
+            if is_ambiguous_timeout_error(detail):
+                # No aumentamos attempts ni lo pasamos a failed. Puede estar escrito en Sheets.
+                with db() as c:
+                    c.execute(
+                        """
+                        UPDATE backup_queue
+                        SET status='pending', last_error=?
+                        WHERE id=?
+                        """,
+                        (detail, int(row["id"])),
+                    )
+                    c.commit()
+                continue
+
             attempts_next = int(row["attempts"] or 0) + 1
             new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
             with db() as c:
@@ -1687,7 +1749,7 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
                     SET attempts=?, status=?, last_error=?
                     WHERE id=?
                     """,
-                    (attempts_next, new_status, str(e)[:500], int(row["id"])),
+                    (attempts_next, new_status, detail, int(row["id"])),
                 )
                 c.commit()
 
@@ -1695,11 +1757,10 @@ def flush_backup_queue(webhook_url: str | None = None, limit: int = 25, include_
 def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: bool = True):
     """Envía solo los eventos indicados a Google Sheets.
 
-    Esto evita que una acción crítica del operador, como registrar una incidencia
-    desde Escaneo, se quede esperando a que se reintenten cientos de eventos viejos
-    que puedan estar pendientes o fallidos en la cola.
+    Mantiene la misma regla: timeout de Apps Script no cuenta como falla definitiva,
+    porque puede haber escrito en Sheets y no alcanzó a responder.
     """
-    ids = [int(x) for x in (ids or []) if x is not None]
+    ids = [int(x) for x in (ids or []) if str(x).strip()]
     if not ids:
         return
     url = clean_text(webhook_url or get_backup_webhook_url())
@@ -1710,7 +1771,7 @@ def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: 
     with db() as c:
         rows = c.execute(
             f"""
-            SELECT id, event_type, payload_json, attempts, created_at
+            SELECT id, event_type, payload_json, attempts, created_at, status, last_error, last_attempt_at
             FROM backup_queue
             WHERE id IN ({qmarks}) AND status IN ({statuses})
             ORDER BY id ASC
@@ -1725,37 +1786,107 @@ def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: 
             "queued_at": row["created_at"],
             **json.loads(row["payload_json"]),
         }
+        attempt_at = now_cl().isoformat(timespec="seconds")
+        with db() as c:
+            c.execute("UPDATE backup_queue SET last_attempt_at=? WHERE id=?", (attempt_at, int(row["id"])))
+            c.commit()
         try:
             ok, detail = send_webhook_event(url, event)
             if not ok:
                 raise RuntimeError(detail)
             sent_at = now_cl().isoformat(timespec="seconds")
             with db() as c:
-                c.execute(
-                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
-                    (sent_at, int(row["id"])),
-                )
+                c.execute("UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?", (sent_at, int(row["id"])))
                 c.commit()
         except Exception as e:
+            detail = str(e)[:500]
+            if is_ambiguous_timeout_error(detail):
+                with db() as c:
+                    c.execute("UPDATE backup_queue SET status='pending', last_error=? WHERE id=?", (detail, int(row["id"])))
+                    c.commit()
+                continue
             attempts_next = int(row["attempts"] or 0) + 1
             new_status = "failed" if attempts_next >= MAX_BACKUP_ATTEMPTS else "pending"
             with db() as c:
                 c.execute(
-                    """
-                    UPDATE backup_queue
-                    SET attempts=?, status=?, last_error=?
-                    WHERE id=?
-                    """,
-                    (attempts_next, new_status, str(e)[:500], int(row["id"])),
+                    "UPDATE backup_queue SET attempts=?, status=?, last_error=? WHERE id=?",
+                    (attempts_next, new_status, detail, int(row["id"])),
                 )
                 c.commit()
 
+
+def reconcile_backup_queue_from_sheets(limit: int = 5000) -> int:
+    """Marca como enviados eventos que ya están en Sheets aunque Python haya recibido timeout."""
+    ok, events, _msg = get_backup_events_from_sheets()
+    if not ok or not events:
+        return 0
+
+    seen_uids = set()
+    seen_keys = set()
+    for ev in events:
+        base = dict(ev or {})
+        raw = base.get("raw_json")
+        if raw:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, dict):
+                    base.update(parsed)
+            except Exception:
+                pass
+        uid = clean_text(base.get("event_uid", ""))
+        if uid:
+            seen_uids.add(uid)
+        key = clean_text(base.get("event_key", ""))
+        if key:
+            seen_keys.add(key)
+
+    if not seen_uids and not seen_keys:
+        return 0
+
+    marked = 0
+    with db() as c:
+        rows = c.execute(
+            """
+            SELECT id, event_type, payload_json, created_at
+            FROM backup_queue
+            WHERE status <> 'sent'
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except Exception:
+                payload = {}
+            uid = clean_text(payload.get("event_uid", ""))
+            queued_event = {
+                "event_type": row["event_type"],
+                "queue_id": int(row["id"]),
+                "queued_at": row["created_at"],
+                **payload,
+            }
+            key = sheet_event_semantic_identity(queued_event)
+            if (uid and uid in seen_uids) or (key and key in seen_keys):
+                c.execute(
+                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
+                    (now_cl().isoformat(timespec="seconds"), int(row["id"])),
+                )
+                marked += 1
+        c.commit()
+    return marked
+
+
+
+
 def _backup_sync_worker(limit: int = 50):
+    """Worker liviano para drenar backup_queue sin bloquear la operación."""
     global _BACKUP_SYNC_RUNNING
     try:
         flush_backup_queue(limit=int(limit), include_failed=False)
     except Exception:
-        # El error queda registrado por flush_backup_queue en backup_queue.last_error.
+        # El error queda guardado en backup_queue.last_error; no botamos la app.
         pass
     finally:
         with _BACKUP_SYNC_LOCK:
@@ -1763,7 +1894,11 @@ def _backup_sync_worker(limit: int = 50):
 
 
 def trigger_backup_sync_async(limit: int = 50):
-    """Lanza sincronización Sheets en segundo plano sin bloquear al operador."""
+    """Lanza sincronización Sheets en segundo plano sin bloquear al operador.
+
+    Streamlit no es un worker permanente, pero este hilo permite que el scan
+    quede guardado en SQLite y la cola intente subir a Sheets sin frenar PDA.
+    """
     global _BACKUP_SYNC_RUNNING
     if not clean_text(get_backup_webhook_url()):
         return False
@@ -1782,9 +1917,20 @@ def trigger_backup_sync_async(limit: int = 50):
 
 
 def retry_failed_backups(limit: int = 1000):
-    """Reintenta eventos fallidos sin perder su queue_id original."""
+    """Reintenta eventos fallidos sin inflar el contador.
+
+    Primero concilia contra Sheets: muchos 'fallidos' son timeouts donde Apps Script
+    sí escribió el evento pero no respondió a tiempo.
+    """
+    reconcile_backup_queue_from_sheets(limit=max(int(limit), 1000))
     with db() as c:
-        c.execute("UPDATE backup_queue SET status='pending' WHERE status='failed'")
+        c.execute(
+            """
+            UPDATE backup_queue
+            SET status='pending', attempts=0
+            WHERE status='failed'
+            """
+        )
         c.commit()
     flush_backup_queue(limit=limit, include_failed=True)
 
@@ -2100,8 +2246,11 @@ def snapshot_items_from_sqlite(lote_id: int) -> list[dict]:
 def queue_lote_snapshot_from_sqlite(lote_id: int, motivo: str = "AUTO", usuario: str = "SISTEMA", chunk_size: int = 50, force: bool = False):
     """Encola snapshot completo del lote local hacia Sheets.
 
-    No bloquea la operación. Sirve para restaurar el FULL completo aunque algunos
-    eventos individuales queden pendientes o fallen temporalmente.
+    SQLite-first:
+    - el snapshot nace desde la base operativa local;
+    - no bloquea a los operadores;
+    - no se debe repetir por cada escaneo. El hash excluye campos volátiles
+      como item_updated_at para evitar llenar Sheets con snapshots duplicados.
     """
     lid = int(lote_id)
     now = now_cl().isoformat(timespec="seconds")
@@ -2111,7 +2260,35 @@ def queue_lote_snapshot_from_sqlite(lote_id: int, motivo: str = "AUTO", usuario:
     lote_payload = build_lote_payload(lid)
     total_productos = len(items)
     total_unidades = int(sum(int(x.get("unidades") or 0) for x in items))
-    snapshot_hash = hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    # Hash estable de estructura base del lote. No incluye campos volátiles
+    # como item_updated_at, porque estos cambian con escaneos/acopio y provocan
+    # snapshots repetidos innecesarios.
+    stable_items = []
+    for it in items:
+        stable_items.append({
+            "item_id": it.get("item_id"),
+            "area": it.get("area"),
+            "nro": it.get("nro"),
+            "codigo_ml": it.get("codigo_ml"),
+            "codigo_universal": it.get("codigo_universal"),
+            "sku": it.get("sku"),
+            "descripcion": it.get("descripcion"),
+            "descripcion_kame": it.get("descripcion_kame"),
+            "descripcion_ml": it.get("descripcion_ml"),
+            "descripcion_fuente": it.get("descripcion_fuente"),
+            "familia_kame": it.get("familia_kame"),
+            "maestro_match_status": it.get("maestro_match_status"),
+            "unidades": it.get("unidades"),
+            "identificacion": it.get("identificacion"),
+            "vence": it.get("vence"),
+            "instrucciones": it.get("instrucciones"),
+            "dia": it.get("dia"),
+            "hora": it.get("hora"),
+            "item_created_at": it.get("item_created_at"),
+        })
+    snapshot_hash = hashlib.sha256(json.dumps(stable_items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
     if not force:
         try:
             with db() as c:
@@ -2128,7 +2305,8 @@ def queue_lote_snapshot_from_sqlite(lote_id: int, motivo: str = "AUTO", usuario:
                 return []
         except Exception:
             pass
-    chunk_size = max(10, int(chunk_size or 50))
+
+    chunk_size = max(25, int(chunk_size or 50))
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
     events = []
     for idx, chunk in enumerate(chunks, start=1):
@@ -2158,9 +2336,10 @@ def queue_lote_snapshot_from_sqlite(lote_id: int, motivo: str = "AUTO", usuario:
 
 
 def ensure_active_lote_snapshot_queued(lote_id: int):
-    """Encola automáticamente el snapshot del lote activo una sola vez por hash.
+    """Encola snapshot del lote activo solo si falta ese hash estable.
 
-    Esto blinda restauración desde Sheets sin bloquear al operador ni duplicar snapshots en cada rerun.
+    Ya no debe generar snapshot por cada escaneo. El hash estable del lote evita
+    duplicados aunque cambie updated_at por movimientos de acopio.
     """
     try:
         return queue_lote_snapshot_from_sqlite(int(lote_id), motivo="AUTO_ACTIVE_LOTE", usuario="SISTEMA", force=False)
@@ -7683,13 +7862,21 @@ with st.sidebar:
     pending_backup = int(bs.get("pending") or 0)
     # Intento de sincronización automático y no bloqueante.
     if pending_backup:
-        trigger_backup_sync_async(limit=100)
+        # Sync liviano y con freno: evita lanzar 100 eventos en cada rerun/PDA.
+        last_auto = float(st.session_state.get("_last_auto_backup_sync", 0) or 0)
+        if time.time() - last_auto > 30:
+            trigger_backup_sync_async(limit=20)
+            st.session_state["_last_auto_backup_sync"] = time.time()
     failed_backup = int(bs.get("failed") or 0)
     sent_backup = int(bs.get("sent") or 0)
     if failed_backup:
         st.warning(f"Respaldo Sheets: {failed_backup} eventos fallidos")
+        if st.button("Conciliar contra Sheets"):
+            n_marked = reconcile_backup_queue_from_sheets(limit=5000)
+            st.success(f"Conciliados como enviados: {n_marked}")
+            st.rerun()
         if st.button("Reintentar fallidos"):
-            retry_failed_backups(limit=1000)
+            retry_failed_backups(limit=250)
             st.rerun()
     if pending_backup:
         st.info(f"Respaldo Sheets pendiente: {pending_backup} eventos en cola")
@@ -7702,7 +7889,7 @@ with st.sidebar:
             else:
                 st.dataframe(err_df, use_container_width=True, hide_index=True, height=220)
         if st.button("Sincronizar respaldo Sheets ahora"):
-            flush_backup_queue(limit=1000)
+            flush_backup_queue(limit=250)
             st.rerun()
     else:
         st.success(f"SQLite operativo · Sheets sincronizado · enviados: {sent_backup}")
