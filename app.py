@@ -5032,6 +5032,109 @@ def apply_picking_operational_sort(df: pd.DataFrame, units_desc: bool = True) ->
     return out.drop(columns=["_sort_area", "_sort_sku", "_sort_unidades", "_sort_nro"], errors="ignore").reset_index(drop=True)
 
 
+
+
+def search_picking_assignment(lote_id: int, query: str) -> pd.DataFrame:
+    """Busca un producto del lote y muestra si está asignado a una lista de picking.
+
+    Es una consulta operativa solamente: no modifica cantidades, no crea eventos y no toca Sheets.
+    Permite buscar por SKU, Código ML, Código Universal/EAN o descripción.
+    """
+    q = clean_text(query)
+    if not lote_id or not q:
+        return pd.DataFrame()
+
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                i.id AS item_id,
+                i.area,
+                i.nro,
+                i.codigo_ml,
+                i.codigo_universal,
+                i.sku,
+                COALESCE(NULLIF(i.descripcion_kame, ''), i.descripcion, '') AS descripcion,
+                COALESCE(i.descripcion_ml, '') AS descripcion_ml,
+                COALESCE(i.familia_kame, '') AS familia_kame,
+                COALESCE(i.maestro_match_status, '') AS maestro_match_status,
+                i.unidades AS cantidad_lote,
+                pl.id AS picking_list_id,
+                pl.codigo_lista AS codigo_lista,
+                pl.asignado_a AS asignado_a,
+                pl.estado AS estado_lista,
+                pli.cantidad AS cantidad_lista,
+                COALESCE(SUM(s.cantidad), 0) AS validado_pda
+            FROM items i
+            LEFT JOIN picking_list_items pli
+                ON pli.item_id = i.id
+               AND pli.lote_id = i.lote_id
+            LEFT JOIN picking_lists pl
+                ON pl.id = pli.picking_list_id
+               AND pl.estado <> 'ANULADA'
+            LEFT JOIN scans s
+                ON s.lote_id = i.lote_id
+               AND s.item_id = i.id
+               AND s.picking_list_id = pli.picking_list_id
+            WHERE i.lote_id = ?
+            GROUP BY
+                i.id, i.area, i.nro, i.codigo_ml, i.codigo_universal, i.sku,
+                i.descripcion_kame, i.descripcion, i.descripcion_ml, i.familia_kame,
+                i.maestro_match_status, i.unidades,
+                pl.id, pl.codigo_lista, pl.asignado_a, pl.estado, pli.cantidad
+            ORDER BY i.sku, i.codigo_ml, pl.codigo_lista
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+
+    if df.empty:
+        return df
+
+    qn = normalize_header(q)
+    mask = pd.Series(False, index=df.index)
+    for col in ["sku", "codigo_ml", "codigo_universal", "descripcion", "descripcion_ml", "familia_kame"]:
+        if col in df.columns:
+            mask = mask | df[col].astype(str).map(normalize_header).str.contains(qn, na=False, regex=False)
+    df = df[mask].copy()
+    if df.empty:
+        return df
+
+    for col in ["cantidad_lote", "cantidad_lista", "validado_pda"]:
+        if col in df.columns:
+            df[col] = df[col].map(to_int)
+
+    # Los productos sin lista quedan con columnas de picking vacías.
+    df["picking_list_id"] = df["picking_list_id"].fillna(0).map(to_int)
+    df["codigo_lista"] = df["codigo_lista"].fillna("").map(clean_text)
+    df["asignado_a"] = df["asignado_a"].fillna("").map(clean_text)
+    df["estado_lista"] = df["estado_lista"].fillna("").map(clean_text)
+    df["cantidad_lista"] = df["cantidad_lista"].fillna(0).map(to_int)
+    df["validado_pda"] = df["validado_pda"].fillna(0).map(to_int)
+    df["pendiente_picking"] = (df["cantidad_lista"].astype(int) - df["validado_pda"].astype(int)).clip(lower=0)
+
+    def estado_asig(r):
+        if to_int(r.get("picking_list_id", 0)) <= 0:
+            return "SIN ASIGNAR"
+        return f"ASIGNADO · {clean_text(r.get('codigo_lista',''))} · {clean_text(r.get('asignado_a',''))}"
+
+    def estado_val(r):
+        if to_int(r.get("picking_list_id", 0)) <= 0:
+            return "SIN LISTA"
+        req = to_int(r.get("cantidad_lista", 0))
+        val = to_int(r.get("validado_pda", 0))
+        if val == 0:
+            return "SIN VALIDAR"
+        if val < req:
+            return "PARCIAL"
+        if val == req:
+            return "COMPLETO"
+        return "SOBREVALIDADO"
+
+    df["estado_asignacion"] = df.apply(estado_asig, axis=1)
+    df["estado_validacion"] = df.apply(estado_val, axis=1)
+    return df.reset_index(drop=True)
+
 def get_picking_validation_summary(picking_list_id: int) -> pd.DataFrame:
     items = get_picking_items(picking_list_id)
     if items.empty:
@@ -5575,7 +5678,7 @@ def render_picking_module(active_lote: int):
     m4.metric("Listas", 0 if lists_progress.empty else len(lists_progress))
     st.caption(f"Lote: {clean_text(lote.get('nombre',''))}")
 
-    tab_resumen, tab_crear, tab_detalle = st.tabs(["Resumen", "Crear lista", "Detalle / impresión"])
+    tab_resumen, tab_crear, tab_buscar, tab_detalle = st.tabs(["Resumen", "Crear lista", "Buscar SKU", "Detalle / impresión"])
 
     with tab_resumen:
         if lists_progress.empty:
@@ -5674,6 +5777,80 @@ def render_picking_module(active_lote: int):
                     st.rerun()
                 else:
                     st.error(msg)
+
+
+    with tab_buscar:
+        st.markdown("### Buscar asignación por SKU / código")
+        st.caption("Consulta rápida para saber si un producto del FULL ya está asignado a un pickeador y cuánto lleva validado. No modifica datos ni envía eventos.")
+        q_asig = st.text_input(
+            "Buscar producto",
+            key="pick_assignment_search",
+            placeholder="Ingresa SKU, Código ML, EAN/código universal o parte de la descripción",
+        )
+        if not clean_text(q_asig):
+            st.info("Escribe un SKU o código para buscar en el lote activo.")
+        else:
+            result = search_picking_assignment(active_lote, q_asig)
+            if result.empty:
+                st.warning("No encontré productos en este lote con ese dato.")
+            else:
+                productos_encontrados = int(result["item_id"].nunique()) if "item_id" in result.columns else len(result)
+                asignados = int((result["picking_list_id"].map(to_int) > 0).sum()) if "picking_list_id" in result.columns else 0
+                sin_asignar = int((result["picking_list_id"].map(to_int) <= 0).sum()) if "picking_list_id" in result.columns else 0
+                unidades_lista = int(result["cantidad_lista"].sum()) if "cantidad_lista" in result.columns else 0
+                validado_lista = int(result["validado_pda"].sum()) if "validado_pda" in result.columns else 0
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("Productos encontrados", productos_encontrados)
+                b2.metric("Filas asignadas", asignados)
+                b3.metric("Sin asignar", sin_asignar)
+                b4.metric("Validado", f"{validado_lista}/{unidades_lista}")
+
+                show_cols = [
+                    "estado_asignacion", "estado_validacion", "codigo_lista", "asignado_a", "estado_lista",
+                    "codigo_ml", "codigo_universal", "sku", "descripcion", "cantidad_lote", "cantidad_lista",
+                    "validado_pda", "pendiente_picking", "area", "nro"
+                ]
+                show_cols = [c for c in show_cols if c in result.columns]
+                show = result[show_cols].copy().rename(columns={
+                    "estado_asignacion": "Asignación",
+                    "estado_validacion": "Validación",
+                    "codigo_lista": "Lista",
+                    "asignado_a": "Pickeador",
+                    "estado_lista": "Estado lista",
+                    "codigo_ml": "Código ML",
+                    "codigo_universal": "Código universal",
+                    "sku": "SKU",
+                    "descripcion": "Descripción Kame",
+                    "cantidad_lote": "Cant. lote",
+                    "cantidad_lista": "Cant. lista",
+                    "validado_pda": "Validado PDA",
+                    "pendiente_picking": "Falta validar",
+                    "area": "Área",
+                    "nro": "N°",
+                })
+                st.dataframe(show, use_container_width=True, hide_index=True, height=360)
+
+                # Resumen simple por producto para no obligar a leer toda la tabla.
+                with st.expander("Resumen por producto", expanded=False):
+                    for item_id, grp in result.groupby("item_id", sort=False):
+                        r = grp.iloc[0]
+                        desc = clean_text(r.get("descripcion", ""))
+                        sku = norm_code(r.get("sku", ""))
+                        ml = norm_code(r.get("codigo_ml", ""))
+                        if (grp["picking_list_id"].map(to_int) > 0).any():
+                            asignaciones = []
+                            for rr in grp.itertuples(index=False):
+                                pid = to_int(getattr(rr, "picking_list_id", 0))
+                                if pid <= 0:
+                                    continue
+                                asignaciones.append(
+                                    f"{clean_text(getattr(rr, 'codigo_lista', ''))} · {clean_text(getattr(rr, 'asignado_a', ''))} · "
+                                    f"{clean_text(getattr(rr, 'estado_lista', ''))} · "
+                                    f"validado {to_int(getattr(rr, 'validado_pda', 0))}/{to_int(getattr(rr, 'cantidad_lista', 0))}"
+                                )
+                            st.success(f"{sku or ml} · {desc} — " + " | ".join(asignaciones))
+                        else:
+                            st.warning(f"{sku or ml} · {desc} — SIN ASIGNAR A PICKING")
 
     with tab_detalle:
         lists = get_picking_lists(active_lote)
@@ -7893,22 +8070,25 @@ with st.sidebar:
     failed_backup = int(bs.get("failed") or 0)
     sent_backup = int(bs.get("sent") or 0)
     if failed_backup:
-        st.warning(f"Respaldo Sheets: {failed_backup} eventos fallidos")
+        st.warning(f"Respaldo Sheets requiere conciliación: {failed_backup} evento(s)")
+        st.caption("La operación local sigue registrada en SQLite. Estos eventos se pueden conciliar o reintentar sin detener el escaneo.")
         if st.button("Conciliar contra Sheets"):
             n_marked = reconcile_backup_queue_from_sheets(limit=5000)
             st.success(f"Conciliados como enviados: {n_marked}")
             st.rerun()
-        if st.button("Reintentar fallidos"):
+        if st.button("Reintentar pendientes"):
             retry_failed_backups(limit=250)
             st.rerun()
     if pending_backup:
-        st.info(f"Respaldo Sheets pendiente: {pending_backup} eventos en cola")
-        if bs.get("last_error"):
-            st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
-        with st.expander("Últimos errores respaldo", expanded=False):
+        st.info(f"Respaldo Sheets pendiente: {pending_backup} evento(s) en cola")
+        with st.expander("Diagnóstico técnico respaldo", expanded=False):
+            last_error_txt = clean_text(bs.get("last_error"))
+            if last_error_txt:
+                st.caption("Último detalle técnico registrado:")
+                st.code(last_error_txt[:1200])
             err_df = get_backup_error_rows(limit=20)
             if err_df.empty:
-                st.caption("Sin errores registrados.")
+                st.caption("Sin detalles técnicos registrados.")
             else:
                 st.dataframe(err_df, use_container_width=True, hide_index=True, height=220)
         if st.button("Sincronizar respaldo Sheets ahora"):
