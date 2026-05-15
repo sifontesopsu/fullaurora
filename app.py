@@ -6410,6 +6410,25 @@ def summarize_sheet_lotes(events: list[dict]) -> pd.DataFrame:
         elif et == "lote_eliminado":
             rec["estado"] = "ELIMINADO"
 
+    # Recalcula métricas visuales usando la misma reconstrucción limpia que usa el rescate real.
+    # Evita sumar dos veces lote_item + lote_snapshot_chunk + snapshots repetidos.
+    for _lid, _rec in lotes.items():
+        try:
+            _state = build_sheet_lote_state_clean(events, int(_lid))
+            _items_state = _state.get("items", []) or []
+            _scans_state = _state.get("scans", []) or []
+            _rec["productos"] = len(_items_state)
+            _rec["unidades"] = sum(float(to_float_qty(x.get("unidades", 0))) for x in _items_state if isinstance(x, dict))
+            _rec["escaneos"] = len(_scans_state)
+            _rec["unidades_escaneadas"] = sum(float(to_int(x.get("cantidad", 0))) for x in _scans_state if isinstance(x, dict))
+            _rec["picking_listas"] = len(_state.get("picking_lists", []) or [])
+            _rec["incidencias"] = len(_state.get("incidencias", []) or [])
+            _rec["avisos"] = len(_state.get("avisos", []) or [])
+            _rec["reservas_kame"] = len(_state.get("reservas", []) or [])
+        except Exception:
+            # Si algo falla en el diagnóstico, conserva el conteo rápido para no bloquear la pantalla.
+            pass
+
     if not lotes:
         return pd.DataFrame()
     df = pd.DataFrame(list(lotes.values()))
@@ -6579,7 +6598,7 @@ def render_rescate_sheets():
     if integ_preview.get("unmatched_scans") or integ_preview.get("ambiguous_scans"):
         st.info(f"Acopios recuperables desde Sheets: {integ_preview.get('unmatched_scans',0)}. Ambiguos: {integ_preview.get('ambiguous_scans',0)}. La app los conserva como válidos del mismo lote y no mezcla otros FULL.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Productos", "Eventos", "Picking/escaneos", "Incidencias y avisos"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Productos", "Eventos", "Picking/escaneos", "Incidencias y avisos", "Diagnóstico rescate"])
     with tab1:
         if items_df.empty:
             st.warning("Este lote no tiene snapshot de productos visible en Sheets. No se puede restaurar con seguridad.")
@@ -6594,11 +6613,15 @@ def render_rescate_sheets():
         else:
             st.dataframe(mov, use_container_width=True, hide_index=True, height=320)
     with tab4:
-        ia = events_df[events_df["event_type"].astype(str).str.contains("incidencia|aviso_operacional", case=False, na=False)] if not events_df.empty else pd.DataFrame()
+        ia = events_df[events_df["event_type"].astype(str).str.contains("incidencia|aviso_operacional|postventa_full|reserva_kame|zpl_etiquetas", case=False, na=False)] if not events_df.empty else pd.DataFrame()
         if ia.empty:
-            st.info("Sin incidencias ni avisos para este lote.")
+            st.info("Sin incidencias, avisos, postventa, reservas ni etiquetas para este lote.")
         else:
             st.dataframe(ia, use_container_width=True, hide_index=True, height=320)
+    with tab5:
+        diag_df = diagnose_sheet_lote_state(state_preview)
+        st.caption("Compara lo que existe en Sheets con lo que la app reconstruirá localmente. Sirve para detectar módulos que no se levantan visualmente después del rescate.")
+        st.dataframe(diag_df, use_container_width=True, hide_index=True, height=360)
 
     st.divider()
     if items_df.empty:
@@ -6987,6 +7010,9 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
     avisos_updates = {}
     auditoria = []
     reservas = []
+    label_events = []
+    postventa_errores = {}
+    postventa_cierres = []
 
     def resolve_event_item(ev: dict):
         original_id = to_int(ev.get("item_id", 0))
@@ -7081,6 +7107,97 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
                     upd["resolved_at"] = clean_text(ev.get("resolved_at", "")) or clean_text(ev.get("created_at", ""))
                     upd["resolved_by"] = clean_text(ev.get("resolved_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
                     upd["resolution_comment"] = clean_text(ev.get("resolution_comment", "")) or clean_text(ev.get("comentario", ""))
+        elif et in {"zpl_etiquetas_generado", "ZPL_ETIQUETAS_GENERADO"}:
+            label_events.append({
+                "lote_id": target,
+                "print_scope": clean_text(ev.get("print_scope", ev.get("scope", ""))).upper(),
+                "print_kind": clean_text(ev.get("print_kind", "NORMAL")).upper() or "NORMAL",
+                "block_index": to_int(ev.get("block_index", 0)) or None,
+                "block_key": clean_text(ev.get("block_key", "")),
+                "picking_list_id": to_int(ev.get("picking_list_id", 0)) or None,
+                "picking_code": clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+                "asignado_a": clean_text(ev.get("asignado_a", "")),
+                "item_id": resolve_event_item(ev) or to_int(ev.get("item_id", 0)) or None,
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion", "")),
+                "productos_count": to_int(ev.get("productos_count", 0)),
+                "cantidad_normal": to_int(ev.get("cantidad_normal", ev.get("normal_qty", 0))),
+                "cantidad_separadores": to_int(ev.get("cantidad_separadores", ev.get("separator_qty", 0))),
+                "cantidad_total": to_int(ev.get("cantidad_total", ev.get("total_qty", ev.get("cantidad", 0)))),
+                "archivo_nombre": clean_text(ev.get("archivo_nombre", "")),
+                "zpl_hash": clean_text(ev.get("zpl_hash", "")),
+                "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+            })
+        elif et in {"postventa_full_error_creado", "POSTVENTA_FULL_ERROR_CREADO"}:
+            err_id = to_int(ev.get("error_id", 0))
+            if not err_id:
+                err_id = _stable_negative_id(f"POSTVENTA:{target}:{sheet_event_semantic_identity(ev)}", used_ids)
+                used_ids.add(err_id)
+            postventa_errores[err_id] = {
+                "id": err_id,
+                "lote_id": target,
+                "item_id": resolve_event_item(ev),
+                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                "sku": norm_code(ev.get("sku", "")),
+                "descripcion": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_kame": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                "descripcion_ml": clean_text(ev.get("descripcion_ml", "")),
+                "familia_kame": clean_text(ev.get("familia_kame", "")),
+                "tipo_error": clean_text(ev.get("tipo_error", "")) or clean_text(ev.get("tipo", "")) or "Otro",
+                "cantidad_solicitada": to_int(ev.get("cantidad_solicitada", 0)),
+                "cantidad_preparada": to_int(ev.get("cantidad_preparada", 0)),
+                "cantidad_reportada_full": to_int(ev.get("cantidad_reportada_full", 0)) if clean_text(ev.get("cantidad_reportada_full", "")) else None,
+                "cantidad_diferencia": to_int(ev.get("cantidad_diferencia", 0)),
+                "cantidad_afectada": to_int(ev.get("cantidad_afectada", ev.get("cantidad", 0))),
+                "comentario": clean_text(ev.get("comentario", "")),
+                "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "estado": clean_text(ev.get("estado", "ACTIVO")) or "ACTIVO",
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                "anulado_at": clean_text(ev.get("anulado_at", "")),
+                "anulado_by": clean_text(ev.get("anulado_by", "")),
+                "anulado_motivo": clean_text(ev.get("anulado_motivo", "")),
+            }
+        elif et in {"postventa_full_error_anulado", "POSTVENTA_FULL_ERROR_ANULADO"}:
+            err_id = to_int(ev.get("error_id", 0))
+            if err_id and err_id in postventa_errores:
+                postventa_errores[err_id].update({
+                    "estado": "ANULADO",
+                    "anulado_at": clean_text(ev.get("anulado_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")),
+                    "anulado_by": clean_text(ev.get("anulado_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "anulado_motivo": clean_text(ev.get("anulado_motivo", "")) or clean_text(ev.get("comentario", "")),
+                })
+            elif err_id:
+                postventa_errores[err_id] = {
+                    "id": err_id, "lote_id": target, "item_id": resolve_event_item(ev),
+                    "codigo_ml": norm_code(ev.get("codigo_ml", "")), "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                    "sku": norm_code(ev.get("sku", "")), "descripcion": clean_text(ev.get("descripcion", "")),
+                    "descripcion_kame": clean_text(ev.get("descripcion_kame", ev.get("descripcion", ""))), "descripcion_ml": clean_text(ev.get("descripcion_ml", "")),
+                    "familia_kame": clean_text(ev.get("familia_kame", "")), "tipo_error": clean_text(ev.get("tipo_error", ev.get("tipo", "Otro"))),
+                    "cantidad_solicitada": 0, "cantidad_preparada": 0, "cantidad_reportada_full": None, "cantidad_diferencia": 0,
+                    "cantidad_afectada": to_int(ev.get("cantidad_afectada", ev.get("cantidad", 0))), "comentario": clean_text(ev.get("comentario", "")),
+                    "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO", "estado": "ANULADO",
+                    "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "anulado_at": clean_text(ev.get("anulado_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")),
+                    "anulado_by": clean_text(ev.get("anulado_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "anulado_motivo": clean_text(ev.get("anulado_motivo", "")) or clean_text(ev.get("comentario", "")),
+                }
+        elif et in {"postventa_full_revision_cerrada", "POSTVENTA_FULL_REVISION_CERRADA"}:
+            cierre_id = to_int(ev.get("cierre_id", 0)) or _stable_negative_id(f"POSTVENTA_CIERRE:{target}:{sheet_event_semantic_identity(ev)}", used_ids)
+            used_ids.add(cierre_id)
+            postventa_cierres.append({
+                "id": cierre_id,
+                "lote_id": target,
+                "lote_nombre": clean_text(ev.get("lote_nombre", meta.get("nombre", f"Lote {target}"))),
+                "total_errores": to_int(ev.get("total_errores", 0)),
+                "errores_activos": to_int(ev.get("errores_activos", 0)),
+                "unidades_afectadas": to_int(ev.get("unidades_afectadas", 0)),
+                "cerrado_por": clean_text(ev.get("cerrado_por", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "comentario": clean_text(ev.get("comentario", "")),
+                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+            })
         elif et == "audit_event":
             auditoria.append({
                 "lote_id": target,
@@ -7134,6 +7251,9 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
         "avisos": list(avisos.values()),
         "auditoria": auditoria,
         "reservas": reservas,
+        "label_events": label_events,
+        "postventa_errores": list(postventa_errores.values()),
+        "postventa_cierres": postventa_cierres,
         "integrity": integrity,
         "events": lote_events,
     }
@@ -7164,6 +7284,145 @@ def get_sheet_lote_items_from_events(events: list[dict], lote_id: int) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+def diagnose_sheet_lote_state(state: dict) -> pd.DataFrame:
+    """Diagnóstico rápido de lo que el rescate reconstruirá para cada módulo."""
+    rows = []
+    def add(modulo, sheets_count, local_count=None, estado=None, detalle=""):
+        if estado is None:
+            estado = "OK" if (local_count is None or int(local_count) == int(sheets_count)) else "REVISAR"
+        rows.append({
+            "Módulo": modulo,
+            "Eventos/estado Sheets": int(sheets_count or 0),
+            "Registros a reconstruir": "" if local_count is None else int(local_count or 0),
+            "Estado": estado,
+            "Detalle": clean_text(detalle),
+        })
+    add("Productos", len(state.get("items", []) or []), len(state.get("items", []) or []), detalle="Snapshot limpio deduplicado")
+    add("Escaneo", len(state.get("scans", []) or []), len(state.get("scans", []) or []), detalle="Acopiadas se recalculan desde scans")
+    add("Picking listas", len(state.get("picking_lists", []) or []), len(state.get("picking_lists", []) or []))
+    add("Picking items", len(state.get("picking_items", []) or []), len(state.get("picking_items", []) or []))
+    add("Etiquetas", len(state.get("label_events", []) or []), len(state.get("label_events", []) or []), detalle="Se reconstruye label_prints/label_blocks desde zpl_etiquetas_generado")
+    add("Incidencias", len(state.get("incidencias", []) or []), len(state.get("incidencias", []) or []))
+    add("Avisos operacionales", len(state.get("avisos", []) or []), len(state.get("avisos", []) or []))
+    add("Reservas Kame", len(state.get("reservas", []) or []), len(state.get("reservas", []) or []))
+    add("Postventa FULL errores", len(state.get("postventa_errores", []) or []), len(state.get("postventa_errores", []) or []))
+    add("Postventa FULL cierres", len(state.get("postventa_cierres", []) or []), len(state.get("postventa_cierres", []) or []))
+    add("Auditoría", len(state.get("auditoria", []) or []), len(state.get("auditoria", []) or []))
+    integ = state.get("integrity", {}) or {}
+    if integ.get("fallback_from_picking"):
+        add("Integridad", integ.get("fallback_from_picking"), integ.get("fallback_from_picking"), "REVISAR", "Productos reconstruidos desde picking porque no estaban en snapshot")
+    if integ.get("unmatched_scans") or integ.get("ambiguous_scans"):
+        add("Scans recuperados", int(integ.get("unmatched_scans", 0)) + int(integ.get("ambiguous_scans", 0)), None, "REVISAR", "Hay scans con match recuperado/ambiguo; revisar detalle si el número es alto")
+    return pd.DataFrame(rows)
+
+
+def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
+    """Reconstruye el estado visual de Etiquetas después del rescate."""
+    restored = 0
+    lid = int(lote_id)
+    for evp in state.get("label_events", []) or []:
+        scope = clean_text(evp.get("print_scope", "")).upper()
+        kind = clean_text(evp.get("print_kind", "NORMAL")).upper() or "NORMAL"
+        is_reprint = 1 if kind == "REIMPRESION" else 0
+        created_at = clean_text(evp.get("created_at", "")) or now_cl().isoformat(timespec="seconds")
+        try:
+            if scope == "BLOQUE":
+                block_index = to_int(evp.get("block_index", 0))
+                block_key = clean_text(evp.get("block_key", ""))
+                if not block_index or not block_key:
+                    continue
+                labels_view_restore = label_control_view(lid)
+                blocks_restore = build_label_blocks(labels_view_restore, ROLL_CAPACITY_DEFAULT) if not labels_view_restore.empty else []
+                block = next((b for b in blocks_restore if int(b.get("block_index", 0)) == block_index and clean_text(b.get("block_key", "")) == block_key), None)
+                if not block:
+                    continue
+                c.execute(
+                    """
+                    INSERT OR REPLACE INTO label_blocks
+                    (lote_id, block_index, block_key, products_count, normal_qty, separator_qty, total_qty,
+                     status, download_count, last_printed_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (lid, block_index, block_key, int(block.get("products_count", 0)), int(block.get("normal_qty", 0)),
+                     int(block.get("separator_qty", 0)), int(block.get("total_qty", 0)), "REIMPRESO" if is_reprint else "IMPRESO",
+                     created_at, created_at, created_at),
+                )
+                for item in block.get("items", []):
+                    for pkind, qty in [("NORMAL", int(item.get("unidades", 0))), ("SEPARADOR", LABEL_SEPARATOR_PER_PRODUCT)]:
+                        c.execute(
+                            """
+                            INSERT INTO label_prints
+                            (lote_id, item_id, codigo_ml, sku, descripcion, descripcion_kame, descripcion_ml, cantidad, print_scope, print_kind,
+                             block_index, block_key, is_reprint, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'BLOQUE', ?, ?, ?, ?, ?)
+                            """,
+                            (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                             descripcion_etiqueta_value(item), clean_text(item.get("descripcion_kame", item.get("descripcion", ""))),
+                             clean_text(item.get("descripcion_ml", item.get("descripcion", ""))), qty, pkind, block_index, block_key, is_reprint, created_at),
+                        )
+                restored += 1
+            elif scope == "PICKING":
+                picking_id = to_int(evp.get("picking_list_id", 0)) or to_int(evp.get("block_index", 0))
+                block_key = clean_text(evp.get("block_key", "")) or clean_text(evp.get("picking_code", ""))
+                if not picking_id:
+                    code = clean_text(evp.get("picking_code", ""))
+                    if code:
+                        row = c.execute("SELECT id FROM picking_lists WHERE lote_id=? AND codigo_lista=?", (lid, code)).fetchone()
+                        picking_id = int(row["id"]) if row else 0
+                if not picking_id:
+                    continue
+                items_df = pd.read_sql_query("SELECT * FROM picking_list_items WHERE picking_list_id=? ORDER BY id", c, params=(int(picking_id),))
+                if items_df.empty:
+                    continue
+                for _, item in items_df.iterrows():
+                    for pkind, qty in [("NORMAL", to_int(item.get("cantidad", 0))), ("SEPARADOR", LABEL_SEPARATOR_PER_PRODUCT)]:
+                        c.execute(
+                            """
+                            INSERT INTO label_prints
+                            (lote_id, item_id, codigo_ml, sku, descripcion, descripcion_kame, descripcion_ml, cantidad, print_scope, print_kind,
+                             block_index, block_key, is_reprint, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PICKING', ?, ?, ?, ?, ?)
+                            """,
+                            (lid, int(item.get("item_id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+                             descripcion_etiqueta_value(item), clean_text(item.get("descripcion_kame", item.get("descripcion", ""))),
+                             clean_text(item.get("descripcion_ml", item.get("descripcion", ""))), qty, pkind, int(picking_id), block_key, is_reprint, created_at),
+                        )
+                restored += 1
+            elif scope == "INDIVIDUAL":
+                item_id = to_int(evp.get("item_id", 0))
+                if not item_id:
+                    # Resolver por código si el id histórico cambió.
+                    key_item = None
+                    for q, val in [("codigo_ml", norm_code(evp.get("codigo_ml", ""))), ("sku", norm_code(evp.get("sku", "")))]:
+                        if val:
+                            key_item = c.execute(f"SELECT * FROM items WHERE lote_id=? AND {q}=? LIMIT 1", (lid, val)).fetchone()
+                            if key_item:
+                                break
+                    item_id = int(key_item["id"]) if key_item else 0
+                if not item_id:
+                    continue
+                row_item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lid)).fetchone()
+                item = dict(row_item) if row_item else {}
+                qty_normal = max(1, to_int(evp.get("cantidad_normal", evp.get("cantidad_total", 1))))
+                for pkind, qty in [("NORMAL", qty_normal), ("SEPARADOR", LABEL_SEPARATOR_PER_PRODUCT)]:
+                    c.execute(
+                        """
+                        INSERT INTO label_prints
+                        (lote_id, item_id, codigo_ml, sku, descripcion, descripcion_kame, descripcion_ml, cantidad, print_scope, print_kind,
+                         block_index, block_key, is_reprint, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INDIVIDUAL', ?, NULL, NULL, ?, ?)
+                        """,
+                        (lid, item_id, norm_code(item.get("codigo_ml", evp.get("codigo_ml", ""))), norm_code(item.get("sku", evp.get("sku", ""))),
+                         descripcion_etiqueta_value(item) or clean_text(evp.get("descripcion", "")), clean_text(item.get("descripcion_kame", item.get("descripcion", ""))),
+                         clean_text(item.get("descripcion_ml", item.get("descripcion", ""))), qty, pkind, is_reprint, created_at),
+                    )
+                restored += 1
+        except Exception:
+            # No bloquea el rescate completo por un evento visual de etiqueta incompleto.
+            continue
+    return restored
+
+
 def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, replace_existing: bool = True) -> tuple[bool, str]:
     state = build_sheet_lote_state_clean(events, int(lote_id))
     meta = state.get("meta", {})
@@ -7183,6 +7442,8 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
             c.execute("DELETE FROM label_prints WHERE lote_id=?", (lid,))
             c.execute("DELETE FROM label_blocks WHERE lote_id=?", (lid,))
             c.execute("DELETE FROM reservas_kame WHERE lote_id=?", (lid,))
+            c.execute("DELETE FROM postventa_full_errores WHERE lote_id=?", (lid,))
+            c.execute("DELETE FROM postventa_full_cierres WHERE lote_id=?", (lid,))
             c.execute("DELETE FROM audit_events WHERE lote_id=?", (lid,))
             c.execute("DELETE FROM items WHERE lote_id=?", (lid,))
             c.execute("DELETE FROM lotes WHERE id=?", (lid,))
@@ -7327,17 +7588,52 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
                 """
                 INSERT INTO reservas_kame
                 (lote_id, folio, folio_auto, ficha, fecha, glosa, bodega_salida, unidad_negocio,
-                 sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, usuario, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, csv_hash, usuario, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (int(lote_id), clean_text(res.get("folio", "SIN_FOLIO")), clean_text(res.get("folio_auto", "S")), clean_text(res.get("ficha", "")), clean_text(res.get("fecha", "")), clean_text(res.get("glosa", "")), clean_text(res.get("bodega_salida", "")), clean_text(res.get("unidad_negocio", "")), to_int(res.get("sku_count", 0)), to_float_qty(res.get("unidades_total", 0)), to_int(res.get("productos_full", 0)), to_int(res.get("packs_expandidos", 0)), to_int(res.get("lineas_csv", 0)), clean_text(res.get("archivo_nombre", "")), clean_text(res.get("usuario", "")) or "SIN_USUARIO", clean_text(res.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
+                (int(lote_id), clean_text(res.get("folio", "SIN_FOLIO")), clean_text(res.get("folio_auto", "S")), clean_text(res.get("ficha", "")), clean_text(res.get("fecha", "")), clean_text(res.get("glosa", "")), clean_text(res.get("bodega_salida", "")), clean_text(res.get("unidad_negocio", "")), to_int(res.get("sku_count", 0)), to_float_qty(res.get("unidades_total", 0)), to_int(res.get("productos_full", 0)), to_int(res.get("packs_expandidos", 0)), to_int(res.get("lineas_csv", 0)), clean_text(res.get("archivo_nombre", "")), clean_text(res.get("csv_hash", "")), clean_text(res.get("usuario", "")) or "SIN_USUARIO", clean_text(res.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
             )
+
+        for pe in state.get("postventa_errores", []):
+            c.execute(
+                """
+                INSERT OR REPLACE INTO postventa_full_errores
+                (id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, tipo_error,
+                 cantidad_solicitada, cantidad_preparada, cantidad_reportada_full, cantidad_diferencia, cantidad_afectada,
+                 comentario, usuario, estado, created_at, anulado_at, anulado_by, anulado_motivo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (to_int(pe.get("id", 0)) or None, int(lote_id), pe.get("item_id"), norm_code(pe.get("codigo_ml", "")), norm_code(pe.get("codigo_universal", "")), norm_code(pe.get("sku", "")),
+                 clean_text(pe.get("descripcion", "")), clean_text(pe.get("descripcion_kame", pe.get("descripcion", ""))), clean_text(pe.get("descripcion_ml", "")), clean_text(pe.get("familia_kame", "")),
+                 clean_text(pe.get("tipo_error", "Otro")) or "Otro", to_int(pe.get("cantidad_solicitada", 0)), to_int(pe.get("cantidad_preparada", 0)),
+                 pe.get("cantidad_reportada_full"), to_int(pe.get("cantidad_diferencia", 0)), to_int(pe.get("cantidad_afectada", 0)),
+                 clean_text(pe.get("comentario", "")), clean_text(pe.get("usuario", "")) or "SIN_USUARIO", clean_text(pe.get("estado", "ACTIVO")) or "ACTIVO",
+                 clean_text(pe.get("created_at", "")) or now_cl().isoformat(timespec="seconds"), clean_text(pe.get("anulado_at", "")), clean_text(pe.get("anulado_by", "")), clean_text(pe.get("anulado_motivo", ""))),
+            )
+
+        for pc in state.get("postventa_cierres", []):
+            c.execute(
+                """
+                INSERT OR REPLACE INTO postventa_full_cierres
+                (id, lote_id, lote_nombre, total_errores, errores_activos, unidades_afectadas, cerrado_por, comentario, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (to_int(pc.get("id", 0)) or None, int(lote_id), clean_text(pc.get("lote_nombre", meta.get("nombre", ""))),
+                 to_int(pc.get("total_errores", 0)), to_int(pc.get("errores_activos", 0)), to_int(pc.get("unidades_afectadas", 0)),
+                 clean_text(pc.get("cerrado_por", "")) or "SIN_USUARIO", clean_text(pc.get("comentario", "")),
+                 clean_text(pc.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
+            )
+
+        restored_label_prints = _restore_labels_from_state(c, int(lote_id), state)
         c.commit()
 
     integ = state.get("integrity", {})
     msg = (
         f"Rescate limpio completo: 1 lote, {len(state.get('items', []))} producto(s), "
         f"{len(state.get('scans', []))} escaneo(s), {len(state.get('picking_lists', []))} lista(s) picking, "
+        f"{len(state.get('label_events', []))} impresión(es) etiqueta, "
+        f"{len(state.get('reservas', []))} reserva(s) Kame, "
+        f"{len(state.get('postventa_errores', []))} error(es) postventa, "
         f"{len(state.get('auditoria', []))} evento(s) auditoría."
     )
     if integ.get("fallback_from_picking"):
