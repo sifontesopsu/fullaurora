@@ -600,97 +600,13 @@ def attach_event_identity(event_type: str, payload: dict, queued_at: str) -> dic
     return out
 
 
-def sheet_event_content_identity(ev: dict) -> str:
-    """Identidad de contenido para deduplicar eventos main + estructurados de Sheets.
-
-    Apps Script devuelve la hoja madre `eventos` y también hojas estructuradas
-    como `picking_validaciones`, `picking_listas`, `lote_items`, etc.
-    Esas filas estructuradas muchas veces no tienen el mismo event_uid/event_key
-    que el evento original, pero representan el mismo movimiento.
-
-    Esta llave ignora event_uid/event_key y usa el contenido operativo estable
-    para que un scan, picking o snapshot no se restaure dos veces.
-    """
-    if not isinstance(ev, dict):
-        return ""
-    et = clean_text(ev.get("event_type", "")) or clean_text(ev.get("source_event_type", ""))
-    created = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", ""))
-    # created_key a nivel minuto evita que el mismo evento main/estructurado
-    # quede distinto por diferencias de 1 segundo entre queued_at y created_at.
-    created_key = created[:16] if created else ""
-    base = [
-        et,
-        norm_code(ev.get("queue_id", "")),
-        created_key,
-        clean_text(ev.get("lote_id", "")),
-    ]
-
-    if et in {"lote_snapshot_chunk", "lote_snapshot_completo"}:
-        base.extend([
-            clean_text(ev.get("snapshot_hash", "")),
-            clean_text(ev.get("chunk_index", "")),
-            clean_text(ev.get("chunk_total", "")),
-            clean_text(ev.get("productos_total", "")),
-            clean_text(ev.get("unidades_total", "")),
-        ])
-    elif et == "lote_item":
-        base.extend([
-            clean_text(ev.get("item_id", "")),
-            norm_code(ev.get("codigo_ml", "")),
-            norm_code(ev.get("codigo_universal", "")),
-            norm_code(ev.get("sku", "")),
-            clean_text(ev.get("unidades", "")) or clean_text(ev.get("cantidad", "")),
-        ])
-    elif et == "scan_agregado":
-        base.extend([
-            clean_text(ev.get("picking_list_id", "")),
-            clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
-            clean_text(ev.get("item_id", "")),
-            norm_code(ev.get("codigo_ml", "")),
-            norm_code(ev.get("codigo_universal", "")),
-            norm_code(ev.get("sku", "")),
-            clean_text(ev.get("cantidad", "")),
-            clean_text(ev.get("modo", "")),
-        ])
-    elif et.startswith("picking_lista") or et.startswith("PICKING_LISTA"):
-        base.extend([
-            clean_text(ev.get("picking_list_id", "")),
-            clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
-            clean_text(ev.get("estado", "")),
-            clean_text(ev.get("asignado_a", "")),
-            clean_text(ev.get("productos", "")),
-            clean_text(ev.get("cantidad", "")),
-            clean_text(ev.get("comentario", "")),
-        ])
-    elif et in {"zpl_etiquetas_generado", "ZPL_ETIQUETAS_GENERADO"}:
-        base.extend([
-            clean_text(ev.get("print_scope", "")),
-            clean_text(ev.get("print_kind", "")),
-            clean_text(ev.get("block_index", "")),
-            clean_text(ev.get("block_key", "")),
-            clean_text(ev.get("picking_list_id", "")),
-            clean_text(ev.get("picking_code", "")),
-            clean_text(ev.get("item_id", "")),
-            clean_text(ev.get("zpl_hash", "")),
-            clean_text(ev.get("cantidad_total", "")),
-        ])
-    else:
-        base.extend([
-            clean_text(ev.get("picking_list_id", "")),
-            clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
-            clean_text(ev.get("item_id", "")),
-            norm_code(ev.get("codigo_ml", "")),
-            norm_code(ev.get("codigo_universal", "")),
-            norm_code(ev.get("sku", "")),
-            clean_text(ev.get("cantidad", "")) or clean_text(ev.get("unidades", "")),
-            clean_text(ev.get("tipo", "")) or clean_text(ev.get("tipo_aviso", "")),
-            clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
-        ])
-    return "CONTENT:" + "|".join(base)
-
-
 def sheet_event_semantic_identity(ev: dict) -> str:
-    """Llave primaria de deduplicación para eventos leídos desde Sheets."""
+    """Llave de deduplicación para eventos leídos desde Sheets.
+
+    Nunca usa queue_id solo, porque queue_id viene de SQLite local y puede
+    repetirse después de un reboot. Primero usa event_uid/event_key si existen;
+    si no, arma una llave semántica con tipo, lote, fecha y entidades del evento.
+    """
     if not isinstance(ev, dict):
         return ""
     event_uid = clean_text(ev.get("event_uid", ""))
@@ -699,7 +615,20 @@ def sheet_event_semantic_identity(ev: dict) -> str:
     event_key = clean_text(ev.get("event_key", ""))
     if event_key:
         return f"KEY:{event_key}"
-    return sheet_event_content_identity(ev)
+    return "|".join([
+        clean_text(ev.get("event_type", "")),
+        clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", "")),
+        clean_text(ev.get("lote_id", "")),
+        clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+        clean_text(ev.get("picking_list_id", "")),
+        clean_text(ev.get("item_id", "")),
+        norm_code(ev.get("codigo_ml", "")),
+        norm_code(ev.get("codigo_universal", "")),
+        norm_code(ev.get("sku", "")),
+        clean_text(ev.get("cantidad", "")),
+        clean_text(ev.get("tipo", "")) or clean_text(ev.get("tipo_aviso", "")),
+        clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
+    ])
 
 def stop_for_backup_failure(message: str):
     """Detiene la operación de forma controlada cuando Sheets no confirma respaldo.
@@ -878,22 +807,12 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
 
     normalized_events = []
     seen_event_ids = set()
-    seen_content_ids = set()
     for raw_ev in events:
         ev = normalize_event(raw_ev)
-        # Doble deduplicación:
-        # 1) event_uid/event_key cuando existe.
-        # 2) contenido operativo para eliminar duplicados entre hoja madre eventos
-        #    y hojas estructuradas devueltas por Apps Script.
-        content_id = sheet_event_content_identity(ev)
         semantic_id = sheet_event_semantic_identity(ev)
-        if content_id and content_id in seen_content_ids:
-            continue
-        if semantic_id and semantic_id in seen_event_ids:
-            continue
-        if content_id:
-            seen_content_ids.add(content_id)
         if semantic_id:
+            if semantic_id in seen_event_ids:
+                continue
             seen_event_ids.add(semantic_id)
         normalized_events.append(ev)
 
@@ -1569,22 +1488,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     )
                     list_id_db = int(cur.lastrowid)
                 c.execute("DELETE FROM picking_list_items WHERE picking_list_id=?", (list_id_db,))
-                # Evita duplicar productos dentro de la misma lista al rescatar desde
-                # eventos + hojas estructuradas. Si aparece más de una fila para el
-                # mismo item, conserva una sola y usa la mayor cantidad informada.
-                unique_pits = {}
-                for pit in plist.get("items", []) or []:
-                    try:
-                        item_id_key = int(pit.get("item_id"))
-                    except Exception:
-                        continue
-                    if item_id_key not in unique_pits:
-                        unique_pits[item_id_key] = dict(pit)
-                    else:
-                        if to_int(pit.get("cantidad", 0)) > to_int(unique_pits[item_id_key].get("cantidad", 0)):
-                            unique_pits[item_id_key] = dict(pit)
-
-                for pit in unique_pits.values():
+                for pit in plist.get("items", []):
                     try:
                         item_id = int(pit.get("item_id"))
                     except Exception:
@@ -1622,12 +1526,14 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     block_key = clean_text(evp.get("block_key", ""))
                     if not block_index or not block_key:
                         continue
-                    # Reconstrucción por block_key contra los bloques actuales del lote.
+                    # Reconstrucción tolerante: primero por block_key, luego por block_index.
+                    # Esto evita falsos pendientes visuales si el block_key cambia después de restaurar.
                     labels_view_restore = label_control_view(lid)
                     blocks_restore = build_label_blocks(labels_view_restore, ROLL_CAPACITY_DEFAULT) if not labels_view_restore.empty else []
-                    block = next((b for b in blocks_restore if int(b.get("block_index", 0)) == block_index and clean_text(b.get("block_key", "")) == block_key), None)
+                    block = find_restored_label_block(blocks_restore, block_index, block_key)
                     if not block:
                         continue
+                    restored_block_key = clean_text(block.get("block_key", "")) or block_key
                     c.execute(
                         """
                         INSERT OR REPLACE INTO label_blocks
@@ -1635,7 +1541,7 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                          status, download_count, last_printed_at, created_at, updated_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                         """,
-                        (lid, block_index, block_key, int(block.get("products_count", 0)), int(block.get("normal_qty", 0)),
+                        (lid, block_index, restored_block_key, int(block.get("products_count", 0)), int(block.get("normal_qty", 0)),
                          int(block.get("separator_qty", 0)), int(block.get("total_qty", 0)), "REIMPRESO" if is_reprint else "IMPRESO",
                          created_at, created_at, created_at),
                     )
@@ -1644,21 +1550,21 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                             """
                             INSERT INTO label_prints
                             (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-                             block_index, block_key, is_reprint, created_at)
+                             block_index, restored_block_key, is_reprint, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'NORMAL', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             descripcion_etiqueta_value(item), int(item.get("unidades", 0)), block_index, block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), int(item.get("unidades", 0)), block_index, restored_block_key, is_reprint, created_at),
                         )
                         c.execute(
                             """
                             INSERT INTO label_prints
                             (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-                             block_index, block_key, is_reprint, created_at)
+                             block_index, restored_block_key, is_reprint, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'SEPARADOR', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, block_index, block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, block_index, restored_block_key, is_reprint, created_at),
                         )
                     restored_label_prints += 1
                 elif scope == "PICKING":
@@ -3589,10 +3495,26 @@ def register_zpl_label_event(
 
 
 def get_label_block_record(lote_id: int, block_index: int, block_key: str) -> dict:
+    """Obtiene el registro de bloque impreso.
+
+    Primero busca por key exacta. Si no encuentra, cae a block_index para
+    soportar rescates desde Sheets donde el block_key se recalcula distinto.
+    """
     with db() as c:
         row = c.execute(
             "SELECT * FROM label_blocks WHERE lote_id=? AND block_index=? AND block_key=?",
             (int(lote_id), int(block_index), clean_text(block_key)),
+        ).fetchone()
+        if row:
+            return dict(row)
+        row = c.execute(
+            """
+            SELECT * FROM label_blocks
+            WHERE lote_id=? AND block_index=?
+            ORDER BY last_printed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (int(lote_id), int(block_index)),
         ).fetchone()
     return dict(row) if row else {}
 
@@ -4436,6 +4358,50 @@ def get_label_blocks_df(lote_id: int) -> pd.DataFrame:
         )
 
 
+def label_block_print_markers(lote_id: int) -> tuple[set[str], set[int]]:
+    """Retorna marcas de bloques impresos por key y por índice.
+
+    En restauraciones desde Sheets puede cambiar el block_key si el lote fue
+    reconstruido con snapshots/ajustes, pero el block_index sigue siendo la
+    referencia operativa del bloque descargado. Esta función evita falsos
+    pendientes visuales cuando la impresión sí existe en Sheets.
+    """
+    df = get_label_blocks_df(lote_id)
+    if df.empty:
+        return set(), set()
+    keys = {clean_text(v) for v in df.get("block_key", pd.Series(dtype=str)).astype(str).tolist() if clean_text(v)}
+    indexes = set()
+    if "block_index" in df.columns:
+        for v in df["block_index"].tolist():
+            idx = to_int(v)
+            if idx:
+                indexes.add(idx)
+    return keys, indexes
+
+
+def is_label_block_marked_printed(block: dict, printed_keys: set[str], printed_indexes: set[int]) -> bool:
+    """Un bloque se considera impreso si coincide por key o, como respaldo, por índice."""
+    return clean_text(block.get("block_key", "")) in printed_keys or to_int(block.get("block_index", 0)) in printed_indexes
+
+
+def find_restored_label_block(blocks_restore: list[dict], block_index: int, block_key: str) -> dict | None:
+    """Busca un bloque restaurable primero por key exacta y luego por índice.
+
+    El fallback por índice es deliberado: evita que un cambio de hash/key del
+    bloque tras rescatar desde Sheets haga desaparecer visualmente una impresión
+    ya registrada.
+    """
+    if not blocks_restore:
+        return None
+    block_key = clean_text(block_key)
+    if block_key:
+        exact = next((b for b in blocks_restore if to_int(b.get("block_index", 0)) == int(block_index) and clean_text(b.get("block_key", "")) == block_key), None)
+        if exact:
+            return exact
+    same_index = [b for b in blocks_restore if to_int(b.get("block_index", 0)) == int(block_index)]
+    return same_index[0] if same_index else None
+
+
 def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, usuario: str):
     if is_lote_closed(lote_id):
         return False, "Este lote está cerrado. Reabre el lote antes de reimprimir."
@@ -4904,9 +4870,9 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
         issues.append(f"Quedan {label_pending} etiquetas normales pendientes de impresión.")
 
     blocks_expected = build_label_blocks(label_view, int(capacity)) if not label_view.empty else []
+    printed_keys, printed_indexes = label_block_print_markers(lote_id)
+    missing_blocks = [b for b in blocks_expected if not is_label_block_marked_printed(b, printed_keys, printed_indexes)]
     blocks_db = get_label_blocks_df(lote_id)
-    printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
-    missing_blocks = [b for b in blocks_expected if str(b["block_key"]) not in printed_keys]
     if missing_blocks:
         issues.append(f"Faltan {len(missing_blocks)} bloque(s) ZPL por descargar/imprimir.")
 
@@ -5162,24 +5128,13 @@ def search_picking_assignment(lote_id: int, query: str) -> pd.DataFrame:
                 pli.cantidad AS cantidad_lista,
                 COALESCE(SUM(s.cantidad), 0) AS validado_pda
             FROM items i
-            LEFT JOIN (
-                SELECT pli.*
-                FROM picking_list_items pli
-                JOIN picking_lists plx
-                  ON plx.id = pli.picking_list_id
-                 AND plx.estado <> 'ANULADA'
-            ) pli
+            LEFT JOIN picking_list_items pli
                 ON pli.item_id = i.id
                AND pli.lote_id = i.lote_id
             LEFT JOIN picking_lists pl
                 ON pl.id = pli.picking_list_id
-            LEFT JOIN (
-                SELECT lote_id, item_id, picking_list_id, created_at,
-                       scan_primario, scan_secundario, cantidad
-                FROM scans
-                GROUP BY lote_id, item_id, picking_list_id, created_at,
-                         scan_primario, scan_secundario, cantidad
-            ) s
+               AND pl.estado <> 'ANULADA'
+            LEFT JOIN scans s
                 ON s.lote_id = i.lote_id
                AND s.item_id = i.id
                AND s.picking_list_id = pli.picking_list_id
@@ -9248,11 +9203,10 @@ elif page == "Supervisor":
         with tab_bloques:
             labels = label_control_view(active_lote)
             expected = build_label_blocks(labels, int(capacity_sup)) if not labels.empty else []
-            blocks_db = get_label_blocks_df(active_lote)
-            printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
+            printed_keys, printed_indexes = label_block_print_markers(active_lote)
             rows = []
             for b in expected:
-                rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if str(b["block_key"]) in printed_keys else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
+                rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if is_label_block_marked_printed(b, printed_keys, printed_indexes) else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=520)
 
         with tab_reimp:
@@ -9263,9 +9217,8 @@ elif page == "Supervisor":
             if mode_rep == "Bloque completo":
                 view_rep = label_control_view(active_lote)
                 expected_rep = build_label_blocks(view_rep, int(capacity_sup)) if not view_rep.empty else []
-                blocks_db_rep = get_label_blocks_df(active_lote)
-                printed_keys_rep = set(blocks_db_rep["block_key"].astype(str).tolist()) if not blocks_db_rep.empty else set()
-                printed_blocks = [b for b in expected_rep if str(b["block_key"]) in printed_keys_rep]
+                printed_keys_rep, printed_indexes_rep = label_block_print_markers(active_lote)
+                printed_blocks = [b for b in expected_rep if is_label_block_marked_printed(b, printed_keys_rep, printed_indexes_rep)]
                 if not printed_blocks:
                     st.warning("Aún no hay bloques impresos para reimprimir.")
                 else:
@@ -9424,9 +9377,8 @@ elif page == "Reimpresión":
             view = label_control_view(active_lote)
             capacity_rep = st.number_input("Capacidad de rollo usada para reconstruir bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="rep_capacity")
             expected = build_label_blocks(view, int(capacity_rep)) if not view.empty else []
-            blocks_db = get_label_blocks_df(active_lote)
-            printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
-            printed_blocks = [b for b in expected if str(b["block_key"]) in printed_keys]
+            printed_keys, printed_indexes = label_block_print_markers(active_lote)
+            printed_blocks = [b for b in expected if is_label_block_marked_printed(b, printed_keys, printed_indexes)]
             if not printed_blocks:
                 st.warning("Aún no hay bloques impresos para reimprimir.")
             else:
