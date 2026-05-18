@@ -8595,53 +8595,109 @@ with st.sidebar:
         st.session_state.pop("active_lote_select_label", None)
         st.info("Sin lotes creados.")
     else:
-        # Selector persistente por ID real de lote.
-        # Antes el selectbox volvía al primer lote de la lista en cada rerun; como list_lotes()
-        # ordena por id DESC, el sistema saltaba al FULL nuevo al escanear o recargar.
-        # Ahora la selección queda fijada en session_state y solo cambia si el usuario cambia el selector.
+        # Selector persistente por ID real de lote + URL.
+        # Problema real en producción:
+        # - list_lotes() ordena por id DESC, por eso el FULL nuevo queda primero.
+        # - En un rerun/recarga, el selectbox puede volver a su valor interno anterior
+        #   o al primer índice y terminar cambiando al lote nuevo.
+        # Solución:
+        # 1) El lote activo vive en st.session_state["active_lote_id"].
+        # 2) También se escribe en la URL (?lote_id=...), para que un refresh duro del navegador
+        #    mantenga el FULL elegido en ese PDA/PC.
+        # 3) El widget del selectbox se sincroniza desde el ID, no al revés.
         lote_options = []
         id_by_label = {}
+        label_by_id = {}
         for r in lotes.itertuples(index=False):
             lid = int(r.id)
             label = f"#{lid} · {r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}"
             lote_options.append(label)
             id_by_label[label] = lid
+            label_by_id[lid] = label
 
-        valid_lote_ids = set(id_by_label.values())
-        saved_lote_id = st.session_state.get("active_lote_id")
-        try:
-            saved_lote_id = int(saved_lote_id)
-        except Exception:
-            saved_lote_id = None
+        valid_lote_ids = set(label_by_id.keys())
 
-        if saved_lote_id not in valid_lote_ids:
+        def _safe_int(v):
+            try:
+                if isinstance(v, (list, tuple)):
+                    v = v[0] if v else None
+                return int(v)
+            except Exception:
+                return None
+
+        def _query_lote_id():
+            try:
+                return _safe_int(st.query_params.get("lote_id", None))
+            except Exception:
+                return None
+
+        session_lote_id = _safe_int(st.session_state.get("active_lote_id"))
+        query_lote_id = _query_lote_id()
+
+        # Prioridad: sesión actual > URL > primer lote.
+        # Así, mientras el usuario está trabajando, no lo pisa la URL ni el orden DESC.
+        if session_lote_id in valid_lote_ids:
+            saved_lote_id = session_lote_id
+        elif query_lote_id in valid_lote_ids:
+            saved_lote_id = query_lote_id
+        else:
             saved_lote_id = id_by_label[lote_options[0]]
-            st.session_state["active_lote_id"] = saved_lote_id
 
-        default_idx = 0
-        for idx, label in enumerate(lote_options):
-            if id_by_label[label] == saved_lote_id:
-                default_idx = idx
-                break
+        st.session_state["active_lote_id"] = int(saved_lote_id)
+        selector_key = "active_lote_select_widget"
+        desired_label = label_by_id[int(saved_lote_id)]
+
+        # Sincroniza el valor visual del selectbox ANTES de crearlo.
+        # Esto evita que Streamlit conserve visualmente el FULL nuevo aunque active_lote_id sea otro.
+        current_widget_label = st.session_state.get(selector_key)
+        if current_widget_label not in id_by_label:
+            st.session_state[selector_key] = desired_label
+        elif int(id_by_label[current_widget_label]) != int(saved_lote_id):
+            st.session_state[selector_key] = desired_label
+
+        def _on_active_lote_changed(_id_by_label):
+            selected = st.session_state.get(selector_key)
+            if selected in _id_by_label:
+                new_lid = int(_id_by_label[selected])
+                old_lid = _safe_int(st.session_state.get("active_lote_id"))
+                if old_lid != new_lid:
+                    st.session_state["active_lote_id"] = new_lid
+                    st.session_state["_active_lote_changed"] = True
 
         selected_label = st.selectbox(
             "Lote activo",
             lote_options,
-            index=default_idx,
-            key="active_lote_select_label",
+            key=selector_key,
+            on_change=_on_active_lote_changed,
+            args=(id_by_label,),
         )
-        active_lote = int(id_by_label[selected_label])
 
-        if st.session_state.get("active_lote_id") != active_lote:
+        active_lote = int(st.session_state.get("active_lote_id") or id_by_label[selected_label])
+
+        # Si por alguna razón el callback no corrió, sincroniza igual desde el widget.
+        if selected_label in id_by_label and int(id_by_label[selected_label]) != int(active_lote):
+            old_lid = active_lote
+            active_lote = int(id_by_label[selected_label])
             st.session_state["active_lote_id"] = active_lote
+            st.session_state["_active_lote_changed"] = True
+
+        # Mantener lote activo en la URL del navegador. Esto permite refrescar la página
+        # sin saltar al lote más nuevo.
+        try:
+            if _query_lote_id() != int(active_lote):
+                st.query_params["lote_id"] = str(int(active_lote))
+        except Exception:
+            pass
+
+        if st.session_state.pop("_active_lote_changed", False):
             # Limpieza liviana de controles dependientes del lote para evitar que una lista
             # de picking o búsqueda del lote anterior quede pegada visualmente al cambiar de FULL.
             for _k in [
                 "scan_picking_select", "scan_primary", "scan_secondary", "scan_qty",
                 "pick_detail_select", "picking_search_query", "label_picking_select",
+                "active_lote_select_label",
             ]:
                 st.session_state.pop(_k, None)
-
         st.caption(f"Trabajando en lote #{active_lote}")
         # Snapshot automático del lote activo hacia Sheets, sin esperar respuesta.
         ensure_active_lote_snapshot_queued(active_lote)
