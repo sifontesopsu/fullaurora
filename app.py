@@ -4074,11 +4074,16 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
             default_code = ""
 
     if st.session_state.pop("scan_inc_reset", False):
+        # Después de guardar una incidencia, limpiamos el formulario completo.
+        # Ojo: si hay un producto escaneado en pantalla, default_code podría volver a rellenar
+        # el código en el rerun y permitir guardar accidentalmente la misma incidencia dos veces.
+        # Por eso guardamos el código de contexto que debe ignorarse hasta que cambie el producto.
         for k in ["scan_inc_codigo", "scan_inc_qty", "scan_inc_comentario"]:
             st.session_state.pop(k, None)
         st.session_state["scan_inc_tipo"] = INCIDENCIA_TIPOS[0]
 
-    if default_code and not clean_text(st.session_state.get("scan_inc_codigo", "")):
+    ignored_prefill_code = norm_code(st.session_state.get("scan_inc_ignore_prefill_code", ""))
+    if default_code and norm_code(default_code) != ignored_prefill_code and not clean_text(st.session_state.get("scan_inc_codigo", "")):
         # Prefill seguro antes de crear el widget. No se vuelve a pisar si el operador ya escribió/escaneó otro código.
         st.session_state["scan_inc_codigo"] = default_code
 
@@ -4120,6 +4125,9 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
                 if ok_inc:
                     st.session_state["scan_inc_last_msg"] = msg_inc
                     st.session_state["scan_inc_reset"] = True
+                    # Evita que el mismo producto/código se vuelva a precargar después del rerun.
+                    # El operador deberá escanear o escribir un código nuevo para crear otra incidencia.
+                    st.session_state["scan_inc_ignore_prefill_code"] = norm_code(default_code) or norm_code(codigo_inc)
                     st.rerun()
                 else:
                     st.error(msg_inc)
