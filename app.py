@@ -4059,7 +4059,12 @@ def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
 
 def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=None):
     """Incidencias creadas desde Escaneo por código real del producto.
-    No se crean incidencias generales por lote: el operador debe indicar Etiqueta ML, Código Universal o SKU.
+
+    Importante producción/PDA:
+    - No usamos st.form aquí. Muchos lectores de código envían ENTER al escanear
+      y eso puede disparar el submit del formulario antes de completar tipo/cantidad/comentario.
+    - El código se puede escanear/escribir sin guardar la incidencia. Solo el botón
+      "Guardar incidencia" ejecuta el registro.
     """
     default_code = ""
     if current_item is not None:
@@ -4068,41 +4073,56 @@ def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=
         except Exception:
             default_code = ""
 
-    with st.expander("Reportar incidencia por código", expanded=False):
-        st.caption("Escanea o ingresa Etiqueta ML, Código Universal/EAN o SKU. Si el código no calza, igual se registrará para revisión de Supervisor.")
-        with st.form("scan_incident_form", clear_on_submit=True):
-            codigo_inc = st.text_input(
-                "Etiqueta ML / Código Universal / SKU",
-                value=default_code,
-                key="scan_inc_codigo",
-                placeholder="Escanea o escribe el código afectado",
-            )
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="scan_inc_tipo")
-            with c2:
-                qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="scan_inc_qty")
-            comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, mal embalaje, etc.")
-            submit_inc = st.form_submit_button("Guardar incidencia", type="primary")
+    if st.session_state.pop("scan_inc_reset", False):
+        for k in ["scan_inc_codigo", "scan_inc_qty", "scan_inc_comentario"]:
+            st.session_state.pop(k, None)
+        st.session_state["scan_inc_tipo"] = INCIDENCIA_TIPOS[0]
+
+    if default_code and not clean_text(st.session_state.get("scan_inc_codigo", "")):
+        # Prefill seguro antes de crear el widget. No se vuelve a pisar si el operador ya escribió/escaneó otro código.
+        st.session_state["scan_inc_codigo"] = default_code
+
+    keep_open = bool(clean_text(st.session_state.get("scan_inc_codigo", ""))) or bool(clean_text(st.session_state.get("scan_inc_last_msg", "")))
+
+    with st.expander("Reportar incidencia por código", expanded=keep_open):
+        st.caption("Escanea o ingresa Etiqueta ML, Código Universal/EAN o SKU. Escanear el código NO guarda la incidencia; solo la registra el botón Guardar incidencia.")
+
+        codigo_inc = st.text_input(
+            "Etiqueta ML / Código Universal / SKU",
+            key="scan_inc_codigo",
+            placeholder="Escanea o escribe el código afectado",
+        )
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="scan_inc_tipo")
+        with c2:
+            qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="scan_inc_qty")
+        comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, mal embalaje, etc.")
 
         last_msg = clean_text(st.session_state.pop("scan_inc_last_msg", ""))
         if last_msg:
             st.success(last_msg)
 
+        submit_inc = st.button("Guardar incidencia", type="primary", key="scan_inc_guardar_btn")
+
         if submit_inc:
-            ok_inc, msg_inc = create_incidencia_por_codigo(
-                lote_id,
-                codigo_inc,
-                tipo_inc,
-                int(qty_inc),
-                comentario_inc,
-                get_operator_name(),
-            )
-            if ok_inc:
-                st.session_state["scan_inc_last_msg"] = msg_inc
-                st.rerun()
+            if not norm_code(codigo_inc):
+                st.error("Ingresa o escanea el código afectado antes de guardar la incidencia.")
             else:
-                st.error(msg_inc)
+                ok_inc, msg_inc = create_incidencia_por_codigo(
+                    lote_id,
+                    codigo_inc,
+                    tipo_inc,
+                    int(qty_inc),
+                    comentario_inc,
+                    get_operator_name(),
+                )
+                if ok_inc:
+                    st.session_state["scan_inc_last_msg"] = msg_inc
+                    st.session_state["scan_inc_reset"] = True
+                    st.rerun()
+                else:
+                    st.error(msg_inc)
 
 
 # ============================================================
@@ -9264,6 +9284,9 @@ elif page == "Supervisor":
     else:
         lote = get_lote(active_lote)
         items = get_items(active_lote)
+        # La impresión por bloques fue retirada del flujo operativo.
+        # Se conserva la variable solo por compatibilidad con validaciones históricas.
+        capacity_sup = ROLL_CAPACITY_DEFAULT
         ok_cierre, issues, cierre_data = cierre_validaciones(active_lote)
         metrics = supervisor_metrics(active_lote)
         total = metrics["total"]
