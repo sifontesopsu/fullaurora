@@ -3689,7 +3689,12 @@ def build_picking_label_block(picking_list_id: int) -> dict:
     }
 
 
-def get_picking_label_print_count(lote_id: int, picking_list_id: int, block_key: str) -> int:
+def get_picking_label_print_count(lote_id: int, picking_list_id: int, block_key: str = "") -> int:
+    """Retorna registros de impresión para una lista de picking.
+
+    Primero busca por block_key actual. Si el rescate recalculó la key, cae al
+    picking_list_id guardado como block_index. Esto evita falsos pendientes.
+    """
     with db() as c:
         row = c.execute(
             """
@@ -3699,11 +3704,97 @@ def get_picking_label_print_count(lote_id: int, picking_list_id: int, block_key:
             """,
             (int(lote_id), int(picking_list_id), clean_text(block_key)),
         ).fetchone()
+        n = int(row["n"] or 0) if row else 0
+        if n > 0:
+            return n
+        row = c.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM label_prints
+            WHERE lote_id=? AND print_scope='PICKING' AND block_index=?
+            """,
+            (int(lote_id), int(picking_list_id)),
+        ).fetchone()
     return int(row["n"] or 0) if row else 0
 
 
-def register_picking_label_download(lote_id: int, picking_list_id: int, block: dict):
-    """Registra una descarga ZPL generada desde lista de picking."""
+def get_picking_label_print_summary(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                block_index AS picking_list_id,
+                SUM(CASE WHEN print_kind='NORMAL' THEN cantidad ELSE 0 END) AS printed_normal,
+                SUM(CASE WHEN print_kind='SEPARADOR' THEN cantidad ELSE 0 END) AS printed_separators,
+                SUM(CASE WHEN is_reprint=1 AND print_kind='NORMAL' THEN cantidad ELSE 0 END) AS reprinted_normal,
+                MAX(created_at) AS last_label_printed_at,
+                COUNT(*) AS label_rows
+            FROM label_prints
+            WHERE lote_id=? AND print_scope='PICKING' AND block_index IS NOT NULL
+            GROUP BY block_index
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    if df.empty:
+        return pd.DataFrame(columns=["picking_list_id", "printed_normal", "printed_separators", "reprinted_normal", "last_label_printed_at", "label_rows"])
+    for col in ["picking_list_id", "printed_normal", "printed_separators", "reprinted_normal", "label_rows"]:
+        df[col] = df[col].fillna(0).astype(int)
+    return df
+
+
+def get_picking_label_status_df(lote_id: int) -> pd.DataFrame:
+    picking_df = get_picking_lists(lote_id)
+    cols = [
+        "picking_list_id", "codigo_lista", "asignado_a", "estado_lista", "productos", "etiquetas_requeridas",
+        "separadores", "total_zpl", "etiquetas_impresas", "reimpresas", "estado_etiquetas", "ultima_impresion"
+    ]
+    if picking_df.empty:
+        return pd.DataFrame(columns=cols)
+    picking_df = picking_df[picking_df["estado"].astype(str).str.upper() != "ANULADA"].copy()
+    if picking_df.empty:
+        return pd.DataFrame(columns=cols)
+    summary = get_picking_label_print_summary(lote_id)
+    summary_map = {int(r["picking_list_id"]): r.to_dict() for _, r in summary.iterrows()} if not summary.empty else {}
+    rows = []
+    for _, pl in picking_df.sort_values("id", ascending=False).iterrows():
+        pid = int(pl["id"])
+        block = build_picking_label_block(pid)
+        srow = summary_map.get(pid, {})
+        printed = int(srow.get("printed_normal", 0) or 0)
+        reprinted = int(srow.get("reprinted_normal", 0) or 0)
+        required = int(block.get("normal_qty", 0) or 0)
+        if printed <= 0:
+            estado_etq = "PENDIENTE"
+        elif reprinted > 0:
+            estado_etq = "REIMPRESA"
+        else:
+            estado_etq = "IMPRESA"
+        rows.append({
+            "picking_list_id": pid,
+            "codigo_lista": clean_text(pl.get("codigo_lista", "")),
+            "asignado_a": clean_text(pl.get("asignado_a", "")),
+            "estado_lista": clean_text(pl.get("estado", "")),
+            "productos": int(block.get("products_count", 0) or 0),
+            "etiquetas_requeridas": required,
+            "separadores": int(block.get("separator_qty", 0) or 0),
+            "total_zpl": int(block.get("total_qty", 0) or 0),
+            "etiquetas_impresas": printed,
+            "reimpresas": reprinted,
+            "estado_etiquetas": estado_etq,
+            "ultima_impresion": clean_text(srow.get("last_label_printed_at", "")),
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def register_picking_label_download(lote_id: int, picking_list_id: int, block: dict, motivo: str = "", usuario: str = ""):
+    """Registra una descarga ZPL generada desde lista de picking.
+
+    Regla de producción:
+    - primera descarga = impresión NORMAL automática;
+    - toda descarga posterior = REIMPRESIÓN controlada con motivo;
+    - no existe marcado manual como impreso.
+    """
     if is_lote_closed(lote_id):
         st.error("Este lote está cerrado. Reabre el lote desde Supervisor antes de imprimir etiquetas.")
         return
@@ -3711,6 +3802,11 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
     picking_id = int(picking_list_id)
     block_key = clean_text(block.get("block_key", ""))
     is_reprint = 1 if get_picking_label_print_count(lote_id, picking_id, block_key) > 0 else 0
+    motivo = clean_text(motivo)
+    usuario = clean_text(usuario) or get_operator_name()
+    if is_reprint and not motivo:
+        st.warning("Para reimprimir una lista ya impresa debes indicar motivo obligatorio.")
+        return
     items = block.get("items") or []
     if not items:
         st.warning("La lista de picking no tiene productos para imprimir.")
@@ -3738,6 +3834,15 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
             """,
             rows,
         )
+        if is_reprint:
+            c.execute(
+                """
+                INSERT INTO reimpresiones
+                (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
+                VALUES (?, NULL, ?, ?, 'PICKING_LISTA', ?, ?, ?, ?)
+                """,
+                (int(lote_id), picking_id, block_key, int(block.get("total_qty", 0)), motivo, usuario, now),
+            )
         c.commit()
 
     zpl_content = zpl_for_block(block)
@@ -3756,11 +3861,95 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
         cantidad_normal=int(block.get("normal_qty", 0)),
         cantidad_separadores=int(block.get("separator_qty", 0)),
         cantidad_total=int(block.get("total_qty", 0)),
-        usuario=get_operator_name(),
+        usuario=usuario,
     )
     event_name = "ZPL_PICKING_REIMPRESO" if is_reprint else "ZPL_PICKING_DESCARGADO"
     detail = f"Lista {clean_text(block.get('picking_code','')) or picking_id} · {int(block.get('products_count',0))} productos"
+    if is_reprint and motivo:
+        detail += f" · Motivo: {motivo}"
     log_audit_event(lote_id, event_type=event_name, detail=detail, qty=int(block.get("total_qty", 0)), mode="PICKING")
+
+
+def register_picking_item_label_reprint(lote_id: int, picking_list_id: int, item: dict, qty: int, motivo: str, usuario: str = ""):
+    """Reimprime un producto específico dentro de una lista de picking.
+
+    Queda asociado a la lista, al picker y al producto. Es reposición controlada,
+    no impresión normal abierta.
+    """
+    if is_lote_closed(lote_id):
+        st.error("Este lote está cerrado. Reabre el lote desde Supervisor antes de reimprimir etiquetas.")
+        return
+    motivo = clean_text(motivo)
+    usuario = clean_text(usuario) or get_operator_name()
+    if not motivo:
+        st.warning("Para reimprimir un producto debes indicar motivo obligatorio.")
+        return
+    qty = max(1, int(qty or 1))
+    picking_id = int(picking_list_id)
+    meta = get_picking_list_meta(picking_id)
+    now = now_cl().isoformat(timespec="seconds")
+    item_id = int(item.get("id") or item.get("item_id") or 0)
+    block_key = f"PICK-ITEM-{picking_id}-{item_id}-{hashlib.sha1((motivo + now).encode('utf-8')).hexdigest()[:8]}"
+    desc_label = descripcion_etiqueta_value(item)
+
+    with db() as c:
+        rows = [
+            (int(lote_id), item_id, norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+             desc_label, qty, "PICKING", "NORMAL", picking_id, block_key, 1, now),
+            (int(lote_id), item_id, norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
+             desc_label, LABEL_SEPARATOR_PER_PRODUCT, "PICKING", "SEPARADOR", picking_id, block_key, 1, now),
+        ]
+        c.executemany(
+            """
+            INSERT INTO label_prints
+            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
+             block_index, block_key, is_reprint, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        c.execute(
+            """
+            INSERT INTO reimpresiones
+            (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
+            VALUES (?, ?, ?, ?, 'PICKING_PRODUCTO', ?, ?, ?, ?)
+            """,
+            (int(lote_id), item_id, picking_id, block_key, qty, motivo, usuario, now),
+        )
+        c.commit()
+
+    zpl_content = zpl_for_item_with_separators(item, qty)
+    register_zpl_label_event(
+        lote_id,
+        print_scope="PICKING",
+        print_kind="REIMPRESION",
+        zpl_content=zpl_content,
+        archivo_nombre=f"reimpresion_{clean_text(meta.get('codigo_lista','PICKING')).replace(' ', '_')}_{norm_code(item.get('codigo_ml','')) or norm_code(item.get('sku',''))}.zpl",
+        block_index=picking_id,
+        block_key=block_key,
+        picking_list_id=picking_id,
+        picking_code=clean_text(meta.get("codigo_lista", "")),
+        asignado_a=clean_text(meta.get("asignado_a", "")),
+        item_id=item_id,
+        codigo_ml=item.get("codigo_ml", ""),
+        sku=item.get("sku", ""),
+        descripcion=desc_label,
+        productos_count=1,
+        cantidad_normal=int(qty),
+        cantidad_separadores=LABEL_SEPARATOR_PER_PRODUCT,
+        cantidad_total=int(qty) + LABEL_SEPARATOR_PER_PRODUCT,
+        usuario=usuario,
+    )
+    log_audit_event(
+        lote_id,
+        item_id,
+        "ZPL_PICKING_PRODUCTO_REIMPRESO",
+        f"Lista {clean_text(meta.get('codigo_lista','')) or picking_id} · {desc_label} · Motivo: {motivo}",
+        int(qty),
+        item.get("codigo_ml", ""),
+        item.get("sku", ""),
+        "PICKING",
+    )
 
 # ============================================================
 # Auditoría operacional Fase 1
@@ -4864,25 +5053,25 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
     if not avisos_activos.empty:
         issues.append(f"Hay {len(avisos_activos)} aviso(s) operacional(es) activo(s).")
 
+    picking_label_status = get_picking_label_status_df(lote_id)
+    pending_picking_labels = 0
+    if not picking_label_status.empty:
+        pending_picking_labels = int((picking_label_status["estado_etiquetas"] == "PENDIENTE").sum())
+        if pending_picking_labels > 0:
+            issues.append(f"Hay {pending_picking_labels} lista(s) de picking sin etiquetas descargadas/impresas.")
+
     label_view = label_control_view(lote_id)
     label_pending = int(label_view["label_pending"].sum()) if not label_view.empty else 0
-    if label_pending > 0:
-        issues.append(f"Quedan {label_pending} etiquetas normales pendientes de impresión.")
-
-    blocks_expected = build_label_blocks(label_view, int(capacity)) if not label_view.empty else []
-    printed_keys, printed_indexes = label_block_print_markers(lote_id)
-    missing_blocks = [b for b in blocks_expected if not is_label_block_marked_printed(b, printed_keys, printed_indexes)]
-    blocks_db = get_label_blocks_df(lote_id)
-    if missing_blocks:
-        issues.append(f"Faltan {len(missing_blocks)} bloque(s) ZPL por descargar/imprimir.")
 
     return len(issues) == 0, issues, {
         "pending_units": pending_units,
         "open_incidents": int(len(inc_abiertas)),
         "active_notices": int(len(avisos_activos)),
         "label_pending": label_pending,
-        "expected_blocks": int(len(blocks_expected)),
-        "printed_blocks": int(len(blocks_db)),
+        "expected_blocks": 0,
+        "printed_blocks": 0,
+        "picking_label_pending": pending_picking_labels,
+        "picking_label_total": int(len(picking_label_status)) if not picking_label_status.empty else 0,
     }
 
 
@@ -8967,8 +9156,7 @@ elif page == "Supervisor":
     else:
         lote = get_lote(active_lote)
         items = get_items(active_lote)
-        capacity_sup = st.number_input("Capacidad de rollo para validar bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="supervisor_capacity")
-        ok_cierre, issues, cierre_data = cierre_validaciones(active_lote, int(capacity_sup))
+        ok_cierre, issues, cierre_data = cierre_validaciones(active_lote)
         metrics = supervisor_metrics(active_lote)
         total = metrics["total"]
         done = metrics["done"]
@@ -8992,7 +9180,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_avisos, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Avisos operacionales", "Bloques", "Reimpresión", "Cierre", "Auditoría"])
+        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_avisos, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Avisos operacionales", "Etiquetas picking", "Reimpresión", "Cierre", "Auditoría"])
 
         with tab_resumen:
             view = items.copy()
@@ -9004,8 +9192,8 @@ elif page == "Supervisor":
                     "Unidades pendientes": int(view["pendiente"].sum()),
                     "Líneas totales": int(len(view)),
                     "Líneas pendientes": int((view["pendiente"] > 0).sum()),
-                    "Bloques impresos": cierre_data.get("printed_blocks", 0),
-                    "Bloques esperados": cierre_data.get("expected_blocks", 0),
+                    "Listas etiquetas pendientes": cierre_data.get("picking_label_pending", 0),
+                    "Listas picking controladas": cierre_data.get("picking_label_total", 0),
                     "Incidencias abiertas": cierre_data.get("open_incidents", 0),
                     "Avisos operacionales activos": cierre_data.get("active_notices", 0),
                 }])
@@ -9201,64 +9389,30 @@ elif page == "Supervisor":
                     st.dataframe(out_av[[c for c in cols_av if c in out_av.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_bloques:
-            labels = label_control_view(active_lote)
-            expected = build_label_blocks(labels, int(capacity_sup)) if not labels.empty else []
-            printed_keys, printed_indexes = label_block_print_markers(active_lote)
-            rows = []
-            for b in expected:
-                rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if is_label_block_marked_printed(b, printed_keys, printed_indexes) else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=520)
+            st.caption("Control de etiquetas por lista de picking. La impresión por bloques ya no forma parte del flujo operativo.")
+            pick_label_df = get_picking_label_status_df(active_lote)
+            if pick_label_df.empty:
+                st.info("No hay listas de picking activas para controlar etiquetas.")
+            else:
+                out_pick_labels = pick_label_df.rename(columns={
+                    "codigo_lista": "Lista", "asignado_a": "Picker", "estado_lista": "Estado lista",
+                    "productos": "Productos", "etiquetas_requeridas": "Etiquetas requeridas",
+                    "etiquetas_impresas": "Etiquetas impresas", "reimpresas": "Reimpresas",
+                    "estado_etiquetas": "Estado etiquetas", "ultima_impresion": "Última impresión",
+                })
+                cols_pick_labels = ["Lista", "Picker", "Estado lista", "Productos", "Etiquetas requeridas", "Etiquetas impresas", "Reimpresas", "Estado etiquetas", "Última impresión"]
+                st.dataframe(out_pick_labels[[c for c in cols_pick_labels if c in out_pick_labels.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_reimp:
-            st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
-            mode_rep = st.radio("Tipo de reimpresión", ["Bloque completo", "Producto individual"], horizontal=True, key="sup_rep_mode")
-            usuario_rep = st.text_input("Usuario que reimprime", key="sup_rep_usuario", placeholder="Ej: p1, p2, supervisor")
-            motivo_rep = st.text_area("Motivo obligatorio", key="sup_rep_motivo", placeholder="Ej: rollo se cortó a mitad de bloque, etiqueta dañada, impresora pausada, etc.")
-            if mode_rep == "Bloque completo":
-                view_rep = label_control_view(active_lote)
-                expected_rep = build_label_blocks(view_rep, int(capacity_sup)) if not view_rep.empty else []
-                printed_keys_rep, printed_indexes_rep = label_block_print_markers(active_lote)
-                printed_blocks = [b for b in expected_rep if is_label_block_marked_printed(b, printed_keys_rep, printed_indexes_rep)]
-                if not printed_blocks:
-                    st.warning("Aún no hay bloques impresos para reimprimir.")
-                else:
-                    labels_rep = [f"Bloque {int(b['block_index'])} · {int(b['products_count'])} productos · {int(b['total_qty'])} etiquetas" for b in printed_blocks]
-                    map_blocks = {labels_rep[i]: printed_blocks[i] for i in range(len(labels_rep))}
-                    selected_block_label = st.selectbox("Bloque a reimprimir", labels_rep, key="sup_rep_block")
-                    block = map_blocks[selected_block_label]
-                    zpl_data = zpl_for_block(block).encode("utf-8")
-                    fname = f"reimpresion_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
-                    if clean_text(motivo_rep) and clean_text(usuario_rep):
-                        st.download_button("Descargar ZPL y registrar reimpresión", data=zpl_data, file_name=fname, mime="text/plain", key=f"sup_reprint_block_{active_lote}_{block['block_index']}_{block['block_key']}_{hashlib.sha1((clean_text(motivo_rep)+clean_text(usuario_rep)).encode()).hexdigest()[:8]}", on_click=register_controlled_block_reprint, args=(active_lote, block, motivo_rep, usuario_rep))
-                    else:
-                        st.warning("Ingresa usuario y motivo para habilitar descarga.")
-            else:
-                view_rep = label_control_view(active_lote)
-                options_rep = []
-                option_map_rep = {}
-                for _, r in view_rep.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                    options_rep.append(label)
-                    option_map_rep[label] = int(r["id"])
-                if not options_rep:
-                    st.warning("No hay productos.")
-                else:
-                    selected_item_label = st.selectbox("Producto a reimprimir", options_rep, key="sup_rep_item")
-                    item_id = option_map_rep[selected_item_label]
-                    row = view_rep[view_rep["id"].astype(int) == int(item_id)].iloc[0].to_dict()
-                    qty_rep = st.number_input("Cantidad de etiquetas normales", min_value=1, max_value=9999, value=1, step=1, key="sup_rep_qty")
-                    zpl_ind = zpl_for_item_with_separators(row, int(qty_rep)).encode("utf-8")
-                    fname_ind = f"reimpresion_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                    if clean_text(motivo_rep) and clean_text(usuario_rep):
-                        st.download_button("Descargar ZPL individual y registrar reimpresión", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"sup_reprint_item_{active_lote}_{item_id}_{qty_rep}_{hashlib.sha1((clean_text(motivo_rep)+clean_text(usuario_rep)).encode()).hexdigest()[:8]}", on_click=register_controlled_item_reprint, args=(active_lote, row, int(qty_rep), motivo_rep, usuario_rep))
-                    else:
-                        st.warning("Ingresa usuario y motivo para habilitar descarga.")
+            st.info("La reimpresión operativa de etiquetas se gestiona desde Etiquetas → Por lista picking. La impresión por bloques fue retirada del flujo operativo.")
+            st.caption("Desde el módulo Etiquetas puedes reimprimir una lista completa o un producto específico de una lista, siempre con motivo obligatorio.")
             hist_rep = get_reimpresiones(active_lote)
-            if not hist_rep.empty:
-                st.divider()
+            if hist_rep.empty:
+                st.info("Sin reimpresiones registradas.")
+            else:
                 st.subheader("Historial de reimpresiones")
-                out_rep = hist_rep.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
-                st.dataframe(out_rep, use_container_width=True, hide_index=True, height=320)
+                out_rep = hist_rep.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Lista/Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
+                st.dataframe(out_rep, use_container_width=True, hide_index=True, height=360)
 
         with tab_cierre:
             lote_close = get_lote(active_lote)
@@ -9268,7 +9422,7 @@ elif page == "Supervisor":
             c2.metric("Unidades pendientes", data_close2.get("pending_units", 0))
             c3.metric("Incidencias abiertas", data_close2.get("open_incidents", 0))
             c4.metric("Avisos activos", data_close2.get("active_notices", 0))
-            c5.metric("Bloques", f"{data_close2.get('printed_blocks',0)}/{data_close2.get('expected_blocks',0)}")
+            c5.metric("Listas etiquetas pendientes", data_close2.get("picking_label_pending", 0))
             if clean_text(lote_close.get("status")) == "CERRADO":
                 st.success(f"Lote cerrado por {clean_text(lote_close.get('closed_by',''))} el {fmt_dt(lote_close.get('closed_at',''))}.")
                 st.caption(clean_text(lote_close.get("close_note", "")))
@@ -9369,60 +9523,14 @@ elif page == "Reimpresión":
     if not active_lote:
         st.warning("No hay lote activo.")
     else:
-        st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
-        mode_rep = st.radio("Tipo de reimpresión", ["Bloque completo", "Producto individual"], horizontal=True)
-        usuario_rep = st.text_input("Usuario que reimprime", value=get_operator_name(), key="rep_usuario")
-        motivo_rep = st.text_area("Motivo obligatorio", placeholder="Ej: rollo se cortó a mitad de bloque, etiqueta dañada, impresora pausada, etc.")
-        if mode_rep == "Bloque completo":
-            view = label_control_view(active_lote)
-            capacity_rep = st.number_input("Capacidad de rollo usada para reconstruir bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="rep_capacity")
-            expected = build_label_blocks(view, int(capacity_rep)) if not view.empty else []
-            printed_keys, printed_indexes = label_block_print_markers(active_lote)
-            printed_blocks = [b for b in expected if is_label_block_marked_printed(b, printed_keys, printed_indexes)]
-            if not printed_blocks:
-                st.warning("Aún no hay bloques impresos para reimprimir.")
-            else:
-                labels = [f"Bloque {int(b['block_index'])} · {int(b['products_count'])} productos · {int(b['total_qty'])} etiquetas" for b in printed_blocks]
-                map_blocks = {labels[i]: printed_blocks[i] for i in range(len(labels))}
-                selected_block_label = st.selectbox("Bloque a reimprimir", labels)
-                block = map_blocks[selected_block_label]
-                zpl_data = zpl_for_block(block).encode("utf-8")
-                fname = f"reimpresion_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
-                if clean_text(motivo_rep):
-                    st.download_button("Descargar ZPL y registrar reimpresión", data=zpl_data, file_name=fname, mime="text/plain", key=f"reprint_block_{active_lote}_{block['block_index']}_{block['block_key']}_{hashlib.sha1(clean_text(motivo_rep).encode()).hexdigest()[:8]}", on_click=register_controlled_block_reprint, args=(active_lote, block, motivo_rep, usuario_rep))
-                else:
-                    st.warning("Ingresa motivo para habilitar descarga.")
-                with st.expander("Productos del bloque"):
-                    bdf = pd.DataFrame(block["items"])
-                    st.dataframe(bdf[[c for c in ["codigo_ml", "sku", "descripcion", "unidades"] if c in bdf.columns]], use_container_width=True, hide_index=True)
-        else:
-            view = label_control_view(active_lote)
-            options = []
-            option_map = {}
-            for _, r in view.iterrows():
-                label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                options.append(label)
-                option_map[label] = int(r["id"])
-            if not options:
-                st.warning("No hay productos.")
-            else:
-                selected_item_label = st.selectbox("Producto a reimprimir", options)
-                item_id = option_map[selected_item_label]
-                row = view[view["id"].astype(int) == int(item_id)].iloc[0].to_dict()
-                qty_rep = st.number_input("Cantidad de etiquetas normales", min_value=1, max_value=9999, value=1, step=1)
-                zpl_ind = zpl_for_item_with_separators(row, int(qty_rep)).encode("utf-8")
-                fname_ind = f"reimpresion_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                if clean_text(motivo_rep):
-                    st.download_button("Descargar ZPL individual y registrar reimpresión", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"reprint_item_{active_lote}_{item_id}_{qty_rep}_{hashlib.sha1(clean_text(motivo_rep).encode()).hexdigest()[:8]}", on_click=register_controlled_item_reprint, args=(active_lote, row, int(qty_rep), motivo_rep, usuario_rep))
-                else:
-                    st.warning("Ingresa motivo para habilitar descarga.")
+        st.info("La reimpresión por bloques fue retirada. Usa Etiquetas → Por lista picking para reimprimir listas o productos con motivo obligatorio.")
         hist = get_reimpresiones(active_lote)
-        if not hist.empty:
-            st.divider()
+        if hist.empty:
+            st.info("Sin reimpresiones registradas.")
+        else:
             st.subheader("Historial de reimpresiones")
-            out = hist.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
+            out = hist.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Lista/Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
             st.dataframe(out, use_container_width=True, hide_index=True, height=360)
-
 
 elif page == "Cierre de lote":
     st.subheader("Cierre formal de lote")
@@ -9430,13 +9538,12 @@ elif page == "Cierre de lote":
         st.warning("No hay lote activo.")
     else:
         lote = get_lote(active_lote)
-        capacity_close = st.number_input("Capacidad de rollo para validar bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="close_capacity")
-        ok_close, issues, data_close = cierre_validaciones(active_lote, int(capacity_close))
+        ok_close, issues, data_close = cierre_validaciones(active_lote)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Estado actual", clean_text(lote.get("status", "ACTIVO")))
         c2.metric("Unidades pendientes", data_close.get("pending_units", 0))
         c3.metric("Incidencias abiertas", data_close.get("open_incidents", 0))
-        c4.metric("Bloques", f"{data_close.get('printed_blocks',0)}/{data_close.get('expected_blocks',0)}")
+        c4.metric("Listas etiquetas pendientes", data_close.get("picking_label_pending", 0))
         if clean_text(lote.get("status")) == "CERRADO":
             st.success(f"Lote cerrado por {clean_text(lote.get('closed_by',''))} el {fmt_dt(lote.get('closed_at',''))}.")
             st.caption(clean_text(lote.get("close_note", "")))
@@ -9474,7 +9581,7 @@ elif page == "Cierre de lote":
 
 elif page == "Etiquetas":
     st.subheader("Etiquetas Zebra 50x30")
-    st.caption("Módulo independiente: solo genera/descarga ZPL y registra etiquetas. No modifica el escaneo ni las unidades acopiadas.")
+    st.caption("Flujo productivo: etiquetas por lista de picking. Toda descarga queda registrada automáticamente; no existe marcado manual como impreso.")
 
     if not active_lote:
         st.warning("Primero crea o selecciona un lote FULL.")
@@ -9483,128 +9590,152 @@ elif page == "Etiquetas":
         if clean_text(lote.get("status", "ACTIVO")).upper() == "CERRADO":
             st.error(f"Lote cerrado por {clean_text(lote.get('closed_by',''))} el {fmt_dt(lote.get('closed_at',''))}. No se permite impresión normal ni reimpresión sin reapertura.")
             st.stop()
+
+        pick_status_df = get_picking_label_status_df(active_lote)
         view = label_control_view(active_lote)
-        if view.empty:
-            st.warning("El lote activo no tiene productos.")
-        else:
-            capacity = st.number_input("Capacidad de rollo dedicado", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100)
-            blocks = build_label_blocks(view, int(capacity))
-            total_products = int(len(view))
-            total_normal = int(view["unidades"].sum())
-            total_separators = int(total_products * LABEL_SEPARATOR_PER_PRODUCT)
-            total_labels = int(total_normal + total_separators)
-            printed_normal = int(view["printed_normal"].sum())
-            pending_normal = max(total_normal - printed_normal, 0)
 
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Productos", total_products)
-            c2.metric("Etiquetas producto", total_normal)
-            c3.metric("Inicio/Fin", total_separators)
-            c4.metric("Total ZPL", total_labels)
-            c5.metric("Bloques", len(blocks))
-            st.caption(f"Lote: {lote.get('nombre','')} · Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')}")
+        total_lists = int(len(pick_status_df)) if not pick_status_df.empty else 0
+        pending_lists = int((pick_status_df["estado_etiquetas"] == "PENDIENTE").sum()) if not pick_status_df.empty else 0
+        printed_lists = int((pick_status_df["estado_etiquetas"] == "IMPRESA").sum()) if not pick_status_df.empty else 0
+        reprinted_lists = int((pick_status_df["estado_etiquetas"] == "REIMPRESA").sum()) if not pick_status_df.empty else 0
+        total_required = int(pick_status_df["etiquetas_requeridas"].sum()) if not pick_status_df.empty else 0
 
-            if any(b.get("over_capacity") for b in blocks):
-                st.warning("Hay al menos un producto que por sí solo supera la capacidad del rollo. Ese producto quedará en un bloque propio.")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Listas picking", total_lists)
+        c2.metric("Pendientes", pending_lists)
+        c3.metric("Impresas", printed_lists)
+        c4.metric("Reimpresas", reprinted_lists)
+        c5.metric("Etiquetas requeridas", total_required)
+        st.caption(f"Lote: {lote.get('nombre','')} · Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')}")
 
-            tab_blocks, tab_picking_labels, tab_individual, tab_control = st.tabs(["Bloques por rollo", "Por lista picking", "Individual", "Control etiquetas"])
+        tab_picking_labels, tab_individual, tab_historial = st.tabs(["Por lista picking", "Reposición individual", "Historial y control"])
 
-            with tab_blocks:
-                st.info("Regla activa: 1 bloque = 1 rollo nuevo dedicado. Cada producto imprime: INICIO + etiquetas normales + FIN. Al descargar un ZPL, queda registrado automáticamente como impreso.")
-                for block in blocks:
-                    rec = get_label_block_record(active_lote, block["block_index"], block["block_key"])
-                    printed = bool(rec)
-                    status = rec.get("status", "PENDIENTE") if rec else "PENDIENTE"
-                    card_class = "label-card-printed" if printed else "label-card"
-                    first_item = block["items"][0]
-                    last_item = block["items"][-1]
-                    st.markdown(f"""
-                        <div class='label-card {card_class}'>
-                            <b>Bloque {int(block['block_index'])}</b><br>
-                            Estado: <b>{esc(status)}</b><br>
-                            Productos: <b>{int(block['products_count'])}</b> · Etiquetas normales: <b>{int(block['normal_qty'])}</b> · Inicio/Fin: <b>{int(block['separator_qty'])}</b> · Total rollo: <b>{int(block['total_qty'])}</b><br>
-                            Desde: <b>{esc(first_item.get('codigo_ml',''))}</b> / SKU {esc(first_item.get('sku',''))}<br>
-                            Hasta: <b>{esc(last_item.get('codigo_ml',''))}</b> / SKU {esc(last_item.get('sku',''))}
-                        </div>
-                        """, unsafe_allow_html=True)
-                    zpl_data = zpl_for_block(block).encode("utf-8")
-                    fname = f"etiquetas_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
-                    if printed:
-                        st.warning(f"Bloque {int(block['block_index'])} ya fue marcado como impreso. Para volver a imprimirlo usa la vista Reimpresión y registra motivo obligatorio.")
-                    else:
-                        label = f"Descargar ZPL bloque {int(block['block_index'])} y marcar como impreso"
-                        st.download_button(label, data=zpl_data, file_name=fname, mime="text/plain", key=f"download_block_{active_lote}_{block['block_index']}_{block['block_key']}", on_click=register_block_download, args=(active_lote, block))
-                    with st.expander(f"Ver productos del bloque {int(block['block_index'])}"):
-                        bdf = pd.DataFrame(block["items"])
-                        show_cols = ["codigo_ml", "sku", "descripcion", "unidades", "printed_normal", "label_pending", "label_status"]
-                        existing_cols = [c for c in show_cols if c in bdf.columns]
-                        st.dataframe(bdf[existing_cols], use_container_width=True, hide_index=True)
+        with tab_picking_labels:
+            st.info("Descargar ZPL lista = queda automáticamente registrada como impresa. Si la lista ya fue impresa, solo permite reimpresión con motivo obligatorio.")
+            if pick_status_df.empty:
+                st.warning("Aún no hay listas de picking activas para este lote.")
+            else:
+                filtro_lista = st.selectbox("Filtro", ["Pendientes", "Impresas", "Reimpresas", "Completadas", "Todas"], key="label_pick_filter")
+                show_lists = pick_status_df.copy()
+                if filtro_lista == "Pendientes":
+                    show_lists = show_lists[show_lists["estado_etiquetas"] == "PENDIENTE"]
+                elif filtro_lista == "Impresas":
+                    show_lists = show_lists[show_lists["estado_etiquetas"] == "IMPRESA"]
+                elif filtro_lista == "Reimpresas":
+                    show_lists = show_lists[show_lists["estado_etiquetas"] == "REIMPRESA"]
+                elif filtro_lista == "Completadas":
+                    show_lists = show_lists[show_lists["estado_lista"].astype(str).str.upper() == "COMPLETADA"]
 
-            with tab_picking_labels:
-                st.info("Imprime etiquetas usando la cantidad asignada a una lista de picking. No modifica el escaneo ni el acopio; solo registra impresión de etiquetas.")
-                picking_df = get_picking_lists(active_lote)
-                if picking_df.empty:
-                    st.warning("Aún no hay listas de picking creadas para este lote.")
+                if show_lists.empty:
+                    st.info("No hay listas para este filtro.")
                 else:
-                    picking_df = picking_df[picking_df["estado"].astype(str).str.upper() != "ANULADA"].copy()
-                    if picking_df.empty:
-                        st.warning("No hay listas de picking disponibles; las existentes están anuladas.")
-                    else:
-                        labels_pick = []
-                        pick_map = {}
-                        for _, pl in picking_df.iterrows():
-                            pid = int(pl["id"])
-                            block_pick_preview = build_picking_label_block(pid)
-                            if int(block_pick_preview.get("products_count", 0)) <= 0:
-                                continue
-                            label = (
-                                f"{clean_text(pl.get('codigo_lista',''))} · {clean_text(pl.get('asignado_a',''))} · "
-                                f"{clean_text(pl.get('estado',''))} · {int(block_pick_preview.get('products_count',0))} productos · "
-                                f"{int(block_pick_preview.get('normal_qty',0))} etiquetas"
-                            )
-                            labels_pick.append(label)
-                            pick_map[label] = pid
-                        if not labels_pick:
-                            st.warning("Las listas de picking no tienen productos imprimibles.")
-                        else:
-                            selected_pick_label = st.selectbox("Lista de picking", labels_pick, key="label_pick_select")
-                            selected_pick_id = pick_map.get(selected_pick_label)
-                            if selected_pick_id:
-                                block_pick = build_picking_label_block(int(selected_pick_id))
-                                already_pick = get_picking_label_print_count(active_lote, int(selected_pick_id), clean_text(block_pick.get("block_key", "")))
-                                p1, p2, p3, p4 = st.columns(4)
-                                p1.metric("Productos", int(block_pick.get("products_count", 0)))
-                                p2.metric("Etiquetas producto", int(block_pick.get("normal_qty", 0)))
-                                p3.metric("Inicio/Fin", int(block_pick.get("separator_qty", 0)))
-                                p4.metric("Total ZPL", int(block_pick.get("total_qty", 0)))
-                                st.caption(
-                                    f"Lista: {clean_text(block_pick.get('picking_code',''))} · "
-                                    f"Asignado a: {clean_text(block_pick.get('asignado_a',''))} · "
-                                    f"Estado: {clean_text(block_pick.get('estado',''))}"
-                                )
-                                if already_pick > 0:
-                                    st.warning("Esta lista de picking ya tiene una descarga registrada. Si vuelves a descargar, quedará marcada como reimpresión y aumentará el conteo de etiquetas impresas.")
-                                zpl_pick = zpl_for_block(block_pick).encode("utf-8")
-                                fname_pick = f"etiquetas_lote_{active_lote}_{clean_text(block_pick.get('picking_code','PICKING')).replace(' ', '_')}.zpl"
-                                st.download_button(
-                                    "Descargar ZPL de lista picking y registrar impresión",
-                                    data=zpl_pick,
-                                    file_name=fname_pick,
-                                    mime="text/plain",
-                                    key=f"download_pick_labels_{active_lote}_{selected_pick_id}_{block_pick.get('block_key','')}",
-                                    on_click=register_picking_label_download,
-                                    args=(active_lote, int(selected_pick_id), block_pick),
-                                )
-                                with st.expander("Ver productos de la lista picking"):
-                                    pick_items_df = pd.DataFrame(block_pick.get("items") or [])
-                                    cols_pick = [c for c in ["codigo_ml", "sku", "descripcion", "unidades", "area", "nro"] if c in pick_items_df.columns]
-                                    if pick_items_df.empty:
-                                        st.info("Sin productos.")
-                                    else:
-                                        st.dataframe(pick_items_df[cols_pick].rename(columns={"unidades": "cantidad_lista"}), use_container_width=True, hide_index=True)
+                    label_options = []
+                    label_map = {}
+                    for _, r in show_lists.iterrows():
+                        label = (
+                            f"{clean_text(r.get('codigo_lista',''))} · Picker {clean_text(r.get('asignado_a',''))} · "
+                            f"{clean_text(r.get('estado_etiquetas',''))} · {int(r.get('productos',0))} productos · "
+                            f"{int(r.get('etiquetas_requeridas',0))} etiquetas"
+                        )
+                        label_options.append(label)
+                        label_map[label] = int(r["picking_list_id"])
+                    selected_pick_label = st.selectbox("Lista de picking", label_options, key="label_pick_select_v2")
+                    selected_pick_id = label_map.get(selected_pick_label)
 
-            with tab_individual:
-                st.info("Para excepciones: imprimir 1 o varias etiquetas de un producto específico. También queda registrado automáticamente al descargar.")
+                    if selected_pick_id:
+                        block_pick = build_picking_label_block(int(selected_pick_id))
+                        already_pick = get_picking_label_print_count(active_lote, int(selected_pick_id), clean_text(block_pick.get("block_key", "")))
+                        is_printed = already_pick > 0
+                        p1, p2, p3, p4, p5 = st.columns(5)
+                        p1.metric("Productos", int(block_pick.get("products_count", 0)))
+                        p2.metric("Etiquetas producto", int(block_pick.get("normal_qty", 0)))
+                        p3.metric("Inicio/Fin", int(block_pick.get("separator_qty", 0)))
+                        p4.metric("Total ZPL", int(block_pick.get("total_qty", 0)))
+                        p5.metric("Estado", "IMPRESA" if is_printed else "PENDIENTE")
+                        st.caption(
+                            f"Lista: {clean_text(block_pick.get('picking_code',''))} · "
+                            f"Asignado a: {clean_text(block_pick.get('asignado_a',''))} · "
+                            f"Estado lista: {clean_text(block_pick.get('estado',''))}"
+                        )
+
+                        zpl_pick = zpl_for_block(block_pick).encode("utf-8")
+                        fname_pick = f"etiquetas_lote_{active_lote}_{clean_text(block_pick.get('picking_code','PICKING')).replace(' ', '_')}.zpl"
+                        if not is_printed:
+                            st.download_button(
+                                "Descargar ZPL lista",
+                                data=zpl_pick,
+                                file_name=fname_pick,
+                                mime="text/plain",
+                                key=f"download_pick_labels_normal_{active_lote}_{selected_pick_id}_{block_pick.get('block_key','')}",
+                                on_click=register_picking_label_download,
+                                args=(active_lote, int(selected_pick_id), block_pick),
+                            )
+                            st.caption("Al descargar, la lista queda registrada como IMPRESA automáticamente.")
+                        else:
+                            st.warning("Esta lista ya fue impresa. Para volver a descargar, registra una reimpresión controlada con motivo obligatorio.")
+                            rep_usuario = st.text_input("Usuario reimpresión", value=get_operator_name(), key=f"pick_rep_user_{selected_pick_id}")
+                            rep_motivo = st.selectbox(
+                                "Motivo de reimpresión",
+                                ["", "Rollo dañado", "Etiqueta cortada", "Error de impresora", "Reposición parcial", "Solicitud supervisor", "Otro"],
+                                key=f"pick_rep_reason_{selected_pick_id}",
+                            )
+                            rep_motivo_otro = ""
+                            if rep_motivo == "Otro":
+                                rep_motivo_otro = st.text_input("Detalle motivo", key=f"pick_rep_reason_other_{selected_pick_id}")
+                            motivo_final = rep_motivo_otro if rep_motivo == "Otro" else rep_motivo
+                            if clean_text(motivo_final):
+                                st.download_button(
+                                    "Reimprimir lista",
+                                    data=zpl_pick,
+                                    file_name=f"reimpresion_{fname_pick}",
+                                    mime="text/plain",
+                                    key=f"download_pick_labels_reprint_{active_lote}_{selected_pick_id}_{block_pick.get('block_key','')}_{hashlib.sha1(clean_text(motivo_final).encode()).hexdigest()[:8]}",
+                                    on_click=register_picking_label_download,
+                                    args=(active_lote, int(selected_pick_id), block_pick, motivo_final, rep_usuario),
+                                )
+                            else:
+                                st.caption("Selecciona o escribe motivo para habilitar la reimpresión.")
+
+                        with st.expander("Ver productos / reimprimir producto de esta lista"):
+                            pick_items_df = pd.DataFrame(block_pick.get("items") or [])
+                            if pick_items_df.empty:
+                                st.info("Sin productos.")
+                            else:
+                                cols_pick = [c for c in ["codigo_ml", "sku", "descripcion_ml", "descripcion", "unidades", "area", "nro"] if c in pick_items_df.columns]
+                                st.dataframe(pick_items_df[cols_pick].rename(columns={"unidades": "cantidad_lista", "descripcion_ml": "descripcion_etiqueta", "descripcion": "descripcion_kame"}), use_container_width=True, hide_index=True)
+                                st.divider()
+                                product_options = []
+                                product_map = {}
+                                for i, item in pick_items_df.iterrows():
+                                    label_prod = f"{norm_code(item.get('codigo_ml',''))} · SKU {norm_code(item.get('sku',''))} · {clean_text(item.get('descripcion_ml',''))[:80]}"
+                                    product_options.append(label_prod)
+                                    product_map[label_prod] = item.to_dict()
+                                selected_prod = st.selectbox("Producto a reimprimir desde esta lista", product_options, key=f"pick_item_reprint_select_{selected_pick_id}")
+                                selected_item = product_map.get(selected_prod)
+                                if selected_item:
+                                    qty_prod = st.number_input("Cantidad etiquetas normales", min_value=1, max_value=9999, value=1, step=1, key=f"pick_item_reprint_qty_{selected_pick_id}_{selected_item.get('id')}")
+                                    prod_usuario = st.text_input("Usuario", value=get_operator_name(), key=f"pick_item_reprint_user_{selected_pick_id}_{selected_item.get('id')}")
+                                    prod_motivo = st.text_input("Motivo obligatorio", key=f"pick_item_reprint_reason_{selected_pick_id}_{selected_item.get('id')}", placeholder="Ej: etiqueta dañada, reposición por corte, error de impresora")
+                                    zpl_prod = zpl_for_item_with_separators(selected_item, int(qty_prod)).encode("utf-8")
+                                    fname_prod = f"reimpresion_{clean_text(block_pick.get('picking_code','PICKING')).replace(' ', '_')}_{norm_code(selected_item.get('codigo_ml','')) or norm_code(selected_item.get('sku',''))}.zpl"
+                                    if clean_text(prod_motivo):
+                                        st.download_button(
+                                            "Reimprimir producto de la lista",
+                                            data=zpl_prod,
+                                            file_name=fname_prod,
+                                            mime="text/plain",
+                                            key=f"pick_item_reprint_btn_{active_lote}_{selected_pick_id}_{selected_item.get('id')}_{qty_prod}_{hashlib.sha1(clean_text(prod_motivo).encode()).hexdigest()[:8]}",
+                                            on_click=register_picking_item_label_reprint,
+                                            args=(active_lote, int(selected_pick_id), selected_item, int(qty_prod), prod_motivo, prod_usuario),
+                                        )
+                                    else:
+                                        st.caption("Ingresa motivo para habilitar la reimpresión del producto.")
+
+        with tab_individual:
+            st.info("Uso excepcional para reposiciones fuera de una lista. También queda registrado automáticamente al descargar.")
+            if view.empty:
+                st.warning("El lote activo no tiene productos.")
+            else:
                 options = []
                 option_map = {}
                 for _, r in view.iterrows():
@@ -9626,34 +9757,54 @@ elif page == "Etiquetas":
                     m4.metric("Estado", status)
                     st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
                     st.caption(f"Código ML: {clean_text(row.get('codigo_ml',''))} · SKU: {clean_text(row.get('sku',''))}")
-                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1)
+                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1, key=f"qty_individual_{active_lote}_{selected_id}")
                     if printed >= req:
                         st.warning("Este producto ya tiene todas sus etiquetas normales impresas. La descarga se registrará como REIMPRESIÓN.")
                     elif int(qty_ind) > pending:
                         st.warning(f"La cantidad supera lo pendiente ({pending}). Puede dejar el producto SOBREIMPRESO.")
                     zpl_ind = zpl_for_item_with_separators(row, int(qty_ind)).encode("utf-8")
                     fname_ind = f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                    st.download_button("Descargar ZPL individual y marcar como impreso", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"download_individual_{active_lote}_{selected_id}_{qty_ind}", on_click=register_individual_download, args=(active_lote, row, int(qty_ind)))
+                    st.download_button("Descargar ZPL individual", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"download_individual_{active_lote}_{selected_id}_{qty_ind}", on_click=register_individual_download, args=(active_lote, row, int(qty_ind)))
+                    st.caption("Al descargar, queda registrado automáticamente. No hay marcado manual.")
 
-            with tab_control:
-                st.caption(f"Etiquetas normales impresas: {printed_normal}/{total_normal} · Pendientes normales: {pending_normal}")
-                filtro_label = st.selectbox("Filtro estado etiquetas", ["Todos", "SIN IMPRIMIR", "PARCIAL", "COMPLETO", "SOBREIMPRESO"])
-                show = view.copy()
-                if filtro_label != "Todos":
-                    show = show[show["label_status"] == filtro_label]
-                out = show.rename(columns={
-                    "codigo_ml": "Código ML",
-                    "sku": "SKU",
-                    "descripcion": "Producto",
-                    "unidades": "Unidades requeridas",
-                    "printed_normal": "Etiquetas impresas",
-                    "label_pending": "Pendientes",
-                    "label_status": "Estado etiquetas",
-                    "printed_separators": "Inicio/Fin impresos",
-                    "last_label_printed_at": "Última impresión",
+        with tab_historial:
+            st.subheader("Control por lista de picking")
+            if pick_status_df.empty:
+                st.info("Sin listas de picking activas.")
+            else:
+                out_lists = pick_status_df.rename(columns={
+                    "codigo_lista": "Lista", "asignado_a": "Picker", "estado_lista": "Estado lista",
+                    "productos": "Productos", "etiquetas_requeridas": "Etiquetas requeridas",
+                    "etiquetas_impresas": "Etiquetas impresas", "reimpresas": "Reimpresas",
+                    "estado_etiquetas": "Estado etiquetas", "ultima_impresion": "Última impresión",
                 })
-                cols = ["Código ML", "SKU", "Producto", "Unidades requeridas", "Etiquetas impresas", "Pendientes", "Estado etiquetas", "Inicio/Fin impresos", "Última impresión"]
-                st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
+                cols_list = ["Lista", "Picker", "Estado lista", "Productos", "Etiquetas requeridas", "Etiquetas impresas", "Reimpresas", "Estado etiquetas", "Última impresión"]
+                st.dataframe(out_lists[[c for c in cols_list if c in out_lists.columns]], use_container_width=True, hide_index=True, height=360)
+
+            st.divider()
+            st.subheader("Historial de impresiones de etiquetas")
+            with db() as c:
+                hist = pd.read_sql_query(
+                    """
+                    SELECT created_at, print_scope, print_kind, block_index, codigo_ml, sku, descripcion,
+                           cantidad, is_reprint, block_key
+                    FROM label_prints
+                    WHERE lote_id=?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 800
+                    """,
+                    c,
+                    params=(int(active_lote),),
+                )
+            if hist.empty:
+                st.info("Sin impresiones registradas.")
+            else:
+                hist = hist.rename(columns={
+                    "created_at": "Fecha", "print_scope": "Alcance", "print_kind": "Tipo",
+                    "block_index": "Lista/Bloque", "codigo_ml": "Código ML", "sku": "SKU",
+                    "descripcion": "Producto", "cantidad": "Cantidad", "is_reprint": "Es reimpresión", "block_key": "Key",
+                })
+                st.dataframe(hist, use_container_width=True, hide_index=True, height=420)
 
 elif page == "Auditoría":
     st.subheader("Auditoría operacional")
