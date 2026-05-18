@@ -600,13 +600,97 @@ def attach_event_identity(event_type: str, payload: dict, queued_at: str) -> dic
     return out
 
 
-def sheet_event_semantic_identity(ev: dict) -> str:
-    """Llave de deduplicación para eventos leídos desde Sheets.
+def sheet_event_content_identity(ev: dict) -> str:
+    """Identidad de contenido para deduplicar eventos main + estructurados de Sheets.
 
-    Nunca usa queue_id solo, porque queue_id viene de SQLite local y puede
-    repetirse después de un reboot. Primero usa event_uid/event_key si existen;
-    si no, arma una llave semántica con tipo, lote, fecha y entidades del evento.
+    Apps Script devuelve la hoja madre `eventos` y también hojas estructuradas
+    como `picking_validaciones`, `picking_listas`, `lote_items`, etc.
+    Esas filas estructuradas muchas veces no tienen el mismo event_uid/event_key
+    que el evento original, pero representan el mismo movimiento.
+
+    Esta llave ignora event_uid/event_key y usa el contenido operativo estable
+    para que un scan, picking o snapshot no se restaure dos veces.
     """
+    if not isinstance(ev, dict):
+        return ""
+    et = clean_text(ev.get("event_type", "")) or clean_text(ev.get("source_event_type", ""))
+    created = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", ""))
+    # created_key a nivel minuto evita que el mismo evento main/estructurado
+    # quede distinto por diferencias de 1 segundo entre queued_at y created_at.
+    created_key = created[:16] if created else ""
+    base = [
+        et,
+        norm_code(ev.get("queue_id", "")),
+        created_key,
+        clean_text(ev.get("lote_id", "")),
+    ]
+
+    if et in {"lote_snapshot_chunk", "lote_snapshot_completo"}:
+        base.extend([
+            clean_text(ev.get("snapshot_hash", "")),
+            clean_text(ev.get("chunk_index", "")),
+            clean_text(ev.get("chunk_total", "")),
+            clean_text(ev.get("productos_total", "")),
+            clean_text(ev.get("unidades_total", "")),
+        ])
+    elif et == "lote_item":
+        base.extend([
+            clean_text(ev.get("item_id", "")),
+            norm_code(ev.get("codigo_ml", "")),
+            norm_code(ev.get("codigo_universal", "")),
+            norm_code(ev.get("sku", "")),
+            clean_text(ev.get("unidades", "")) or clean_text(ev.get("cantidad", "")),
+        ])
+    elif et == "scan_agregado":
+        base.extend([
+            clean_text(ev.get("picking_list_id", "")),
+            clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+            clean_text(ev.get("item_id", "")),
+            norm_code(ev.get("codigo_ml", "")),
+            norm_code(ev.get("codigo_universal", "")),
+            norm_code(ev.get("sku", "")),
+            clean_text(ev.get("cantidad", "")),
+            clean_text(ev.get("modo", "")),
+        ])
+    elif et.startswith("picking_lista") or et.startswith("PICKING_LISTA"):
+        base.extend([
+            clean_text(ev.get("picking_list_id", "")),
+            clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+            clean_text(ev.get("estado", "")),
+            clean_text(ev.get("asignado_a", "")),
+            clean_text(ev.get("productos", "")),
+            clean_text(ev.get("cantidad", "")),
+            clean_text(ev.get("comentario", "")),
+        ])
+    elif et in {"zpl_etiquetas_generado", "ZPL_ETIQUETAS_GENERADO"}:
+        base.extend([
+            clean_text(ev.get("print_scope", "")),
+            clean_text(ev.get("print_kind", "")),
+            clean_text(ev.get("block_index", "")),
+            clean_text(ev.get("block_key", "")),
+            clean_text(ev.get("picking_list_id", "")),
+            clean_text(ev.get("picking_code", "")),
+            clean_text(ev.get("item_id", "")),
+            clean_text(ev.get("zpl_hash", "")),
+            clean_text(ev.get("cantidad_total", "")),
+        ])
+    else:
+        base.extend([
+            clean_text(ev.get("picking_list_id", "")),
+            clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
+            clean_text(ev.get("item_id", "")),
+            norm_code(ev.get("codigo_ml", "")),
+            norm_code(ev.get("codigo_universal", "")),
+            norm_code(ev.get("sku", "")),
+            clean_text(ev.get("cantidad", "")) or clean_text(ev.get("unidades", "")),
+            clean_text(ev.get("tipo", "")) or clean_text(ev.get("tipo_aviso", "")),
+            clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
+        ])
+    return "CONTENT:" + "|".join(base)
+
+
+def sheet_event_semantic_identity(ev: dict) -> str:
+    """Llave primaria de deduplicación para eventos leídos desde Sheets."""
     if not isinstance(ev, dict):
         return ""
     event_uid = clean_text(ev.get("event_uid", ""))
@@ -615,20 +699,7 @@ def sheet_event_semantic_identity(ev: dict) -> str:
     event_key = clean_text(ev.get("event_key", ""))
     if event_key:
         return f"KEY:{event_key}"
-    return "|".join([
-        clean_text(ev.get("event_type", "")),
-        clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", "")),
-        clean_text(ev.get("lote_id", "")),
-        clean_text(ev.get("picking_code", "")) or clean_text(ev.get("codigo_lista", "")),
-        clean_text(ev.get("picking_list_id", "")),
-        clean_text(ev.get("item_id", "")),
-        norm_code(ev.get("codigo_ml", "")),
-        norm_code(ev.get("codigo_universal", "")),
-        norm_code(ev.get("sku", "")),
-        clean_text(ev.get("cantidad", "")),
-        clean_text(ev.get("tipo", "")) or clean_text(ev.get("tipo_aviso", "")),
-        clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
-    ])
+    return sheet_event_content_identity(ev)
 
 def stop_for_backup_failure(message: str):
     """Detiene la operación de forma controlada cuando Sheets no confirma respaldo.
@@ -807,12 +878,22 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
 
     normalized_events = []
     seen_event_ids = set()
+    seen_content_ids = set()
     for raw_ev in events:
         ev = normalize_event(raw_ev)
+        # Doble deduplicación:
+        # 1) event_uid/event_key cuando existe.
+        # 2) contenido operativo para eliminar duplicados entre hoja madre eventos
+        #    y hojas estructuradas devueltas por Apps Script.
+        content_id = sheet_event_content_identity(ev)
         semantic_id = sheet_event_semantic_identity(ev)
+        if content_id and content_id in seen_content_ids:
+            continue
+        if semantic_id and semantic_id in seen_event_ids:
+            continue
+        if content_id:
+            seen_content_ids.add(content_id)
         if semantic_id:
-            if semantic_id in seen_event_ids:
-                continue
             seen_event_ids.add(semantic_id)
         normalized_events.append(ev)
 
@@ -1488,7 +1569,22 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     )
                     list_id_db = int(cur.lastrowid)
                 c.execute("DELETE FROM picking_list_items WHERE picking_list_id=?", (list_id_db,))
-                for pit in plist.get("items", []):
+                # Evita duplicar productos dentro de la misma lista al rescatar desde
+                # eventos + hojas estructuradas. Si aparece más de una fila para el
+                # mismo item, conserva una sola y usa la mayor cantidad informada.
+                unique_pits = {}
+                for pit in plist.get("items", []) or []:
+                    try:
+                        item_id_key = int(pit.get("item_id"))
+                    except Exception:
+                        continue
+                    if item_id_key not in unique_pits:
+                        unique_pits[item_id_key] = dict(pit)
+                    else:
+                        if to_int(pit.get("cantidad", 0)) > to_int(unique_pits[item_id_key].get("cantidad", 0)):
+                            unique_pits[item_id_key] = dict(pit)
+
+                for pit in unique_pits.values():
                     try:
                         item_id = int(pit.get("item_id"))
                     except Exception:
@@ -5066,13 +5162,24 @@ def search_picking_assignment(lote_id: int, query: str) -> pd.DataFrame:
                 pli.cantidad AS cantidad_lista,
                 COALESCE(SUM(s.cantidad), 0) AS validado_pda
             FROM items i
-            LEFT JOIN picking_list_items pli
+            LEFT JOIN (
+                SELECT pli.*
+                FROM picking_list_items pli
+                JOIN picking_lists plx
+                  ON plx.id = pli.picking_list_id
+                 AND plx.estado <> 'ANULADA'
+            ) pli
                 ON pli.item_id = i.id
                AND pli.lote_id = i.lote_id
             LEFT JOIN picking_lists pl
                 ON pl.id = pli.picking_list_id
-               AND pl.estado <> 'ANULADA'
-            LEFT JOIN scans s
+            LEFT JOIN (
+                SELECT lote_id, item_id, picking_list_id, created_at,
+                       scan_primario, scan_secundario, cantidad
+                FROM scans
+                GROUP BY lote_id, item_id, picking_list_id, created_at,
+                         scan_primario, scan_secundario, cantidad
+            ) s
                 ON s.lote_id = i.lote_id
                AND s.item_id = i.id
                AND s.picking_list_id = pli.picking_list_id
