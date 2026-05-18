@@ -8591,10 +8591,58 @@ with st.sidebar:
     lotes = list_lotes()
     if lotes.empty:
         active_lote = None
+        st.session_state.pop("active_lote_id", None)
+        st.session_state.pop("active_lote_select_label", None)
         st.info("Sin lotes creados.")
     else:
-        options = {f"{r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}": int(r.id) for r in lotes.itertuples(index=False)}
-        active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
+        # Selector persistente por ID real de lote.
+        # Antes el selectbox volvía al primer lote de la lista en cada rerun; como list_lotes()
+        # ordena por id DESC, el sistema saltaba al FULL nuevo al escanear o recargar.
+        # Ahora la selección queda fijada en session_state y solo cambia si el usuario cambia el selector.
+        lote_options = []
+        id_by_label = {}
+        for r in lotes.itertuples(index=False):
+            lid = int(r.id)
+            label = f"#{lid} · {r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}"
+            lote_options.append(label)
+            id_by_label[label] = lid
+
+        valid_lote_ids = set(id_by_label.values())
+        saved_lote_id = st.session_state.get("active_lote_id")
+        try:
+            saved_lote_id = int(saved_lote_id)
+        except Exception:
+            saved_lote_id = None
+
+        if saved_lote_id not in valid_lote_ids:
+            saved_lote_id = id_by_label[lote_options[0]]
+            st.session_state["active_lote_id"] = saved_lote_id
+
+        default_idx = 0
+        for idx, label in enumerate(lote_options):
+            if id_by_label[label] == saved_lote_id:
+                default_idx = idx
+                break
+
+        selected_label = st.selectbox(
+            "Lote activo",
+            lote_options,
+            index=default_idx,
+            key="active_lote_select_label",
+        )
+        active_lote = int(id_by_label[selected_label])
+
+        if st.session_state.get("active_lote_id") != active_lote:
+            st.session_state["active_lote_id"] = active_lote
+            # Limpieza liviana de controles dependientes del lote para evitar que una lista
+            # de picking o búsqueda del lote anterior quede pegada visualmente al cambiar de FULL.
+            for _k in [
+                "scan_picking_select", "scan_primary", "scan_secondary", "scan_qty",
+                "pick_detail_select", "picking_search_query", "label_picking_select",
+            ]:
+                st.session_state.pop(_k, None)
+
+        st.caption(f"Trabajando en lote #{active_lote}")
         # Snapshot automático del lote activo hacia Sheets, sin esperar respuesta.
         ensure_active_lote_snapshot_queued(active_lote)
         with st.expander("Respaldo SQLite → Sheets", expanded=False):
@@ -8692,7 +8740,9 @@ if page == "Cargar lote FULL":
                         st.dataframe(df[preview_cols_excel].head(20), use_container_width=True, hide_index=True)
                     nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {now_cl().strftime('%d-%m-%Y %H:%M')}")
                     if st.button("Crear lote", type="primary"):
-                        create_lote(nombre, full_file.name, selected_sheet, df)
+                        new_lote_id = create_lote(nombre, full_file.name, selected_sheet, df)
+                        st.session_state["active_lote_id"] = int(new_lote_id)
+                        st.session_state.pop("active_lote_select_label", None)
                         reset_scan_state()
                         st.success("Lote creado correctamente.")
                         st.rerun()
@@ -8748,7 +8798,9 @@ if page == "Cargar lote FULL":
                     if not can_create:
                         st.caption("Por seguridad, la creación se bloquea hasta que productos y unidades detectadas cuadren con el PDF.")
                     if st.button("Crear lote desde PDF", type="primary", disabled=not can_create):
-                        create_lote(nombre, pdf_file.name, "PDF Mercado Libre", df_pdf)
+                        new_lote_id = create_lote(nombre, pdf_file.name, "PDF Mercado Libre", df_pdf)
+                        st.session_state["active_lote_id"] = int(new_lote_id)
+                        st.session_state.pop("active_lote_select_label", None)
                         reset_scan_state()
                         st.success("Lote creado correctamente desde PDF.")
                         st.rerun()
