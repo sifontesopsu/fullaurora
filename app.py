@@ -1664,9 +1664,26 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     labels_view_restore = label_control_view(lid)
                     blocks_restore = build_label_blocks(labels_view_restore, ROLL_CAPACITY_DEFAULT) if not labels_view_restore.empty else []
                     block = find_restored_label_block(blocks_restore, block_index, block_key)
+                    restored_block_key = clean_text(block.get("block_key", "")) if block else block_key
                     if not block:
+                        normal_qty = to_int(evp.get("cantidad_normal", evp.get("normal_qty", 0)))
+                        sep_qty = to_int(evp.get("cantidad_separadores", evp.get("separator_qty", 0)))
+                        total_qty = to_int(evp.get("cantidad_total", evp.get("total_qty", normal_qty + sep_qty)))
+                        products_count = to_int(evp.get("productos_count", 0))
+                        if normal_qty <= 0 and total_qty <= 0:
+                            continue
+                        c.execute(
+                            """
+                            INSERT OR REPLACE INTO label_blocks
+                            (lote_id, block_index, block_key, products_count, normal_qty, separator_qty, total_qty,
+                             status, download_count, last_printed_at, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                            """,
+                            (lid, block_index, restored_block_key, products_count, normal_qty, sep_qty, total_qty,
+                             "REIMPRESO" if is_reprint else "IMPRESO", created_at, created_at, created_at),
+                        )
+                        restored_label_prints += 1
                         continue
-                    restored_block_key = clean_text(block.get("block_key", "")) or block_key
                     c.execute(
                         """
                         INSERT OR REPLACE INTO label_blocks
@@ -1683,21 +1700,21 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                             """
                             INSERT INTO label_prints
                             (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-                             block_index, restored_block_key, is_reprint, created_at)
+                             block_index, block_key, is_reprint, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'NORMAL', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             descripcion_etiqueta_value(item), int(item.get("unidades", 0)), block_index, restored_block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), int(item.get("unidades", 0)), block_index, block_key, is_reprint, created_at),
                         )
                         c.execute(
                             """
                             INSERT INTO label_prints
                             (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-                             block_index, restored_block_key, is_reprint, created_at)
+                             block_index, block_key, is_reprint, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, 'BLOQUE', 'SEPARADOR', ?, ?, ?, ?)
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, block_index, restored_block_key, is_reprint, created_at),
+                             descripcion_etiqueta_value(item), LABEL_SEPARATOR_PER_PRODUCT, block_index, block_key, is_reprint, created_at),
                         )
                     restored_label_prints += 1
                 elif scope == "PICKING":
@@ -8256,9 +8273,34 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                     continue
                 labels_view_restore = label_control_view(lid)
                 blocks_restore = build_label_blocks(labels_view_restore, ROLL_CAPACITY_DEFAULT) if not labels_view_restore.empty else []
-                block = next((b for b in blocks_restore if int(b.get("block_index", 0)) == block_index and clean_text(b.get("block_key", "")) == block_key), None)
+                # El block_key histórico puede cambiar después de rescatar porque los ids locales/snapshot
+                # pueden variar. Primero buscamos por block_key exacto y luego por block_index.
+                block = find_restored_label_block(blocks_restore, block_index, block_key)
+                restored_block_key = clean_text(block.get("block_key", "")) if block else block_key
+
                 if not block:
+                    # Fallback seguro: aunque no podamos repartir producto por producto, conservamos
+                    # el bloque histórico con sus cantidades del evento. Esto permite que el control
+                    # por lista de picking reconozca cobertura histórica y no muestre pendientes falsos.
+                    normal_qty = to_int(evp.get("cantidad_normal", evp.get("normal_qty", 0)))
+                    sep_qty = to_int(evp.get("cantidad_separadores", evp.get("separator_qty", 0)))
+                    total_qty = to_int(evp.get("cantidad_total", evp.get("total_qty", normal_qty + sep_qty)))
+                    products_count = to_int(evp.get("productos_count", 0))
+                    if normal_qty <= 0 and total_qty <= 0:
+                        continue
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO label_blocks
+                        (lote_id, block_index, block_key, products_count, normal_qty, separator_qty, total_qty,
+                         status, download_count, last_printed_at, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (lid, block_index, restored_block_key, products_count, normal_qty, sep_qty, total_qty,
+                         "REIMPRESO" if is_reprint else "IMPRESO", created_at, created_at, created_at),
+                    )
+                    restored += 1
                     continue
+
                 c.execute(
                     """
                     INSERT OR REPLACE INTO label_blocks
@@ -8266,7 +8308,7 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                      status, download_count, last_printed_at, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     """,
-                    (lid, block_index, block_key, int(block.get("products_count", 0)), int(block.get("normal_qty", 0)),
+                    (lid, block_index, restored_block_key, int(block.get("products_count", 0)), int(block.get("normal_qty", 0)),
                      int(block.get("separator_qty", 0)), int(block.get("total_qty", 0)), "REIMPRESO" if is_reprint else "IMPRESO",
                      created_at, created_at, created_at),
                 )
@@ -8281,7 +8323,7 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                             """,
                             (lid, int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
                              descripcion_etiqueta_value(item), clean_text(item.get("descripcion_kame", item.get("descripcion", ""))),
-                             clean_text(item.get("descripcion_ml", item.get("descripcion", ""))), qty, pkind, block_index, block_key, is_reprint, created_at),
+                             clean_text(item.get("descripcion_ml", item.get("descripcion", ""))), qty, pkind, block_index, restored_block_key, is_reprint, created_at),
                         )
                 restored += 1
             elif scope == "PICKING":
