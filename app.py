@@ -472,6 +472,19 @@ def init_db():
         ensure_column(c, "items", "descripcion_fuente", "TEXT")
         ensure_column(c, "items", "familia_kame", "TEXT")
         ensure_column(c, "items", "maestro_match_status", "TEXT")
+        # Anexos manuales al FULL: productos agregados después del PDF/Excel original.
+        ensure_column(c, "items", "origen_item", "TEXT NOT NULL DEFAULT 'PDF_FULL'")
+        ensure_column(c, "items", "motivo_anexo", "TEXT")
+        ensure_column(c, "items", "usuario_anexo", "TEXT")
+        ensure_column(c, "items", "fecha_anexo", "TEXT")
+        ensure_column(c, "items", "anexo_ml_confirmado", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "items", "anexo_ml_confirmado_at", "TEXT")
+        ensure_column(c, "items", "anexo_ml_confirmado_by", "TEXT")
+        ensure_column(c, "items", "anexo_ml_confirmado_comment", "TEXT")
+        ensure_column(c, "items", "anexo_kame_confirmado", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "items", "anexo_kame_confirmado_at", "TEXT")
+        ensure_column(c, "items", "anexo_kame_confirmado_by", "TEXT")
+        ensure_column(c, "items", "anexo_kame_confirmado_comment", "TEXT")
         # Incidencias por código: se conserva lote_id para control/cierre, pero el operador registra por ML/EAN/SKU.
         ensure_column(c, "incidencias", "codigo_ml", "TEXT")
         ensure_column(c, "incidencias", "codigo_universal", "TEXT")
@@ -885,6 +898,18 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                 "descripcion_fuente": clean_text(ev.get("descripcion_fuente", "")),
                 "familia_kame": clean_text(ev.get("familia_kame", "")),
                 "maestro_match_status": clean_text(ev.get("maestro_match_status", "")),
+                "origen_item": clean_text(ev.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+                "motivo_anexo": clean_text(ev.get("motivo_anexo", "")),
+                "usuario_anexo": clean_text(ev.get("usuario_anexo", "")),
+                "fecha_anexo": clean_text(ev.get("fecha_anexo", "")),
+                "anexo_ml_confirmado": to_int(ev.get("anexo_ml_confirmado", 0)),
+                "anexo_ml_confirmado_at": clean_text(ev.get("anexo_ml_confirmado_at", "")),
+                "anexo_ml_confirmado_by": clean_text(ev.get("anexo_ml_confirmado_by", "")),
+                "anexo_ml_confirmado_comment": clean_text(ev.get("anexo_ml_confirmado_comment", "")),
+                "anexo_kame_confirmado": to_int(ev.get("anexo_kame_confirmado", 0)),
+                "anexo_kame_confirmado_at": clean_text(ev.get("anexo_kame_confirmado_at", "")),
+                "anexo_kame_confirmado_by": clean_text(ev.get("anexo_kame_confirmado_by", "")),
+                "anexo_kame_confirmado_comment": clean_text(ev.get("anexo_kame_confirmado_comment", "")),
                 "unidades": to_int(ev.get("unidades", 0)),
                 "acopiadas": 0,
                 "identificacion": clean_text(ev.get("identificacion", "")),
@@ -928,6 +953,18 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     "descripcion_fuente": clean_text(item_ev.get("descripcion_fuente", "")),
                     "familia_kame": clean_text(item_ev.get("familia_kame", "")),
                     "maestro_match_status": clean_text(item_ev.get("maestro_match_status", "")),
+                    "origen_item": clean_text(item_ev.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+                    "motivo_anexo": clean_text(item_ev.get("motivo_anexo", "")),
+                    "usuario_anexo": clean_text(item_ev.get("usuario_anexo", "")),
+                    "fecha_anexo": clean_text(item_ev.get("fecha_anexo", "")),
+                    "anexo_ml_confirmado": to_int(item_ev.get("anexo_ml_confirmado", 0)),
+                    "anexo_ml_confirmado_at": clean_text(item_ev.get("anexo_ml_confirmado_at", "")),
+                    "anexo_ml_confirmado_by": clean_text(item_ev.get("anexo_ml_confirmado_by", "")),
+                    "anexo_ml_confirmado_comment": clean_text(item_ev.get("anexo_ml_confirmado_comment", "")),
+                    "anexo_kame_confirmado": to_int(item_ev.get("anexo_kame_confirmado", 0)),
+                    "anexo_kame_confirmado_at": clean_text(item_ev.get("anexo_kame_confirmado_at", "")),
+                    "anexo_kame_confirmado_by": clean_text(item_ev.get("anexo_kame_confirmado_by", "")),
+                    "anexo_kame_confirmado_comment": clean_text(item_ev.get("anexo_kame_confirmado_comment", "")),
                     "unidades": to_int(item_ev.get("unidades", 0)),
                     "acopiadas": 0,
                     "identificacion": clean_text(item_ev.get("identificacion", "")),
@@ -950,6 +987,58 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     "closed_by": clean_text(ev.get("closed_by", "")),
                     "close_note": clean_text(ev.get("close_note", "")),
                 })
+        elif et == "producto_anexado_lote":
+            try:
+                item_id = int(ev.get("item_id"))
+            except Exception:
+                item_id = 0
+            if item_id:
+                items_by_lote.setdefault(lote_id, {})[item_id] = {
+                    "id": item_id,
+                    "lote_id": lote_id,
+                    "area": clean_text(ev.get("area", "ANEXO")) or "ANEXO",
+                    "nro": clean_text(ev.get("nro", "")),
+                    "codigo_ml": norm_code(ev.get("codigo_ml", "")),
+                    "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                    "sku": norm_code(ev.get("sku", "")),
+                    "descripcion": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                    "descripcion_kame": clean_text(ev.get("descripcion_kame", "")) or clean_text(ev.get("descripcion", "")),
+                    "descripcion_ml": clean_text(ev.get("descripcion_ml", "")) or clean_text(ev.get("descripcion", "")),
+                    "descripcion_fuente": clean_text(ev.get("descripcion_fuente", "")),
+                    "familia_kame": clean_text(ev.get("familia_kame", "")),
+                    "maestro_match_status": clean_text(ev.get("maestro_match_status", "")),
+                    "origen_item": "ANEXO_MANUAL",
+                    "motivo_anexo": clean_text(ev.get("motivo_anexo", ev.get("motivo", ev.get("comentario", "")))),
+                    "usuario_anexo": clean_text(ev.get("usuario_anexo", ev.get("usuario", ""))) or "SIN_USUARIO",
+                    "fecha_anexo": clean_text(ev.get("fecha_anexo", ev.get("created_at", ev.get("queued_at", "")))),
+                    "anexo_ml_confirmado": to_int(ev.get("anexo_ml_confirmado", 0)),
+                    "anexo_ml_confirmado_at": clean_text(ev.get("anexo_ml_confirmado_at", "")),
+                    "anexo_ml_confirmado_by": clean_text(ev.get("anexo_ml_confirmado_by", "")),
+                    "anexo_ml_confirmado_comment": clean_text(ev.get("anexo_ml_confirmado_comment", "")),
+                    "anexo_kame_confirmado": to_int(ev.get("anexo_kame_confirmado", 0)),
+                    "anexo_kame_confirmado_at": clean_text(ev.get("anexo_kame_confirmado_at", "")),
+                    "anexo_kame_confirmado_by": clean_text(ev.get("anexo_kame_confirmado_by", "")),
+                    "anexo_kame_confirmado_comment": clean_text(ev.get("anexo_kame_confirmado_comment", "")),
+                    "unidades": to_int(ev.get("unidades", ev.get("cantidad", 0))),
+                    "acopiadas": 0,
+                    "identificacion": clean_text(ev.get("identificacion", "")),
+                    "vence": clean_text(ev.get("vence", "")),
+                    "instrucciones": clean_text(ev.get("instrucciones", "")),
+                    "dia": clean_text(ev.get("dia", "")),
+                    "hora": clean_text(ev.get("hora", "")),
+                    "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+                }
+                if lote_id not in lotes:
+                    lote_fallbacks.setdefault(lote_id, {
+                        "id": lote_id,
+                        "nombre": clean_text(ev.get("lote_nombre", "")) or f"Lote {lote_id}",
+                        "archivo": clean_text(ev.get("archivo", "")),
+                        "hoja": clean_text(ev.get("hoja", "")),
+                        "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                        "status": clean_text(ev.get("status", "ACTIVO")) or "ACTIVO",
+                        "closed_at": "", "closed_by": "", "close_note": "",
+                    })
         elif et == "scan_agregado":
             try:
                 item_id = int(ev.get("item_id"))
@@ -1325,13 +1414,18 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     """
                     INSERT OR REPLACE INTO items
                     (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
-                     descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
-                     identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     descripcion_fuente, familia_kame, maestro_match_status, origen_item, motivo_anexo, usuario_anexo, fecha_anexo,
+                     anexo_ml_confirmado, anexo_ml_confirmado_at, anexo_ml_confirmado_by, anexo_ml_confirmado_comment,
+                     anexo_kame_confirmado, anexo_kame_confirmado_at, anexo_kame_confirmado_by, anexo_kame_confirmado_comment,
+                     unidades, acopiadas, identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"],
                      item["descripcion"], item.get("descripcion_kame", item["descripcion"]), item.get("descripcion_ml", item["descripcion"]),
                      item.get("descripcion_fuente", ""), item.get("familia_kame", ""), item.get("maestro_match_status", ""),
+                     item.get("origen_item", "PDF_FULL"), item.get("motivo_anexo", ""), item.get("usuario_anexo", ""), item.get("fecha_anexo", ""),
+                     to_int(item.get("anexo_ml_confirmado", 0)), item.get("anexo_ml_confirmado_at", ""), item.get("anexo_ml_confirmado_by", ""), item.get("anexo_ml_confirmado_comment", ""),
+                     to_int(item.get("anexo_kame_confirmado", 0)), item.get("anexo_kame_confirmado_at", ""), item.get("anexo_kame_confirmado_by", ""), item.get("anexo_kame_confirmado_comment", ""),
                      item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item.get("instrucciones", ""), item["dia"], item["hora"], item["created_at"], item["updated_at"]),
                 )
                 restored_items += 1
@@ -2256,6 +2350,18 @@ def snapshot_items_from_sqlite(lote_id: int) -> list[dict]:
             "descripcion_fuente": clean_text(getattr(r, "descripcion_fuente", "")),
             "familia_kame": clean_text(getattr(r, "familia_kame", "")),
             "maestro_match_status": clean_text(getattr(r, "maestro_match_status", "")),
+            "origen_item": clean_text(getattr(r, "origen_item", "PDF_FULL")) or "PDF_FULL",
+            "motivo_anexo": clean_text(getattr(r, "motivo_anexo", "")),
+            "usuario_anexo": clean_text(getattr(r, "usuario_anexo", "")),
+            "fecha_anexo": clean_text(getattr(r, "fecha_anexo", "")),
+            "anexo_ml_confirmado": int(getattr(r, "anexo_ml_confirmado", 0) or 0),
+            "anexo_ml_confirmado_at": clean_text(getattr(r, "anexo_ml_confirmado_at", "")),
+            "anexo_ml_confirmado_by": clean_text(getattr(r, "anexo_ml_confirmado_by", "")),
+            "anexo_ml_confirmado_comment": clean_text(getattr(r, "anexo_ml_confirmado_comment", "")),
+            "anexo_kame_confirmado": int(getattr(r, "anexo_kame_confirmado", 0) or 0),
+            "anexo_kame_confirmado_at": clean_text(getattr(r, "anexo_kame_confirmado_at", "")),
+            "anexo_kame_confirmado_by": clean_text(getattr(r, "anexo_kame_confirmado_by", "")),
+            "anexo_kame_confirmado_comment": clean_text(getattr(r, "anexo_kame_confirmado_comment", "")),
             "unidades": int(getattr(r, "unidades", 0) or 0),
             "identificacion": clean_text(getattr(r, "identificacion", "")),
             "vence": clean_text(getattr(r, "vence", "")),
@@ -2304,6 +2410,18 @@ def queue_lote_snapshot_from_sqlite(lote_id: int, motivo: str = "AUTO", usuario:
             "descripcion_fuente": it.get("descripcion_fuente"),
             "familia_kame": it.get("familia_kame"),
             "maestro_match_status": it.get("maestro_match_status"),
+            "origen_item": it.get("origen_item"),
+            "motivo_anexo": it.get("motivo_anexo"),
+            "usuario_anexo": it.get("usuario_anexo"),
+            "fecha_anexo": it.get("fecha_anexo"),
+            "anexo_ml_confirmado": it.get("anexo_ml_confirmado"),
+            "anexo_ml_confirmado_at": it.get("anexo_ml_confirmado_at"),
+            "anexo_ml_confirmado_by": it.get("anexo_ml_confirmado_by"),
+            "anexo_ml_confirmado_comment": it.get("anexo_ml_confirmado_comment"),
+            "anexo_kame_confirmado": it.get("anexo_kame_confirmado"),
+            "anexo_kame_confirmado_at": it.get("anexo_kame_confirmado_at"),
+            "anexo_kame_confirmado_by": it.get("anexo_kame_confirmado_by"),
+            "anexo_kame_confirmado_comment": it.get("anexo_kame_confirmado_comment"),
             "unidades": it.get("unidades"),
             "identificacion": it.get("identificacion"),
             "vence": it.get("vence"),
@@ -2443,6 +2561,211 @@ def create_lote(nombre, archivo, hoja, df):
     queue_lote_snapshot_from_sqlite(lote_id, motivo="LOTE_CREADO", usuario="SISTEMA")
     log_audit_event(lote_id, event_type="LOTE_CREADO", detail=f"Lote creado desde {archivo} / {hoja}. SQLite OK: {local_productos} productos / {local_unidades} unidades", qty=expected_unidades)
     return lote_id
+
+
+# ============================================================
+# Anexos manuales al FULL
+# ============================================================
+
+def _anexo_bool(v) -> int:
+    return 1 if str(v).strip().upper() in {"1", "TRUE", "SI", "SÍ", "YES"} or v is True or v == 1 else 0
+
+
+def next_anexo_nro(lote_id: int) -> str:
+    """Correlativo simple para anexos; evita depender del PDF original."""
+    with db() as c:
+        row = c.execute(
+            """
+            SELECT MAX(CAST(nro AS INTEGER)) AS mx
+            FROM items
+            WHERE lote_id=? AND COALESCE(nro,'') GLOB '[0-9]*'
+            """,
+            (int(lote_id),),
+        ).fetchone()
+    try:
+        return str(int(row["mx"] or 0) + 1)
+    except Exception:
+        return "1"
+
+
+def get_anexos_lote(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT *
+            FROM items
+            WHERE lote_id=? AND UPPER(COALESCE(origen_item,''))='ANEXO_MANUAL'
+            ORDER BY id DESC
+            """,
+            c,
+            params=(int(lote_id),),
+        )
+    return df
+
+
+def build_item_event_payload(lote_id: int, item_id: int) -> dict:
+    with db() as c:
+        row = c.execute("SELECT * FROM items WHERE lote_id=? AND id=?", (int(lote_id), int(item_id))).fetchone()
+    if not row:
+        return {}
+    r = dict(row)
+    return {
+        **build_lote_payload(int(lote_id)),
+        "item_id": int(item_id),
+        "area": clean_text(r.get("area", "")),
+        "nro": clean_text(r.get("nro", "")),
+        "codigo_ml": norm_code(r.get("codigo_ml", "")),
+        "codigo_universal": norm_code(r.get("codigo_universal", "")),
+        "sku": norm_code(r.get("sku", "")),
+        "descripcion": clean_text(r.get("descripcion", "")),
+        "descripcion_kame": clean_text(r.get("descripcion_kame", "")) or clean_text(r.get("descripcion", "")),
+        "descripcion_ml": clean_text(r.get("descripcion_ml", "")) or clean_text(r.get("descripcion", "")),
+        "descripcion_fuente": clean_text(r.get("descripcion_fuente", "")),
+        "familia_kame": clean_text(r.get("familia_kame", "")),
+        "maestro_match_status": clean_text(r.get("maestro_match_status", "")),
+        "unidades": to_int(r.get("unidades", 0)),
+        "cantidad": to_int(r.get("unidades", 0)),
+        "identificacion": clean_text(r.get("identificacion", "")),
+        "vence": clean_text(r.get("vence", "")),
+        "instrucciones": clean_text(r.get("instrucciones", "")),
+        "dia": clean_text(r.get("dia", "")),
+        "hora": clean_text(r.get("hora", "")),
+        "origen_item": clean_text(r.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+        "motivo_anexo": clean_text(r.get("motivo_anexo", "")),
+        "usuario_anexo": clean_text(r.get("usuario_anexo", "")),
+        "fecha_anexo": clean_text(r.get("fecha_anexo", "")),
+        "anexo_ml_confirmado": to_int(r.get("anexo_ml_confirmado", 0)),
+        "anexo_ml_confirmado_at": clean_text(r.get("anexo_ml_confirmado_at", "")),
+        "anexo_ml_confirmado_by": clean_text(r.get("anexo_ml_confirmado_by", "")),
+        "anexo_ml_confirmado_comment": clean_text(r.get("anexo_ml_confirmado_comment", "")),
+        "anexo_kame_confirmado": to_int(r.get("anexo_kame_confirmado", 0)),
+        "anexo_kame_confirmado_at": clean_text(r.get("anexo_kame_confirmado_at", "")),
+        "anexo_kame_confirmado_by": clean_text(r.get("anexo_kame_confirmado_by", "")),
+        "anexo_kame_confirmado_comment": clean_text(r.get("anexo_kame_confirmado_comment", "")),
+        "item_created_at": clean_text(r.get("created_at", "")),
+        "item_updated_at": clean_text(r.get("updated_at", "")),
+    }
+
+
+def create_producto_anexado_lote(lote_id: int, sku: str, codigo_ml: str, codigo_universal: str, descripcion_ml: str,
+                                 cantidad: int, identificacion: str, instrucciones: str, motivo: str, usuario: str,
+                                 vence: str = "") -> tuple[bool, str, int | None]:
+    """Agrega un producto manual al lote activo con trazabilidad y sin tocar reservas Kame."""
+    if is_lote_closed(lote_id):
+        return False, "El lote está cerrado. Reabre el lote antes de anexar productos.", None
+    sku = norm_code(sku)
+    codigo_ml = norm_code(codigo_ml)
+    codigo_universal = normalize_universal_code(codigo_universal)
+    descripcion_ml = clean_text(descripcion_ml)
+    motivo = clean_text(motivo)
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    cantidad = int(cantidad or 0)
+    if not sku:
+        return False, "Debes ingresar SKU.", None
+    if not codigo_ml:
+        return False, "Debes ingresar Código ML para que etiquetas y trazabilidad queden correctas.", None
+    if not descripcion_ml:
+        return False, "Debes ingresar descripción ML para la etiqueta.", None
+    if cantidad <= 0:
+        return False, "La cantidad debe ser mayor a 0.", None
+    if not motivo:
+        return False, "Debes ingresar motivo del anexo.", None
+
+    with db() as c:
+        dup = c.execute(
+            """
+            SELECT id, sku, codigo_ml, codigo_universal, descripcion
+            FROM items
+            WHERE lote_id=? AND (
+                UPPER(COALESCE(sku,''))=? OR UPPER(COALESCE(codigo_ml,''))=? OR
+                (? <> 'N/A' AND UPPER(COALESCE(codigo_universal,''))=?)
+            )
+            LIMIT 1
+            """,
+            (int(lote_id), sku, codigo_ml, codigo_universal, codigo_universal),
+        ).fetchone()
+        if dup:
+            return False, f"Este producto/código ya existe en el lote como item #{dup['id']}. No se anexa para evitar duplicidad.", None
+
+    desc_map, family_map, barcode_map, _ = load_kame_master_maps()
+    desc_kame = clean_text(desc_map.get(sku, ""))
+    familia = clean_text(family_map.get(sku, ""))
+    if not desc_kame:
+        # Permitimos anexar, pero queda marcado para revisión; la operación no se detiene.
+        desc_kame = descripcion_ml
+        desc_fuente = "ML_FALLBACK"
+        match_status = "SKU_NO_ENCONTRADO"
+    else:
+        desc_fuente = "KAME"
+        match_status = "MATCH_SKU"
+    if codigo_universal == "N/A":
+        master_barcode = normalize_universal_code(barcode_map.get(sku, ""))
+        if master_barcode != "N/A":
+            codigo_universal = master_barcode
+
+    now = now_cl().isoformat(timespec="seconds")
+    nro = next_anexo_nro(lote_id)
+    with db() as c:
+        cur = c.execute(
+            """
+            INSERT INTO items
+            (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+             descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
+             identificacion, vence, instrucciones, dia, hora, created_at, updated_at,
+             origen_item, motivo_anexo, usuario_anexo, fecha_anexo,
+             anexo_ml_confirmado, anexo_kame_confirmado)
+            VALUES (?, 'ANEXO', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, '', '', ?, ?,
+                    'ANEXO_MANUAL', ?, ?, ?, 0, 0)
+            """,
+            (int(lote_id), nro, codigo_ml, codigo_universal, sku, desc_kame, desc_kame, descripcion_ml,
+             desc_fuente, familia, match_status, cantidad, clean_text(identificacion), clean_text(vence), clean_text(instrucciones),
+             now, now, motivo, usuario, now),
+        )
+        item_id = int(cur.lastrowid)
+        c.commit()
+
+    payload = build_item_event_payload(lote_id, item_id)
+    payload.update({"created_at": now, "motivo": motivo, "usuario": usuario, "tipo": "ANEXO_MANUAL", "comentario": motivo})
+    enqueue_backup_event("producto_anexado_lote", payload)
+    log_audit_event(lote_id, item_id=item_id, event_type="PRODUCTO_ANEXADO", detail=f"Producto anexado manualmente. Motivo: {motivo}", qty=cantidad, codigo_ml=codigo_ml, sku=sku, mode=usuario)
+    queue_lote_snapshot_from_sqlite(lote_id, motivo="PRODUCTO_ANEXADO", usuario=usuario, force=True)
+    return True, "Producto anexado correctamente. Queda disponible para crear lista de picking.", item_id
+
+
+def confirmar_producto_anexado(lote_id: int, item_id: int, tipo: str, usuario: str, comentario: str = "") -> tuple[bool, str]:
+    tipo = clean_text(tipo).lower()
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    comentario = clean_text(comentario)
+    if tipo not in {"ml", "kame"}:
+        return False, "Tipo de confirmación inválido."
+    now = now_cl().isoformat(timespec="seconds")
+    col_prefix = "anexo_ml" if tipo == "ml" else "anexo_kame"
+    with db() as c:
+        row = c.execute("SELECT * FROM items WHERE lote_id=? AND id=? AND UPPER(COALESCE(origen_item,''))='ANEXO_MANUAL'", (int(lote_id), int(item_id))).fetchone()
+        if not row:
+            return False, "No encontré este producto anexado en el lote activo."
+        c.execute(
+            f"""
+            UPDATE items
+            SET {col_prefix}_confirmado=1,
+                {col_prefix}_confirmado_at=?,
+                {col_prefix}_confirmado_by=?,
+                {col_prefix}_confirmado_comment=?,
+                updated_at=?
+            WHERE lote_id=? AND id=?
+            """,
+            (now, usuario, comentario, now, int(lote_id), int(item_id)),
+        )
+        c.commit()
+
+    event_type = "producto_anexado_ml_confirmado" if tipo == "ml" else "producto_anexado_kame_confirmado"
+    audit_type = "ANEXO_ML_CONFIRMADO" if tipo == "ml" else "ANEXO_KAME_CONFIRMADO"
+    payload = build_item_event_payload(lote_id, item_id)
+    payload.update({"created_at": now, "confirmado_at": now, "confirmado_by": usuario, "usuario": usuario, "comentario": comentario})
+    enqueue_backup_event(event_type, payload)
+    log_audit_event(lote_id, item_id=item_id, event_type=audit_type, detail=comentario or audit_type, qty=None, codigo_ml=payload.get("codigo_ml", ""), sku=payload.get("sku", ""), mode=usuario)
+    queue_lote_snapshot_from_sqlite(lote_id, motivo=audit_type, usuario=usuario, force=True)
+    return True, "Confirmación registrada."
 
 def delete_lote(lote_id):
     lote_payload = build_lote_payload(lote_id)
@@ -5081,6 +5404,17 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
     if not avisos_activos.empty:
         issues.append(f"Hay {len(avisos_activos)} aviso(s) operacional(es) activo(s).")
 
+    anexos_df = get_anexos_lote(lote_id)
+    anexos_pend_ml = 0
+    anexos_pend_kame = 0
+    if anexos_df is not None and not anexos_df.empty:
+        anexos_pend_ml = int((pd.to_numeric(anexos_df.get("anexo_ml_confirmado", 0), errors="coerce").fillna(0).astype(int) == 0).sum())
+        anexos_pend_kame = int((pd.to_numeric(anexos_df.get("anexo_kame_confirmado", 0), errors="coerce").fillna(0).astype(int) == 0).sum())
+        if anexos_pend_ml > 0:
+            issues.append(f"Hay {anexos_pend_ml} producto(s) anexado(s) sin confirmar modificación en ML.")
+        if anexos_pend_kame > 0:
+            issues.append(f"Hay {anexos_pend_kame} producto(s) anexado(s) sin confirmar reserva Kame realizada.")
+
     picking_label_status = get_picking_label_status_df(lote_id)
     pending_picking_labels = 0
     if not picking_label_status.empty:
@@ -5100,6 +5434,9 @@ def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> 
         "printed_blocks": 0,
         "picking_label_pending": pending_picking_labels,
         "picking_label_total": int(len(picking_label_status)) if not picking_label_status.empty else 0,
+        "anexos_total": int(len(anexos_df)) if anexos_df is not None and not anexos_df.empty else 0,
+        "anexos_ml_pendientes": anexos_pend_ml,
+        "anexos_kame_pendientes": anexos_pend_kame,
     }
 
 
@@ -6743,6 +7080,18 @@ def get_sheet_lote_items_from_events(events: list[dict], lote_id: int) -> pd.Dat
                 "descripcion_fuente": clean_text(ev.get("descripcion_fuente", "")),
                 "familia_kame": clean_text(ev.get("familia_kame", "")),
                 "maestro_match_status": clean_text(ev.get("maestro_match_status", "")),
+                "origen_item": clean_text(ev.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+                "motivo_anexo": clean_text(ev.get("motivo_anexo", "")),
+                "usuario_anexo": clean_text(ev.get("usuario_anexo", "")),
+                "fecha_anexo": clean_text(ev.get("fecha_anexo", "")),
+                "anexo_ml_confirmado": to_int(ev.get("anexo_ml_confirmado", 0)),
+                "anexo_ml_confirmado_at": clean_text(ev.get("anexo_ml_confirmado_at", "")),
+                "anexo_ml_confirmado_by": clean_text(ev.get("anexo_ml_confirmado_by", "")),
+                "anexo_ml_confirmado_comment": clean_text(ev.get("anexo_ml_confirmado_comment", "")),
+                "anexo_kame_confirmado": to_int(ev.get("anexo_kame_confirmado", 0)),
+                "anexo_kame_confirmado_at": clean_text(ev.get("anexo_kame_confirmado_at", "")),
+                "anexo_kame_confirmado_by": clean_text(ev.get("anexo_kame_confirmado_by", "")),
+                "anexo_kame_confirmado_comment": clean_text(ev.get("anexo_kame_confirmado_comment", "")),
                 "unidades": to_int(ev.get("unidades", 0)),
                 "identificacion": clean_text(ev.get("identificacion", "")),
                 "vence": clean_text(ev.get("vence", "")),
@@ -7060,6 +7409,18 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
                     "descripcion_fuente": clean_text(raw.get("descripcion_fuente", item.get("descripcion_fuente", ""))),
                     "familia_kame": clean_text(raw.get("familia_kame", item.get("familia_kame", ""))),
                     "maestro_match_status": clean_text(raw.get("maestro_match_status", item.get("maestro_match_status", ""))),
+                    "origen_item": clean_text(raw.get("origen_item", item.get("origen_item", "PDF_FULL"))) or "PDF_FULL",
+                    "motivo_anexo": clean_text(raw.get("motivo_anexo", item.get("motivo_anexo", ""))),
+                    "usuario_anexo": clean_text(raw.get("usuario_anexo", item.get("usuario_anexo", ""))),
+                    "fecha_anexo": clean_text(raw.get("fecha_anexo", item.get("fecha_anexo", ""))),
+                    "anexo_ml_confirmado": to_int(raw.get("anexo_ml_confirmado", item.get("anexo_ml_confirmado", 0))),
+                    "anexo_ml_confirmado_at": clean_text(raw.get("anexo_ml_confirmado_at", item.get("anexo_ml_confirmado_at", ""))),
+                    "anexo_ml_confirmado_by": clean_text(raw.get("anexo_ml_confirmado_by", item.get("anexo_ml_confirmado_by", ""))),
+                    "anexo_ml_confirmado_comment": clean_text(raw.get("anexo_ml_confirmado_comment", item.get("anexo_ml_confirmado_comment", ""))),
+                    "anexo_kame_confirmado": to_int(raw.get("anexo_kame_confirmado", item.get("anexo_kame_confirmado", 0))),
+                    "anexo_kame_confirmado_at": clean_text(raw.get("anexo_kame_confirmado_at", item.get("anexo_kame_confirmado_at", ""))),
+                    "anexo_kame_confirmado_by": clean_text(raw.get("anexo_kame_confirmado_by", item.get("anexo_kame_confirmado_by", ""))),
+                    "anexo_kame_confirmado_comment": clean_text(raw.get("anexo_kame_confirmado_comment", item.get("anexo_kame_confirmado_comment", ""))),
                     "unidades": to_int(raw.get("unidades", raw.get("cantidad", 0))),
                     "identificacion": clean_text(raw.get("identificacion", item.get("identificacion", ""))),
                     "vence": clean_text(raw.get("vence", item.get("vence", ""))),
@@ -7096,6 +7457,18 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             "descripcion_fuente": clean_text(raw.get("descripcion_fuente", "")),
             "familia_kame": clean_text(raw.get("familia_kame", "")),
             "maestro_match_status": clean_text(raw.get("maestro_match_status", "")),
+            "origen_item": clean_text(raw.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+            "motivo_anexo": clean_text(raw.get("motivo_anexo", "")),
+            "usuario_anexo": clean_text(raw.get("usuario_anexo", "")),
+            "fecha_anexo": clean_text(raw.get("fecha_anexo", "")),
+            "anexo_ml_confirmado": to_int(raw.get("anexo_ml_confirmado", 0)),
+            "anexo_ml_confirmado_at": clean_text(raw.get("anexo_ml_confirmado_at", "")),
+            "anexo_ml_confirmado_by": clean_text(raw.get("anexo_ml_confirmado_by", "")),
+            "anexo_ml_confirmado_comment": clean_text(raw.get("anexo_ml_confirmado_comment", "")),
+            "anexo_kame_confirmado": to_int(raw.get("anexo_kame_confirmado", 0)),
+            "anexo_kame_confirmado_at": clean_text(raw.get("anexo_kame_confirmado_at", "")),
+            "anexo_kame_confirmado_by": clean_text(raw.get("anexo_kame_confirmado_by", "")),
+            "anexo_kame_confirmado_comment": clean_text(raw.get("anexo_kame_confirmado_comment", "")),
             "unidades": to_int(raw.get("unidades", raw.get("cantidad", 0))),
             "acopiadas": 0,
             "identificacion": clean_text(raw.get("identificacion", "")),
@@ -7122,6 +7495,8 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             for it in ev.get("items") or []:
                 if isinstance(it, dict):
                     add_or_update_item({**it, "created_at": ev.get("created_at", "")}, "LOTE_ITEM", "snapshot primario desde lote_snapshot_chunk")
+        elif et == "producto_anexado_lote":
+            add_or_update_item({**ev, "unidades": ev.get("unidades", ev.get("cantidad", 0)), "origen_item": "ANEXO_MANUAL"}, "LOTE_ITEM", "producto anexado manualmente")
         elif et == "lote_cerrado":
             meta["status"] = "CERRADO"
             meta["closed_at"] = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", ""))
@@ -7311,7 +7686,36 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
     for ev in lote_events:
         et = clean_text(ev.get("event_type", ""))
         et_low = et.lower()
-        if et in {"incidencia_creada", "INCIDENCIA_ABIERTA"}:
+        if et == "producto_anexado_lote":
+            resolved_id = add_or_update_item({**ev, "unidades": ev.get("unidades", ev.get("cantidad", 0)), "origen_item": "ANEXO_MANUAL"}, "LOTE_ITEM", "producto anexado manualmente")
+            if resolved_id and resolved_id in items_by_id:
+                items_by_id[resolved_id].update({
+                    "origen_item": "ANEXO_MANUAL",
+                    "motivo_anexo": clean_text(ev.get("motivo_anexo", ev.get("motivo", ev.get("comentario", "")))),
+                    "usuario_anexo": clean_text(ev.get("usuario_anexo", ev.get("usuario", ""))) or "SIN_USUARIO",
+                    "fecha_anexo": clean_text(ev.get("fecha_anexo", ev.get("created_at", ev.get("queued_at", "")))),
+                    "anexo_ml_confirmado": _to_bool_flag(ev.get("anexo_ml_confirmado", 0)),
+                    "anexo_kame_confirmado": _to_bool_flag(ev.get("anexo_kame_confirmado", 0)),
+                })
+        elif et == "producto_anexado_ml_confirmado":
+            iid = resolve_event_item(ev)
+            if iid and iid in items_by_id:
+                items_by_id[iid].update({
+                    "anexo_ml_confirmado": 1,
+                    "anexo_ml_confirmado_at": clean_text(ev.get("confirmado_at", ev.get("created_at", ev.get("queued_at", "")))),
+                    "anexo_ml_confirmado_by": clean_text(ev.get("confirmado_by", ev.get("usuario", ""))) or "SIN_USUARIO",
+                    "anexo_ml_confirmado_comment": clean_text(ev.get("comentario", "")),
+                })
+        elif et == "producto_anexado_kame_confirmado":
+            iid = resolve_event_item(ev)
+            if iid and iid in items_by_id:
+                items_by_id[iid].update({
+                    "anexo_kame_confirmado": 1,
+                    "anexo_kame_confirmado_at": clean_text(ev.get("confirmado_at", ev.get("created_at", ev.get("queued_at", "")))),
+                    "anexo_kame_confirmado_by": clean_text(ev.get("confirmado_by", ev.get("usuario", ""))) or "SIN_USUARIO",
+                    "anexo_kame_confirmado_comment": clean_text(ev.get("comentario", "")),
+                })
+        elif et in {"incidencia_creada", "INCIDENCIA_ABIERTA"}:
             incidencias.append({
                 "lote_id": target,
                 "item_id": resolve_event_item(ev),
@@ -7556,6 +7960,12 @@ def get_sheet_lote_items_from_events(events: list[dict], lote_id: int) -> pd.Dat
             "descripcion_ml": it.get("descripcion_ml", ""),
             "familia_kame": it.get("familia_kame", ""),
             "maestro_match_status": it.get("maestro_match_status", ""),
+            "origen_item": it.get("origen_item", "PDF_FULL"),
+            "motivo_anexo": it.get("motivo_anexo", ""),
+            "usuario_anexo": it.get("usuario_anexo", ""),
+            "fecha_anexo": it.get("fecha_anexo", ""),
+            "anexo_ml_confirmado": it.get("anexo_ml_confirmado", 0),
+            "anexo_kame_confirmado": it.get("anexo_kame_confirmado", 0),
             "unidades": it.get("unidades", 0),
             "identificacion": it.get("identificacion", ""),
             "vence": it.get("vence", ""),
@@ -7753,15 +8163,23 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
                 """
                 INSERT OR REPLACE INTO items
                 (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
-                 descripcion_fuente, familia_kame, maestro_match_status, unidades, acopiadas,
-                 identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 descripcion_fuente, familia_kame, maestro_match_status, origen_item, motivo_anexo, usuario_anexo, fecha_anexo,
+                 anexo_ml_confirmado, anexo_ml_confirmado_at, anexo_ml_confirmado_by, anexo_ml_confirmado_comment,
+                 anexo_kame_confirmado, anexo_kame_confirmado_at, anexo_kame_confirmado_by, anexo_kame_confirmado_comment,
+                 unidades, acopiadas, identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(it.get("id")), int(lote_id), clean_text(it.get("area", "")), clean_text(it.get("nro", "")),
                     norm_code(it.get("codigo_ml", "")), norm_code(it.get("codigo_universal", "")), norm_code(it.get("sku", "")),
                     clean_text(it.get("descripcion", "")), clean_text(it.get("descripcion_kame", it.get("descripcion", ""))), clean_text(it.get("descripcion_ml", it.get("descripcion", ""))),
                     clean_text(it.get("descripcion_fuente", "")), clean_text(it.get("familia_kame", "")), clean_text(it.get("maestro_match_status", "")),
+                    clean_text(it.get("origen_item", "PDF_FULL")) or "PDF_FULL", clean_text(it.get("motivo_anexo", "")),
+                    clean_text(it.get("usuario_anexo", "")), clean_text(it.get("fecha_anexo", "")),
+                    to_int(it.get("anexo_ml_confirmado", 0)), clean_text(it.get("anexo_ml_confirmado_at", "")),
+                    clean_text(it.get("anexo_ml_confirmado_by", "")), clean_text(it.get("anexo_ml_confirmado_comment", "")),
+                    to_int(it.get("anexo_kame_confirmado", 0)), clean_text(it.get("anexo_kame_confirmado_at", "")),
+                    clean_text(it.get("anexo_kame_confirmado_by", "")), clean_text(it.get("anexo_kame_confirmado_comment", "")),
                     to_int(it.get("unidades", 0)), to_int(it.get("acopiadas", 0)),
                     clean_text(it.get("identificacion", "")), clean_text(it.get("vence", "")), clean_text(it.get("instrucciones", "")),
                     clean_text(it.get("dia", "")), clean_text(it.get("hora", "")),
@@ -8893,6 +9311,57 @@ if page == "Cargar lote FULL":
             except Exception as e:
                 st.error(f"No pude procesar el PDF: {e}")
 
+
+    st.divider()
+    st.subheader("Anexar producto al lote activo")
+    st.caption("Uso controlado: producto agregado después del PDF/Excel original. No genera reserva Kame; solo deja checks operacionales para ML y Kame.")
+    if not active_lote:
+        st.warning("Selecciona un lote activo para anexar productos.")
+    elif is_lote_closed(active_lote):
+        st.warning("El lote activo está cerrado. Reabre el lote antes de anexar productos.")
+    else:
+        with st.expander("➕ Agregar producto anexado", expanded=False):
+            st.info("El producto anexado quedará disponible para crear una lista de picking nueva. No se agrega automáticamente a listas ya impresas o escaneadas.")
+            ca1, ca2, ca3 = st.columns(3)
+            with ca1:
+                anexo_sku = st.text_input("SKU", key="anexo_sku")
+                anexo_codigo_ml = st.text_input("Código ML", key="anexo_codigo_ml")
+                anexo_ean = st.text_input("Código universal / EAN", value="N/A", key="anexo_ean")
+            with ca2:
+                anexo_qty = st.number_input("Cantidad a anexar", min_value=1, value=1, step=1, key="anexo_qty")
+                anexo_ident = st.selectbox("Identificación", ["", "Etiquetado obligatorio", "Supermercado"], key="anexo_ident")
+                anexo_vence = st.text_input("Vence / VCTO opcional", key="anexo_vence")
+            with ca3:
+                anexo_user = st.text_input("Usuario", value=get_operator_name(), key="anexo_user")
+                anexo_motivo = st.text_input("Motivo del anexo", placeholder="Ej: producto agregado posterior al envío FULL", key="anexo_motivo")
+            anexo_desc_ml = st.text_area("Descripción ML para etiqueta", key="anexo_desc_ml", placeholder="Debe ser la descripción/título que corresponde usar en la etiqueta.")
+            anexo_instr = st.text_area("Instrucciones opcionales", key="anexo_instr", placeholder="Ej: etiquetar / embalar separado / revisar unidades.")
+            if st.button("Anexar producto al lote", type="primary", key="btn_anexar_producto"):
+                ok_ax, msg_ax, item_ax = create_producto_anexado_lote(
+                    active_lote, anexo_sku, anexo_codigo_ml, anexo_ean, anexo_desc_ml,
+                    int(anexo_qty), anexo_ident, anexo_instr, anexo_motivo, anexo_user, anexo_vence,
+                )
+                if ok_ax:
+                    st.success(msg_ax)
+                    # Limpiar campos del formulario de anexos para evitar doble creación accidental.
+                    for k in ["anexo_sku", "anexo_codigo_ml", "anexo_ean", "anexo_desc_ml", "anexo_qty", "anexo_ident", "anexo_vence", "anexo_user", "anexo_motivo", "anexo_instr"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+                else:
+                    st.error(msg_ax)
+
+        anexos_view = get_anexos_lote(active_lote)
+        if anexos_view.empty:
+            st.info("Este lote no tiene productos anexados.")
+        else:
+            st.warning(f"Este lote tiene {len(anexos_view)} producto(s) anexado(s). Revisa los checks operacionales antes del cierre.")
+            show = anexos_view.copy()
+            show["ML OK"] = pd.to_numeric(show.get("anexo_ml_confirmado", 0), errors="coerce").fillna(0).astype(int).map(lambda x: "Sí" if x else "Pendiente")
+            show["Kame OK"] = pd.to_numeric(show.get("anexo_kame_confirmado", 0), errors="coerce").fillna(0).astype(int).map(lambda x: "Sí" if x else "Pendiente")
+            out = show.rename(columns={"created_at":"Fecha", "codigo_ml":"Código ML", "codigo_universal":"EAN", "sku":"SKU", "descripcion":"Descripción Kame", "descripcion_ml":"Descripción ML", "unidades":"Cantidad", "motivo_anexo":"Motivo", "usuario_anexo":"Usuario"})
+            cols = ["Fecha", "Código ML", "EAN", "SKU", "Descripción Kame", "Descripción ML", "Cantidad", "ML OK", "Kame OK", "Motivo", "Usuario"]
+            st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=320)
+
 elif page == "Escaneo":
     st.markdown("""
     <style>
@@ -9321,7 +9790,7 @@ elif page == "Supervisor":
             for issue in issues:
                 st.write(f"• {issue}")
 
-        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_avisos, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Avisos operacionales", "Etiquetas picking", "Reimpresión", "Cierre", "Auditoría"])
+        tab_resumen, tab_control, tab_pendientes, tab_incid, tab_avisos, tab_anexos, tab_bloques, tab_reimp, tab_cierre, tab_auditoria = st.tabs(["Resumen", "Control operativo", "Pendientes", "Incidencias", "Avisos operacionales", "Anexos", "Etiquetas picking", "Reimpresión", "Cierre", "Auditoría"])
 
         with tab_resumen:
             view = items.copy()
@@ -9337,6 +9806,9 @@ elif page == "Supervisor":
                     "Listas picking controladas": cierre_data.get("picking_label_total", 0),
                     "Incidencias abiertas": cierre_data.get("open_incidents", 0),
                     "Avisos operacionales activos": cierre_data.get("active_notices", 0),
+                    "Productos anexados": cierre_data.get("anexos_total", 0),
+                    "Anexos ML pendientes": cierre_data.get("anexos_ml_pendientes", 0),
+                    "Anexos Kame pendientes": cierre_data.get("anexos_kame_pendientes", 0),
                 }])
                 st.dataframe(resumen, use_container_width=True, hide_index=True)
 
@@ -9529,6 +10001,56 @@ elif page == "Supervisor":
                     cols_av = ["Fecha", "Estado", "Tipo", "Código ML", "Código Universal", "SKU", "Producto", "Mensaje operador", "Cantidad original", "Cantidad nueva", "Conf. ML", "Conf. Kame", "Visible operador", "Creado por", "Fecha resolución", "Resuelto por"]
                     st.dataframe(out_av[[c for c in cols_av if c in out_av.columns]], use_container_width=True, hide_index=True, height=520)
 
+
+        with tab_anexos:
+            st.info("Control de productos anexados manualmente al FULL. Estos checks no generan reserva Kame; solo confirman que el movimiento operacional fue realizado.")
+            anexos_df = get_anexos_lote(active_lote)
+            if anexos_df.empty:
+                st.success("No hay productos anexados en este lote.")
+            else:
+                anexos_df = anexos_df.copy()
+                anexos_df["ML"] = pd.to_numeric(anexos_df.get("anexo_ml_confirmado", 0), errors="coerce").fillna(0).astype(int).map(lambda x: "OK" if x else "PENDIENTE")
+                anexos_df["Reserva Kame"] = pd.to_numeric(anexos_df.get("anexo_kame_confirmado", 0), errors="coerce").fillna(0).astype(int).map(lambda x: "OK" if x else "PENDIENTE")
+                out_ax = anexos_df.rename(columns={
+                    "id":"ID", "created_at":"Fecha", "codigo_ml":"Código ML", "codigo_universal":"EAN", "sku":"SKU",
+                    "descripcion":"Descripción Kame", "descripcion_ml":"Descripción ML", "unidades":"Cantidad",
+                    "motivo_anexo":"Motivo", "usuario_anexo":"Usuario anexo", "fecha_anexo":"Fecha anexo",
+                })
+                cols_ax = ["ID", "Fecha anexo", "Código ML", "EAN", "SKU", "Descripción Kame", "Descripción ML", "Cantidad", "ML", "Reserva Kame", "Motivo", "Usuario anexo"]
+                st.dataframe(out_ax[[c for c in cols_ax if c in out_ax.columns]], use_container_width=True, hide_index=True, height=360)
+                st.divider()
+                st.subheader("Confirmar tareas de anexos")
+                pendientes = anexos_df[(pd.to_numeric(anexos_df.get("anexo_ml_confirmado", 0), errors="coerce").fillna(0).astype(int) == 0) | (pd.to_numeric(anexos_df.get("anexo_kame_confirmado", 0), errors="coerce").fillna(0).astype(int) == 0)].copy()
+                if pendientes.empty:
+                    st.success("Todos los anexos tienen ML y Reserva Kame confirmados.")
+                else:
+                    opts = {}
+                    for _, r in pendientes.iterrows():
+                        label = f"#{int(r['id'])} · SKU {clean_text(r.get('sku',''))} · ML {clean_text(r.get('codigo_ml',''))} · {clean_text(r.get('descripcion',''))[:65]}"
+                        opts[label] = int(r["id"])
+                    sel_ax = st.selectbox("Producto anexado", list(opts.keys()), key="sup_anexo_select")
+                    item_ax_id = opts[sel_ax]
+                    row_ax = anexos_df[anexos_df["id"].astype(int) == int(item_ax_id)].iloc[0].to_dict()
+                    conf_user_ax = st.text_input("Confirmado por", value=get_operator_name(), key="sup_anexo_conf_user")
+                    conf_comment_ax = st.text_input("Comentario opcional", key="sup_anexo_conf_comment")
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        st.caption("Modificado en ML: " + ("OK" if to_int(row_ax.get("anexo_ml_confirmado", 0)) else "PENDIENTE"))
+                        if not to_int(row_ax.get("anexo_ml_confirmado", 0)):
+                            if st.button("Confirmar modificado en ML", key=f"conf_ml_anexo_{item_ax_id}", type="primary"):
+                                ok_conf, msg_conf = confirmar_producto_anexado(active_lote, item_ax_id, "ml", conf_user_ax, conf_comment_ax)
+                                st.success(msg_conf) if ok_conf else st.error(msg_conf)
+                                if ok_conf:
+                                    st.rerun()
+                    with cc2:
+                        st.caption("Reserva Kame realizada: " + ("OK" if to_int(row_ax.get("anexo_kame_confirmado", 0)) else "PENDIENTE"))
+                        if not to_int(row_ax.get("anexo_kame_confirmado", 0)):
+                            if st.button("Confirmar reserva Kame realizada", key=f"conf_kame_anexo_{item_ax_id}", type="primary"):
+                                ok_conf, msg_conf = confirmar_producto_anexado(active_lote, item_ax_id, "kame", conf_user_ax, conf_comment_ax)
+                                st.success(msg_conf) if ok_conf else st.error(msg_conf)
+                                if ok_conf:
+                                    st.rerun()
+
         with tab_bloques:
             st.caption("Control de etiquetas por lista de picking. La impresión por bloques ya no forma parte del flujo operativo.")
             pick_label_df = get_picking_label_status_df(active_lote)
@@ -9564,6 +10086,8 @@ elif page == "Supervisor":
             c3.metric("Incidencias abiertas", data_close2.get("open_incidents", 0))
             c4.metric("Avisos activos", data_close2.get("active_notices", 0))
             c5.metric("Listas etiquetas pendientes", data_close2.get("picking_label_pending", 0))
+            if data_close2.get("anexos_total", 0):
+                st.caption(f"Anexos: {data_close2.get('anexos_total', 0)} · ML pendientes: {data_close2.get('anexos_ml_pendientes', 0)} · Kame pendientes: {data_close2.get('anexos_kame_pendientes', 0)}")
             if clean_text(lote_close.get("status")) == "CERRADO":
                 st.success(f"Lote cerrado por {clean_text(lote_close.get('closed_by',''))} el {fmt_dt(lote_close.get('closed_at',''))}.")
                 st.caption(clean_text(lote_close.get("close_note", "")))
