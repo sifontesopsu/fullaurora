@@ -3650,6 +3650,17 @@ def zpl_for_item_with_separators(row, copies=None) -> str:
     )
 
 
+def zpl_for_item_with_separators_exact_pq(row, copies=None) -> str:
+    """Genera ZPL individual asegurando que la etiqueta normal salga con ^PQ exacto.
+
+    Es una protección contra estado viejo de UI o fallbacks internos: la lógica sigue siendo
+    INICIO + etiqueta normal + FIN, solo se fuerza el ^PQ de la etiqueta normal al valor elegido.
+    """
+    qty = max(1, int(copies or 1))
+    zpl = zpl_for_item_with_separators(row, qty)
+    return re.sub(r"\^PQ\d+", f"^PQ{qty}", zpl, count=1)
+
+
 def get_label_print_summary(lote_id: int) -> pd.DataFrame:
     with db() as c:
         df = pd.read_sql_query(
@@ -3944,7 +3955,7 @@ def register_individual_download(lote_id: int, item: dict, qty: int):
             rows,
         )
         c.commit()
-    zpl_content = zpl_for_item_with_separators(item, qty)
+    zpl_content = zpl_for_item_with_separators_exact_pq(item, qty)
     register_zpl_label_event(
         lote_id,
         print_scope="INDIVIDUAL",
@@ -4241,7 +4252,7 @@ def register_picking_item_label_reprint(lote_id: int, picking_list_id: int, item
         )
         c.commit()
 
-    zpl_content = zpl_for_item_with_separators(item, qty)
+    zpl_content = zpl_for_item_with_separators_exact_pq(item, qty)
     register_zpl_label_event(
         lote_id,
         print_scope="PICKING",
@@ -8053,16 +8064,45 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                         )
                 restored += 1
             elif scope == "PICKING":
+                # El id histórico de picking_list_id puede cambiar al rescatar desde Sheets.
+                # Por eso se valida que exista en este lote; si no, se resuelve por codigo_lista/picking_code.
                 picking_id = to_int(evp.get("picking_list_id", 0)) or to_int(evp.get("block_index", 0))
                 block_key = clean_text(evp.get("block_key", "")) or clean_text(evp.get("picking_code", ""))
-                if not picking_id:
-                    code = clean_text(evp.get("picking_code", ""))
-                    if code:
-                        row = c.execute("SELECT id FROM picking_lists WHERE lote_id=? AND codigo_lista=?", (lid, code)).fetchone()
-                        picking_id = int(row["id"]) if row else 0
+                code = clean_text(evp.get("picking_code", "")) or clean_text(evp.get("codigo_lista", ""))
+
+                valid_pick = None
+                if picking_id:
+                    valid_pick = c.execute(
+                        "SELECT id FROM picking_lists WHERE lote_id=? AND id=? LIMIT 1",
+                        (lid, int(picking_id)),
+                    ).fetchone()
+                if not valid_pick and code:
+                    valid_pick = c.execute(
+                        "SELECT id FROM picking_lists WHERE lote_id=? AND codigo_lista=? LIMIT 1",
+                        (lid, code),
+                    ).fetchone()
+                    picking_id = int(valid_pick["id"]) if valid_pick else 0
+
                 if not picking_id:
                     continue
-                items_df = pd.read_sql_query("SELECT * FROM picking_list_items WHERE picking_list_id=? ORDER BY id", c, params=(int(picking_id),))
+
+                items_df = pd.read_sql_query(
+                    "SELECT * FROM picking_list_items WHERE lote_id=? AND picking_list_id=? ORDER BY id",
+                    c,
+                    params=(lid, int(picking_id)),
+                )
+                if items_df.empty and code:
+                    row_pick = c.execute(
+                        "SELECT id FROM picking_lists WHERE lote_id=? AND codigo_lista=? LIMIT 1",
+                        (lid, code),
+                    ).fetchone()
+                    if row_pick:
+                        picking_id = int(row_pick["id"])
+                        items_df = pd.read_sql_query(
+                            "SELECT * FROM picking_list_items WHERE lote_id=? AND picking_list_id=? ORDER BY id",
+                            c,
+                            params=(lid, int(picking_id)),
+                        )
                 if items_df.empty:
                     continue
                 for _, item in items_df.iterrows():
@@ -10381,7 +10421,7 @@ elif page == "Etiquetas":
                                     qty_prod = st.number_input("Cantidad etiquetas normales", min_value=1, max_value=9999, value=1, step=1, key=f"pick_item_reprint_qty_{selected_pick_id}_{selected_item.get('id')}")
                                     prod_usuario = st.text_input("Usuario", value=get_operator_name(), key=f"pick_item_reprint_user_{selected_pick_id}_{selected_item.get('id')}")
                                     prod_motivo = st.text_input("Motivo obligatorio", key=f"pick_item_reprint_reason_{selected_pick_id}_{selected_item.get('id')}", placeholder="Ej: etiqueta dañada, reposición por corte, error de impresora")
-                                    zpl_prod = zpl_for_item_with_separators(selected_item, int(qty_prod)).encode("utf-8")
+                                    zpl_prod = zpl_for_item_with_separators_exact_pq(selected_item, int(qty_prod)).encode("utf-8")
                                     fname_prod = f"reimpresion_{clean_text(block_pick.get('picking_code','PICKING')).replace(' ', '_')}_{norm_code(selected_item.get('codigo_ml','')) or norm_code(selected_item.get('sku',''))}.zpl"
                                     if clean_text(prod_motivo):
                                         st.download_button(
@@ -10422,15 +10462,39 @@ elif page == "Etiquetas":
                     m4.metric("Estado", status)
                     st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
                     st.caption(f"Código ML: {clean_text(row.get('codigo_ml',''))} · SKU: {clean_text(row.get('sku',''))}")
-                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1, key=f"qty_individual_{active_lote}_{selected_id}")
+                    qty_key_ind = f"qty_individual_{active_lote}_{selected_id}"
+                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1, key=qty_key_ind)
+                    qty_ind = max(1, int(st.session_state.get(qty_key_ind, qty_ind) or 1))
                     if printed >= req:
                         st.warning("Este producto ya tiene todas sus etiquetas normales impresas. La descarga se registrará como REIMPRESIÓN.")
                     elif int(qty_ind) > pending:
                         st.warning(f"La cantidad supera lo pendiente ({pending}). Puede dejar el producto SOBREIMPRESO.")
-                    zpl_ind = zpl_for_item_with_separators(row, int(qty_ind)).encode("utf-8")
-                    fname_ind = f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                    st.download_button("Descargar ZPL individual", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"download_individual_{active_lote}_{selected_id}_{qty_ind}", on_click=register_individual_download, args=(active_lote, row, int(qty_ind)))
-                    st.caption("Al descargar, queda registrado automáticamente. No hay marcado manual.")
+
+                    prep_key = f"prepared_individual_zpl_{active_lote}_{selected_id}"
+                    if st.button("Preparar ZPL individual con esta cantidad", key=f"prepare_individual_zpl_{active_lote}_{selected_id}_{qty_ind}"):
+                        zpl_text = zpl_for_item_with_separators_exact_pq(row, int(qty_ind))
+                        st.session_state[prep_key] = {
+                            "qty": int(qty_ind),
+                            "zpl": zpl_text.encode("utf-8"),
+                            "fname": f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl",
+                            "row": row,
+                        }
+
+                    prepared = st.session_state.get(prep_key)
+                    if prepared:
+                        prepared_qty = int(prepared.get("qty") or 1)
+                        st.success(f"ZPL preparado con ^PQ{prepared_qty}. Al descargar, queda registrado automáticamente.")
+                        st.download_button(
+                            "Descargar ZPL individual",
+                            data=prepared.get("zpl"),
+                            file_name=prepared.get("fname"),
+                            mime="text/plain",
+                            key=f"download_individual_prepared_{active_lote}_{selected_id}_{prepared_qty}",
+                            on_click=register_individual_download,
+                            args=(active_lote, prepared.get("row") or row, prepared_qty),
+                        )
+                    else:
+                        st.caption("Primero prepara el ZPL para fijar la cantidad exacta. No hay marcado manual.")
 
         with tab_historial:
             st.subheader("Control por lista de picking")
