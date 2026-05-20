@@ -6377,7 +6377,9 @@ def build_kame_reserva_csv(grouped: pd.DataFrame, folio: str, ficha: str, fecha_
         ]
         lines.append(";".join(row))
     text = "\r\n".join(lines) + "\r\n"
-    return text.encode("utf-8-sig")
+    # Kame no reconoce correctamente la primera cabecera si el CSV trae BOM.
+    # Debe ser UTF-8 simple, separado por punto y coma y con cabeceras exactas.
+    return text.encode("utf-8")
 
 
 def register_reserva_kame(lote_id: int, folio: str, folio_auto: str, ficha: str, fecha_doc, glosa: str, bodega_salida: str, unidad_negocio: str, archivo_nombre: str, usuario: str, expanded: pd.DataFrame, grouped: pd.DataFrame):
