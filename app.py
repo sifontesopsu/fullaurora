@@ -616,19 +616,25 @@ def attach_event_identity(event_type: str, payload: dict, queued_at: str) -> dic
 def sheet_event_semantic_identity(ev: dict) -> str:
     """Llave de deduplicación para eventos leídos desde Sheets.
 
-    Nunca usa queue_id solo, porque queue_id viene de SQLite local y puede
-    repetirse después de un reboot. Primero usa event_uid/event_key si existen;
-    si no, arma una llave semántica con tipo, lote, fecha y entidades del evento.
+    Regla importante:
+    Apps Script devuelve el mismo evento desde la hoja madre `eventos` y también
+    desde hojas estructuradas como `picking_validaciones`, `picking_items`, etc.
+    La hoja madre suele traer `event_uid`, mientras la estructurada suele traer
+    `event_key`. Si priorizamos event_uid, el mismo scan puede quedar como dos
+    eventos distintos al rescatar.
+
+    Por eso, para rescate, `event_key` manda primero. Luego viene `event_uid` y,
+    si no existe ninguno, una llave semántica estable sin usar queue_id solo.
     """
     if not isinstance(ev, dict):
         return ""
-    event_uid = clean_text(ev.get("event_uid", ""))
-    if event_uid:
-        return f"UID:{event_uid}"
     event_key = clean_text(ev.get("event_key", ""))
     if event_key:
         return f"KEY:{event_key}"
-    return "|".join([
+    event_uid = clean_text(ev.get("event_uid", ""))
+    if event_uid:
+        return f"UID:{event_uid}"
+    return "SEM:" + "|".join([
         clean_text(ev.get("event_type", "")),
         clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", "")),
         clean_text(ev.get("lote_id", "")),
@@ -639,9 +645,42 @@ def sheet_event_semantic_identity(ev: dict) -> str:
         norm_code(ev.get("codigo_universal", "")),
         norm_code(ev.get("sku", "")),
         clean_text(ev.get("cantidad", "")),
+        clean_text(ev.get("scan_primario", "")),
+        clean_text(ev.get("scan_secundario", "")),
         clean_text(ev.get("tipo", "")) or clean_text(ev.get("tipo_aviso", "")),
         clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
     ])
+
+
+def sheet_event_all_dedupe_ids(ev: dict) -> list[str]:
+    """Identidades equivalentes del mismo evento para deduplicar hoja madre + hojas estructuradas."""
+    if not isinstance(ev, dict):
+        return []
+    ids = []
+    event_key = clean_text(ev.get("event_key", ""))
+    event_uid = clean_text(ev.get("event_uid", ""))
+    if event_key:
+        ids.append(f"KEY:{event_key}")
+        # Muchos event_key antiguos guardan literalmente UID:EVT:...
+        if event_key.startswith("UID:"):
+            ids.append(event_key)
+    if event_uid:
+        ids.append(f"UID:{event_uid}")
+    sem = sheet_event_semantic_identity({k: v for k, v in ev.items() if k not in {"event_key", "event_uid"}})
+    if sem:
+        ids.append(sem)
+    # Orden estable sin duplicados internos.
+    return list(dict.fromkeys([x for x in ids if x]))
+
+
+def sheet_event_seen_or_mark(ev: dict, seen_ids: set[str]) -> bool:
+    """Retorna True si el evento ya fue visto por cualquiera de sus identidades."""
+    ids = sheet_event_all_dedupe_ids(ev)
+    if ids and any(x in seen_ids for x in ids):
+        return True
+    for x in ids:
+        seen_ids.add(x)
+    return False
 
 def stop_for_backup_failure(message: str):
     """Detiene la operación de forma controlada cuando Sheets no confirma respaldo.
@@ -3684,6 +3723,135 @@ def get_label_print_summary(lote_id: int) -> pd.DataFrame:
     return df
 
 
+def parse_event_datetime_for_compare(value):
+    """Parsea fechas operativas para comparar eventos restaurados desde Sheets/SQLite."""
+    s = clean_text(value)
+    if not s:
+        return None
+    try:
+        raw = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=CHILE_TZ)
+        return dt.astimezone(CHILE_TZ)
+    except Exception:
+        pass
+    try:
+        dt = pd.to_datetime(s, errors="coerce")
+        if pd.isna(dt):
+            return None
+        if getattr(dt, "tzinfo", None) is None:
+            return dt.to_pydatetime().replace(tzinfo=CHILE_TZ)
+        return dt.to_pydatetime().astimezone(CHILE_TZ)
+    except Exception:
+        return None
+
+
+def get_historical_block_label_coverage(lote_id: int) -> dict:
+    """Detecta si el lote ya fue cubierto por impresiones históricas por bloque.
+
+    Aunque el flujo operativo actual es por lista de picking, los lotes impresos antes
+    de la migración tienen eventos BLOQUE sin picking_code. Para no mostrarlos como
+    pendientes falsos, se usa una cobertura conservadora:
+    - toma el último registro por block_index;
+    - suma sus etiquetas normales;
+    - solo declara cobertura si alcanza las unidades actuales del lote.
+    """
+    lote_id = int(lote_id)
+    with db() as c:
+        total_row = c.execute("SELECT COALESCE(SUM(unidades),0) AS total FROM items WHERE lote_id=?", (lote_id,)).fetchone()
+        required_total = int(total_row["total"] or 0) if total_row else 0
+        blocks = pd.read_sql_query(
+            """
+            SELECT block_index, block_key, normal_qty, total_qty, last_printed_at, created_at, updated_at, status
+            FROM label_blocks
+            WHERE lote_id=?
+            """,
+            c,
+            params=(lote_id,),
+        )
+        prints = pd.read_sql_query(
+            """
+            SELECT block_index, block_key,
+                   SUM(CASE WHEN print_kind='NORMAL' THEN cantidad ELSE 0 END) AS normal_qty,
+                   SUM(cantidad) AS total_qty,
+                   MAX(created_at) AS last_printed_at
+            FROM label_prints
+            WHERE lote_id=? AND print_scope='BLOQUE' AND block_index IS NOT NULL
+            GROUP BY block_index, block_key
+            """,
+            c,
+            params=(lote_id,),
+        )
+
+    frames = []
+    if not blocks.empty:
+        b = blocks.copy()
+        b["normal_qty"] = b["normal_qty"].fillna(0).astype(int)
+        b["last_printed_at"] = b["last_printed_at"].fillna(b.get("updated_at", "")).fillna(b.get("created_at", ""))
+        frames.append(b[["block_index", "block_key", "normal_qty", "total_qty", "last_printed_at"]])
+    if not prints.empty:
+        p = prints.copy()
+        p["normal_qty"] = p["normal_qty"].fillna(0).astype(int)
+        frames.append(p[["block_index", "block_key", "normal_qty", "total_qty", "last_printed_at"]])
+
+    if not frames or required_total <= 0:
+        return {"covered": False, "required_total": required_total, "normal_total": 0, "latest_at": "", "latest_dt": None, "blocks_count": 0}
+
+    all_blocks = pd.concat(frames, ignore_index=True)
+    all_blocks["block_index_int"] = all_blocks["block_index"].map(to_int)
+    all_blocks = all_blocks[all_blocks["block_index_int"] > 0].copy()
+    if all_blocks.empty:
+        return {"covered": False, "required_total": required_total, "normal_total": 0, "latest_at": "", "latest_dt": None, "blocks_count": 0}
+
+    all_blocks["_dt"] = all_blocks["last_printed_at"].map(parse_event_datetime_for_compare)
+    all_blocks["_dt_sort"] = all_blocks["_dt"].map(lambda d: d.timestamp() if d else 0)
+    latest_per_index = all_blocks.sort_values(["block_index_int", "_dt_sort"]).groupby("block_index_int", as_index=False).tail(1)
+    normal_total = int(latest_per_index["normal_qty"].fillna(0).astype(int).sum())
+    latest_dt = None
+    for d in latest_per_index["_dt"].tolist():
+        if d and (latest_dt is None or d > latest_dt):
+            latest_dt = d
+    latest_at = latest_dt.isoformat(timespec="seconds") if latest_dt else clean_text(latest_per_index["last_printed_at"].max())
+
+    # Cobertura conservadora: debe alcanzar el total actual del lote.
+    covered = normal_total >= required_total
+    return {
+        "covered": bool(covered),
+        "required_total": int(required_total),
+        "normal_total": int(normal_total),
+        "latest_at": latest_at,
+        "latest_dt": latest_dt,
+        "blocks_count": int(latest_per_index["block_index_int"].nunique()),
+    }
+
+
+def item_is_covered_by_historical_blocks(item_row: dict, coverage: dict) -> bool:
+    if not coverage or not coverage.get("covered"):
+        return False
+    latest_dt = coverage.get("latest_dt")
+    if not latest_dt:
+        return True
+    item_dt = parse_event_datetime_for_compare(row_get_value(item_row, "created_at", ""))
+    if not item_dt:
+        return True
+    return item_dt <= latest_dt
+
+
+def picking_list_is_covered_by_historical_blocks(lote_id: int, picking_list_id: int, required: int = 0, coverage: dict | None = None) -> bool:
+    coverage = coverage or get_historical_block_label_coverage(lote_id)
+    if not coverage or not coverage.get("covered"):
+        return False
+    latest_dt = coverage.get("latest_dt")
+    if not latest_dt:
+        return True
+    meta = get_picking_list_meta(int(picking_list_id))
+    list_dt = parse_event_datetime_for_compare(meta.get("created_at", ""))
+    if not list_dt:
+        return True
+    return list_dt <= latest_dt
+
+
 def label_control_view(lote_id: int) -> pd.DataFrame:
     items = get_items(lote_id)
     if items.empty:
@@ -3692,6 +3860,19 @@ def label_control_view(lote_id: int) -> pd.DataFrame:
     view = items.merge(summary, left_on="id", right_on="item_id", how="left")
     for col in ["printed_normal", "printed_separators", "reprinted_qty"]:
         view[col] = view[col].fillna(0).astype(int)
+
+    # Puente seguro para lotes históricos impresos por BLOQUE antes de migrar a etiquetas por picking.
+    # Si el lote completo quedó cubierto por bloques y el producto existía antes de esa impresión,
+    # el control individual no debe mostrarlo falsamente como SIN IMPRIMIR.
+    coverage = get_historical_block_label_coverage(lote_id)
+    if coverage.get("covered"):
+        for idx, r in view.iterrows():
+            req = int(r.get("unidades", 0) or 0)
+            if req > 0 and int(view.at[idx, "printed_normal"] or 0) < req and item_is_covered_by_historical_blocks(r.to_dict(), coverage):
+                view.at[idx, "printed_normal"] = req
+                if not clean_text(view.at[idx, "last_label_printed_at"] if "last_label_printed_at" in view.columns else ""):
+                    view.at[idx, "last_label_printed_at"] = clean_text(coverage.get("latest_at", ""))
+
     view["label_pending"] = (view["unidades"].astype(int) - view["printed_normal"].astype(int)).clip(lower=0)
 
     def status_row(r):
@@ -4026,8 +4207,9 @@ def build_picking_label_block(picking_list_id: int) -> dict:
 def get_picking_label_print_count(lote_id: int, picking_list_id: int, block_key: str = "") -> int:
     """Retorna registros de impresión para una lista de picking.
 
-    Primero busca por block_key actual. Si el rescate recalculó la key, cae al
-    picking_list_id guardado como block_index. Esto evita falsos pendientes.
+    Primero busca por impresión directa por lista. Si no existe, reconoce cobertura
+    histórica por BLOQUE para evitar que una lista ya cubierta aparezca como pendiente
+    tras la migración del módulo de etiquetas.
     """
     with db() as c:
         row = c.execute(
@@ -4049,7 +4231,13 @@ def get_picking_label_print_count(lote_id: int, picking_list_id: int, block_key:
             """,
             (int(lote_id), int(picking_list_id)),
         ).fetchone()
-    return int(row["n"] or 0) if row else 0
+        n = int(row["n"] or 0) if row else 0
+        if n > 0:
+            return n
+
+    if picking_list_is_covered_by_historical_blocks(int(lote_id), int(picking_list_id)):
+        return 1
+    return 0
 
 
 def get_picking_label_print_summary(lote_id: int) -> pd.DataFrame:
@@ -4081,7 +4269,7 @@ def get_picking_label_status_df(lote_id: int) -> pd.DataFrame:
     picking_df = get_picking_lists(lote_id)
     cols = [
         "picking_list_id", "codigo_lista", "asignado_a", "estado_lista", "productos", "etiquetas_requeridas",
-        "separadores", "total_zpl", "etiquetas_impresas", "reimpresas", "estado_etiquetas", "ultima_impresion"
+        "separadores", "total_zpl", "etiquetas_impresas", "reimpresas", "estado_etiquetas", "origen_impresion", "ultima_impresion"
     ]
     if picking_df.empty:
         return pd.DataFrame(columns=cols)
@@ -4090,6 +4278,7 @@ def get_picking_label_status_df(lote_id: int) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     summary = get_picking_label_print_summary(lote_id)
     summary_map = {int(r["picking_list_id"]): r.to_dict() for _, r in summary.iterrows()} if not summary.empty else {}
+    coverage = get_historical_block_label_coverage(lote_id)
     rows = []
     for _, pl in picking_df.sort_values("id", ascending=False).iterrows():
         pid = int(pl["id"])
@@ -4098,6 +4287,16 @@ def get_picking_label_status_df(lote_id: int) -> pd.DataFrame:
         printed = int(srow.get("printed_normal", 0) or 0)
         reprinted = int(srow.get("reprinted_normal", 0) or 0)
         required = int(block.get("normal_qty", 0) or 0)
+        origen = "PICKING" if printed > 0 else ""
+        ultima = clean_text(srow.get("last_label_printed_at", ""))
+
+        # Puente de migración: si una lista existía cuando el lote fue cubierto por impresión
+        # histórica por BLOQUE, no debe quedar marcada como pendiente al cambiar el flujo a picking.
+        if printed <= 0 and required > 0 and picking_list_is_covered_by_historical_blocks(lote_id, pid, required, coverage):
+            printed = required
+            origen = "BLOQUE HISTÓRICO"
+            ultima = clean_text(coverage.get("latest_at", ""))
+
         if printed <= 0:
             estado_etq = "PENDIENTE"
         elif reprinted > 0:
@@ -4116,7 +4315,8 @@ def get_picking_label_status_df(lote_id: int) -> pd.DataFrame:
             "etiquetas_impresas": printed,
             "reimpresas": reprinted,
             "estado_etiquetas": estado_etq,
-            "ultima_impresion": clean_text(srow.get("last_label_printed_at", "")),
+            "origen_impresion": origen,
+            "ultima_impresion": ultima,
         })
     return pd.DataFrame(rows, columns=cols)
 
@@ -6935,11 +7135,8 @@ def get_sheet_events_normalized() -> tuple[bool, list[dict], str]:
     seen_event_ids = set()
     for raw_ev in events:
         ev = normalize_sheet_event(raw_ev)
-        semantic_id = sheet_event_semantic_identity(ev)
-        if semantic_id:
-            if semantic_id in seen_event_ids:
-                continue
-            seen_event_ids.add(semantic_id)
+        if sheet_event_seen_or_mark(ev, seen_event_ids):
+            continue
         normalized.append(ev)
 
     def key(ev):
@@ -7049,7 +7246,10 @@ def summarize_sheet_lotes(events: list[dict]) -> pd.DataFrame:
             _rec["productos"] = len(_items_state)
             _rec["unidades"] = sum(float(to_float_qty(x.get("unidades", 0))) for x in _items_state if isinstance(x, dict))
             _rec["escaneos"] = len(_scans_state)
-            _rec["unidades_escaneadas"] = sum(float(to_int(x.get("cantidad", 0))) for x in _scans_state if isinstance(x, dict))
+            # Métrica visual segura: lo que quedará acopiado localmente al restaurar,
+            # no la suma bruta de eventos scan. La suma bruta puede verse mayor cuando
+            # Sheets devuelve hoja madre + hojas estructuradas o cuando hubo sobre-scan histórico.
+            _rec["unidades_escaneadas"] = sum(float(to_int(x.get("acopiadas", 0))) for x in _items_state if isinstance(x, dict))
             _rec["picking_listas"] = len(_state.get("picking_lists", []) or [])
             _rec["incidencias"] = len(_state.get("incidencias", []) or [])
             _rec["avisos"] = len(_state.get("avisos", []) or [])
@@ -7357,7 +7557,15 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
       duplicar unidades por reimpresiones o recreaciones.
     """
     target = int(lote_id)
-    lote_events = [normalize_sheet_event(ev) for ev in (events or []) if _event_lote_id(normalize_sheet_event(ev)) == target]
+    lote_events = []
+    _seen_lote_event_ids = set()
+    for _raw_ev in (events or []):
+        _ev = normalize_sheet_event(_raw_ev)
+        if _event_lote_id(_ev) != target:
+            continue
+        if sheet_event_seen_or_mark(_ev, _seen_lote_event_ids):
+            continue
+        lote_events.append(_ev)
     lote_events.sort(key=_event_key)
 
     meta = {
@@ -7606,10 +7814,23 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
     scan_rows = []
     unmatched_scans = 0
     ambiguous_scans = 0
+    seen_scan_ids = set()
     for ev in lote_events:
         et = clean_text(ev.get("event_type", ""))
         if et not in {"scan_agregado", "scan_deshacer"}:
             continue
+        scan_identity = sheet_event_semantic_identity(ev)
+        if not scan_identity:
+            scan_identity = "SCAN:" + "|".join([
+                clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", "")),
+                clean_text(ev.get("item_id", "")), norm_code(ev.get("codigo_ml", "")),
+                norm_code(ev.get("codigo_universal", "")), norm_code(ev.get("sku", "")),
+                clean_text(ev.get("cantidad", "")), clean_text(ev.get("picking_code", "")),
+                clean_text(ev.get("scan_primario", "")), clean_text(ev.get("scan_secundario", "")),
+            ])
+        if scan_identity in seen_scan_ids:
+            continue
+        seen_scan_ids.add(scan_identity)
         qty = to_int(ev.get("cantidad", 0))
         sign = -1 if et == "scan_deshacer" else 1
         original_id = to_int(ev.get("item_id", 0))
@@ -10505,9 +10726,9 @@ elif page == "Etiquetas":
                     "codigo_lista": "Lista", "asignado_a": "Picker", "estado_lista": "Estado lista",
                     "productos": "Productos", "etiquetas_requeridas": "Etiquetas requeridas",
                     "etiquetas_impresas": "Etiquetas impresas", "reimpresas": "Reimpresas",
-                    "estado_etiquetas": "Estado etiquetas", "ultima_impresion": "Última impresión",
+                    "estado_etiquetas": "Estado etiquetas", "origen_impresion": "Origen", "ultima_impresion": "Última impresión",
                 })
-                cols_list = ["Lista", "Picker", "Estado lista", "Productos", "Etiquetas requeridas", "Etiquetas impresas", "Reimpresas", "Estado etiquetas", "Última impresión"]
+                cols_list = ["Lista", "Picker", "Estado lista", "Productos", "Etiquetas requeridas", "Etiquetas impresas", "Reimpresas", "Estado etiquetas", "Origen", "Última impresión"]
                 st.dataframe(out_lists[[c for c in cols_list if c in out_lists.columns]], use_container_width=True, hide_index=True, height=360)
 
             st.divider()
