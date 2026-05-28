@@ -2263,6 +2263,78 @@ def apply_quantity_adjustments_df(lote_id: int, df: pd.DataFrame, item_col: str 
     out[qty_col] = out.apply(_apply, axis=1).astype(int)
     return out
 
+
+
+def get_operationally_blocked_item_ids(lote_id: int) -> set[int]:
+    """Productos que no deben entrar al flujo operativo.
+
+    Ajuste chico solicitado:
+    - Si un producto tiene aviso activo de retiro/bloqueo, no debe aparecer para
+      crear picking ni etiquetas, y no debe sumar como pendiente físico.
+    - No se borra ni se oculta de auditoría/Supervisor; solo se excluye del
+      objetivo operativo para evitar faltantes falsos y etiquetas de más.
+    """
+    try:
+        lid = int(lote_id)
+    except Exception:
+        return set()
+    blocking_types = {
+        "PRODUCTO RETIRADO DEL LOTE",
+        "NO ESCANEAR / ESPERAR INSTRUCCIÓN",
+    }
+    with db() as c:
+        rows = c.execute(
+            """
+            SELECT item_id, tipo_aviso
+            FROM avisos_operacionales
+            WHERE lote_id=? AND estado='ACTIVO'
+            """,
+            (lid,),
+        ).fetchall()
+    blocked = set()
+    for r in rows:
+        tipo = clean_text(r["tipo_aviso"]).upper()
+        if tipo in blocking_types:
+            try:
+                iid = int(r["item_id"] or 0)
+                if iid:
+                    blocked.add(iid)
+            except Exception:
+                pass
+    return blocked
+
+
+def apply_operational_exclusions_df(lote_id: int, df: pd.DataFrame, item_col: str = "id", qty_col: str = "unidades") -> pd.DataFrame:
+    """Filtra productos fuera del objetivo operativo actual.
+
+    No cambia la base de datos. Solo evita que productos retirados/bloqueados o
+    ajustados a cantidad 0 inflen métricas, picking y pendientes.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if item_col in out.columns:
+        blocked = get_operationally_blocked_item_ids(lote_id)
+        if blocked:
+            out = out[~out[item_col].map(lambda x: to_int(x) in blocked)].copy()
+    if qty_col in out.columns:
+        out = out[out[qty_col].map(to_int) > 0].copy()
+    return out.reset_index(drop=True)
+
+
+def get_operational_items(lote_id: int) -> pd.DataFrame:
+    """Items que sí cuentan para operación física: escaneo, picking, etiquetas y cierre."""
+    return apply_operational_exclusions_df(lote_id, get_items(lote_id), item_col="id", qty_col="unidades")
+
+
+def get_adjusted_out_items_count(lote_id: int) -> int:
+    """Cantidad de líneas sacadas del objetivo operativo por aviso o cantidad 0."""
+    all_items = get_items(lote_id)
+    op_items = get_operational_items(lote_id)
+    if all_items is None or all_items.empty:
+        return 0
+    return max(int(len(all_items)) - int(len(op_items) if op_items is not None else 0), 0)
+
 def get_items(lote_id):
     with db() as c:
         df = pd.read_sql_query(
@@ -2848,6 +2920,8 @@ def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo,
         item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lote_id)).fetchone()
         if not item:
             return False, "Producto no encontrado."
+        if int(item_id) in get_operationally_blocked_item_ids(lote_id):
+            return False, "Este producto está retirado/bloqueado por aviso operacional activo. No se permite escanearlo."
         unidades_objetivo = get_effective_item_units(lote_id, item_id, int(item["unidades"] or 0))
         pendiente = int(unidades_objetivo or 0) - int(item["acopiadas"])
         # Picking obligatorio:
@@ -3870,7 +3944,7 @@ def picking_list_is_covered_by_historical_blocks(lote_id: int, picking_list_id: 
 
 
 def label_control_view(lote_id: int) -> pd.DataFrame:
-    items = get_items(lote_id)
+    items = get_operational_items(lote_id)
     if items.empty:
         return items
     summary = get_label_print_summary(lote_id)
@@ -5592,12 +5666,12 @@ def confirmar_tarea_externa_aviso(aviso_id: int, tarea: str, usuario: str):
 
 
 def supervisor_metrics(lote_id: int) -> dict:
-    items = get_items(lote_id)
+    items = get_operational_items(lote_id)
     if items.empty:
         return {"total": 0, "done": 0, "pending": 0, "incidencias_abiertas": 0, "avisos_activos": 0, "label_pending": 0}
     view = items.copy()
     total_units = int(view["unidades"].sum())
-    done_units = min(total_units, get_scanned_total(lote_id))
+    done_units = min(total_units, int(view["acopiadas"].sum()))
     pending_units = max(total_units - done_units, 0)
     labels = label_control_view(lote_id)
     incid = get_incidencias(lote_id, status="ABIERTA")
@@ -5613,7 +5687,7 @@ def supervisor_metrics(lote_id: int) -> dict:
 
 
 def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> tuple[bool, list[str], dict]:
-    items = get_items(lote_id)
+    items = get_operational_items(lote_id)
     issues = []
     if items.empty:
         issues.append("El lote no tiene productos.")
@@ -5831,7 +5905,7 @@ def get_picking_available_items(lote_id: int) -> pd.DataFrame:
     desordena el papel y la trazabilidad. Si ya tiene cualquier cantidad asignada
     en una lista no anulada, queda bloqueado para nuevas listas.
     """
-    items = get_items(lote_id)
+    items = get_operational_items(lote_id)
     if items.empty:
         return items
     assigned = get_picking_assigned_qty(lote_id)
@@ -9728,14 +9802,17 @@ elif page == "Escaneo":
     else:
         lote_scan = get_lote(active_lote)
         lote_cerrado = clean_text(lote_scan.get("status", "ACTIVO")).upper() == "CERRADO"
-        items = get_items(active_lote)
+        items = get_operational_items(active_lote)
         total = int(items["unidades"].sum()) if not items.empty else 0
         done = int(items["acopiadas"].sum()) if not items.empty else 0
+        excluidos_operativos = get_adjusted_out_items_count(active_lote)
         st.progress(done / total if total else 0)
         a, b, c = st.columns(3)
         a.metric("Solicitado", total)
         b.metric("Acopiado", done)
-        c.metric("Pendiente", max(total - done, 0))
+        c.metric("Pendiente operativo", max(total - done, 0))
+        if excluidos_operativos > 0:
+            st.caption(f"Objetivo operativo: {excluidos_operativos} producto(s) retirado(s), bloqueado(s) o ajustado(s) a 0 no suman como pendiente físico.")
         st.divider()
 
         # Sesión de trazabilidad: se define una vez, no por cada escaneo.
@@ -10065,7 +10142,7 @@ elif page == "Supervisor":
         st.warning("No hay lote activo.")
     else:
         lote = get_lote(active_lote)
-        items = get_items(active_lote)
+        items = get_operational_items(active_lote)
         # La impresión por bloques fue retirada del flujo operativo.
         # Se conserva la variable solo por compatibilidad con validaciones históricas.
         capacity_sup = ROLL_CAPACITY_DEFAULT
@@ -10100,9 +10177,10 @@ elif page == "Supervisor":
             if not view.empty:
                 view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
                 resumen = pd.DataFrame([{
-                    "Unidades solicitadas": int(view["unidades"].sum()),
+                    "Unidades objetivo operativo": int(view["unidades"].sum()),
                     "Unidades acopiadas": int(view["acopiadas"].sum()),
-                    "Unidades pendientes": int(view["pendiente"].sum()),
+                    "Unidades pendientes físicas": int(view["pendiente"].sum()),
+                    "Productos fuera del objetivo operativo": get_adjusted_out_items_count(active_lote),
                     "Líneas totales": int(len(view)),
                     "Líneas pendientes": int((view["pendiente"] > 0).sum()),
                     "Listas etiquetas pendientes": cierre_data.get("picking_label_pending", 0),
