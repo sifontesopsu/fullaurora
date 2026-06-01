@@ -4030,6 +4030,34 @@ def zpl_for_block(block: dict) -> str:
     return "".join(chunks)
 
 
+def zpl_for_picking_label_block(block: dict) -> str:
+    """Genera ZPL para etiquetas por lista de picking con separadores obligatorios.
+
+    Esta función existe para blindar el flujo nuevo por lista de picking,
+    especialmente en productos anexados al FULL. Cada producto de la lista
+    debe salir siempre como:
+
+    INICIO PRODUCTO + etiquetas normales (^PQ cantidad lista) + FIN PRODUCTO
+
+    No depende de bloques históricos ni de la cantidad total del FULL.
+    """
+    chunks = []
+    for item in block.get("items") or []:
+        qty = max(1, to_int(item.get("unidades", item.get("cantidad", 1))))
+        desc_label = descripcion_etiqueta_value(item)
+        codigo_ml = row_get_value(item, "codigo_ml", "")
+        sku = row_get_value(item, "sku", "")
+        chunks.append(zpl_separator_50x30("INICIO", codigo_ml, sku, desc_label))
+        chunks.append(zpl_ml_label_50x30(codigo_ml, sku, desc_label, qty))
+        chunks.append(zpl_separator_50x30("FIN", codigo_ml, sku, desc_label))
+    return "".join(chunks)
+
+
+def zpl_count_inicio_fin(zpl_content) -> tuple[int, int]:
+    text = zpl_content.decode("utf-8", errors="ignore") if isinstance(zpl_content, bytes) else str(zpl_content or "")
+    return text.count("^FDINICIO PRODUCTO^FS"), text.count("^FDFIN PRODUCTO^FS")
+
+
 def zpl_content_hash(zpl_content) -> str:
     """Huella SHA256 del ZPL generado para trazabilidad sin guardar el archivo completo en Sheets."""
     if isinstance(zpl_content, bytes):
@@ -4470,7 +4498,7 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
             )
         c.commit()
 
-    zpl_content = zpl_for_block(block)
+    zpl_content = zpl_for_picking_label_block(block)
     register_zpl_label_event(
         lote_id,
         print_scope="PICKING",
@@ -10704,7 +10732,11 @@ elif page == "Etiquetas":
                             f"Estado lista: {clean_text(block_pick.get('estado',''))}"
                         )
 
-                        zpl_pick = zpl_for_block(block_pick).encode("utf-8")
+                        zpl_pick_text = zpl_for_picking_label_block(block_pick)
+                        inicio_count, fin_count = zpl_count_inicio_fin(zpl_pick_text)
+                        if int(block_pick.get("products_count", 0) or 0) > 0:
+                            st.caption(f"Separadores en ZPL: INICIO {inicio_count} / FIN {fin_count}")
+                        zpl_pick = zpl_pick_text.encode("utf-8")
                         fname_pick = f"etiquetas_lote_{active_lote}_{clean_text(block_pick.get('picking_code','PICKING')).replace(' ', '_')}.zpl"
                         if not is_printed:
                             st.download_button(
