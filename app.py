@@ -4030,34 +4030,6 @@ def zpl_for_block(block: dict) -> str:
     return "".join(chunks)
 
 
-def zpl_for_picking_label_block(block: dict) -> str:
-    """Genera ZPL para etiquetas por lista de picking con separadores obligatorios.
-
-    Esta función existe para blindar el flujo nuevo por lista de picking,
-    especialmente en productos anexados al FULL. Cada producto de la lista
-    debe salir siempre como:
-
-    INICIO PRODUCTO + etiquetas normales (^PQ cantidad lista) + FIN PRODUCTO
-
-    No depende de bloques históricos ni de la cantidad total del FULL.
-    """
-    chunks = []
-    for item in block.get("items") or []:
-        qty = max(1, to_int(item.get("unidades", item.get("cantidad", 1))))
-        desc_label = descripcion_etiqueta_value(item)
-        codigo_ml = row_get_value(item, "codigo_ml", "")
-        sku = row_get_value(item, "sku", "")
-        chunks.append(zpl_separator_50x30("INICIO", codigo_ml, sku, desc_label))
-        chunks.append(zpl_ml_label_50x30(codigo_ml, sku, desc_label, qty))
-        chunks.append(zpl_separator_50x30("FIN", codigo_ml, sku, desc_label))
-    return "".join(chunks)
-
-
-def zpl_count_inicio_fin(zpl_content) -> tuple[int, int]:
-    text = zpl_content.decode("utf-8", errors="ignore") if isinstance(zpl_content, bytes) else str(zpl_content or "")
-    return text.count("^FDINICIO PRODUCTO^FS"), text.count("^FDFIN PRODUCTO^FS")
-
-
 def zpl_content_hash(zpl_content) -> str:
     """Huella SHA256 del ZPL generado para trazabilidad sin guardar el archivo completo en Sheets."""
     if isinstance(zpl_content, bytes):
@@ -4498,7 +4470,7 @@ def register_picking_label_download(lote_id: int, picking_list_id: int, block: d
             )
         c.commit()
 
-    zpl_content = zpl_for_picking_label_block(block)
+    zpl_content = zpl_for_block(block)
     register_zpl_label_event(
         lote_id,
         print_scope="PICKING",
@@ -5523,17 +5495,30 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
             # picking no deben seguir trabajando con la cantidad antigua.
             c.execute("UPDATE items SET unidades=?, updated_at=? WHERE id=? AND lote_id=?",
                       (int(cantidad_nueva_int), now, int(item_id), int(lote_id)))
+            # Solo actualiza listas que aún no fueron impresas ni tienen escaneos.
+            # Si una lista ya fue emitida/operada, no se modifica silenciosamente: el
+            # objetivo operativo se verá integrado en métricas, pero la lista histórica
+            # queda trazable para revisión operacional.
             c.execute(
                 """
                 UPDATE picking_list_items
                 SET cantidad=?
                 WHERE lote_id=? AND item_id=?
                   AND picking_list_id IN (
-                    SELECT id FROM picking_lists
-                    WHERE lote_id=? AND estado NOT IN ('ANULADA','COMPLETADA')
+                    SELECT pl.id
+                    FROM picking_lists pl
+                    WHERE pl.lote_id=?
+                      AND pl.estado NOT IN ('ANULADA','COMPLETADA')
+                      AND COALESCE(pl.printed_at, '') = ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM scans s
+                          WHERE s.lote_id=pl.lote_id
+                            AND s.picking_list_id=pl.id
+                            AND s.item_id=?
+                      )
                   )
                 """,
-                (int(cantidad_nueva_int), int(lote_id), int(item_id), int(lote_id)),
+                (int(cantidad_nueva_int), int(lote_id), int(item_id), int(lote_id), int(item_id)),
             )
         c.commit()
 
@@ -6045,6 +6030,15 @@ def search_picking_assignment(lote_id: int, query: str) -> pd.DataFrame:
     df = df[mask].copy()
     if df.empty:
         return df
+
+    # Integra avisos operacionales en la consulta: tanto la cantidad del lote
+    # como la cantidad de una lista se leen contra el objetivo operativo vigente.
+    # Esto evita que el buscador de SKU muestre cantidades antiguas si hubo ajuste.
+    try:
+        df = apply_quantity_adjustments_df(lote_id, df, item_col="item_id", qty_col="cantidad_lote")
+        df = apply_quantity_adjustments_df(lote_id, df, item_col="item_id", qty_col="cantidad_lista")
+    except Exception:
+        pass
 
     for col in ["cantidad_lote", "cantidad_lista", "validado_pda"]:
         if col in df.columns:
@@ -9275,9 +9269,14 @@ def export_lote(lote_id):
 # ============================================================
 
 def render_control_integrado(active_lote: int):
-    """Control operativo integrado al panel Supervisor."""
+    """Control operativo integrado al panel Supervisor.
+
+    Usa el objetivo operativo vigente: cantidades originales del FULL ajustadas
+    por avisos operacionales y excluyendo productos retirados/bloqueados.
+    Así el supervisor no ve faltantes físicos falsos por productos ya ajustados.
+    """
     lote = get_lote(active_lote)
-    items = get_items(active_lote)
+    items = get_operational_items(active_lote)
     if items.empty:
         st.warning("El lote no tiene productos.")
         return
@@ -9294,7 +9293,7 @@ def render_control_integrado(active_lote: int):
     c1, c2, c3, c4 = st.columns(4)
     total = int(view["unidades"].sum())
     done = int(view["acopiadas"].sum())
-    c1.metric("Unidades", total)
+    c1.metric("Objetivo operativo", total)
     c2.metric("Acopiadas", done)
     c3.metric("Pendientes", max(total - done, 0))
     c4.metric("Avance", f"{(done / total * 100) if total else 0:.1f}%")
@@ -9341,7 +9340,7 @@ def render_control_integrado(active_lote: int):
             "codigo_universal": "Código Universal",
             "sku": "SKU",
             "descripcion": "Producto",
-            "unidades": "Solicitadas",
+            "unidades": "Objetivo operativo",
             "acopiadas": "Acopiadas",
             "pendiente": "Pendiente",
             "estado": "Estado",
@@ -9349,7 +9348,7 @@ def render_control_integrado(active_lote: int):
             "vence": "Vence",
             "procesado_at": "Último escaneo",
         })
-        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo"]
+        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Objetivo operativo", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo"]
         st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
         return
 
@@ -9358,7 +9357,7 @@ def render_control_integrado(active_lote: int):
         vence = clean_text(r.get("vence", ""))
         proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
         badges_parts = [
-            f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
+            f"<span class='badge'>Objetivo operativo: {int(r['unidades'])}</span>",
             f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
             f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
             f"<span class='badge'>{esc(r['estado'])}</span>",
@@ -10232,8 +10231,8 @@ elif page == "Supervisor":
                 if pend.empty:
                     st.success("No hay productos pendientes.")
                 else:
-                    out = pend.rename(columns={"codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto", "unidades": "Solicitadas", "acopiadas": "Acopiadas", "pendiente": "Pendiente", "identificacion": "Identificación", "vence": "Vence"})
-                    cols = ["Código ML", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence"]
+                    out = pend.rename(columns={"codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto", "unidades": "Objetivo operativo", "acopiadas": "Acopiadas", "pendiente": "Pendiente", "identificacion": "Identificación", "vence": "Vence"})
+                    cols = ["Código ML", "SKU", "Producto", "Objetivo operativo", "Acopiadas", "Pendiente", "Identificación", "Vence"]
                     st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_incid:
@@ -10732,11 +10731,7 @@ elif page == "Etiquetas":
                             f"Estado lista: {clean_text(block_pick.get('estado',''))}"
                         )
 
-                        zpl_pick_text = zpl_for_picking_label_block(block_pick)
-                        inicio_count, fin_count = zpl_count_inicio_fin(zpl_pick_text)
-                        if int(block_pick.get("products_count", 0) or 0) > 0:
-                            st.caption(f"Separadores en ZPL: INICIO {inicio_count} / FIN {fin_count}")
-                        zpl_pick = zpl_pick_text.encode("utf-8")
+                        zpl_pick = zpl_for_block(block_pick).encode("utf-8")
                         fname_pick = f"etiquetas_lote_{active_lote}_{clean_text(block_pick.get('picking_code','PICKING')).replace(' ', '_')}.zpl"
                         if not is_printed:
                             st.download_button(
@@ -11007,7 +11002,7 @@ elif page == "Control":
                     vence = clean_text(r.get("vence", ""))
                     proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
                     badges_parts = [
-                        f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
+                        f"<span class='badge'>Objetivo operativo: {int(r['unidades'])}</span>",
                         f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
                         f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
                     ]
