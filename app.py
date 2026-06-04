@@ -2202,11 +2202,18 @@ def get_lote(lote_id):
 
 
 def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
-    """Última cantidad objetivo administrativa por producto.
+    """Cantidad objetivo operativa por producto considerando avisos.
 
-    Un aviso de tipo Ajuste de cantidad cambia la cantidad operacional del FULL.
-    La confirmación ML/Kame puede quedar pendiente, pero el operador debe ver y
-    trabajar con la nueva cantidad objetivo para no validar con una meta antigua.
+    Regla de producción:
+    - Si existe aviso "Ajuste de cantidad" sin confirmación completa ML+Kame,
+      la cantidad nueva sigue siendo la meta física pendiente.
+    - Si el ajuste ya está confirmado en ML y Kame, el diferencial deja de ser
+      pendiente físico para Supervisor/Cierre/Pendientes. En ese caso el objetivo
+      operativo se baja a lo ya acopiado cuando la cantidad nueva sea mayor que
+      lo acopiado.
+
+    Esto evita falsos pendientes en FULL ya ajustados administrativamente, sin
+    cambiar la auditoría ni borrar el aviso operacional.
     """
     try:
         lid = int(lote_id)
@@ -2215,12 +2222,17 @@ def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
     with db() as c:
         rows = c.execute(
             """
-            SELECT item_id, cantidad_nueva
-            FROM avisos_operacionales
-            WHERE lote_id=?
-              AND COALESCE(cantidad_nueva,'') <> ''
-              AND LOWER(COALESCE(tipo_aviso,'')) LIKE '%ajuste%'
-            ORDER BY id ASC
+            SELECT av.item_id,
+                   av.cantidad_nueva,
+                   av.confirmado_ml,
+                   av.confirmado_inventario,
+                   i.acopiadas
+            FROM avisos_operacionales av
+            LEFT JOIN items i ON i.id=av.item_id AND i.lote_id=av.lote_id
+            WHERE av.lote_id=?
+              AND COALESCE(av.cantidad_nueva,'') <> ''
+              AND LOWER(COALESCE(av.tipo_aviso,'')) LIKE '%ajuste%'
+            ORDER BY av.id ASC
             """,
             (lid,),
         ).fetchall()
@@ -2228,11 +2240,20 @@ def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
     for r in rows:
         try:
             iid = int(r["item_id"] or 0)
-            qty = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
+            qty_new = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
+            acopiadas = int(r["acopiadas"] or 0)
+            confirmed = int(r["confirmado_ml"] or 0) == 1 and int(r["confirmado_inventario"] or 0) == 1
         except Exception:
             continue
-        if iid and qty >= 0:
-            out[iid] = qty
+        if not iid or qty_new < 0:
+            continue
+
+        effective_qty = qty_new
+        if confirmed and qty_new > acopiadas:
+            # El ajuste ya fue cerrado administrativamente. La diferencia no debe
+            # seguir apareciendo como faltante físico del FULL.
+            effective_qty = max(acopiadas, 0)
+        out[iid] = int(effective_qty)
     return out
 
 
@@ -5495,30 +5516,17 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
             # picking no deben seguir trabajando con la cantidad antigua.
             c.execute("UPDATE items SET unidades=?, updated_at=? WHERE id=? AND lote_id=?",
                       (int(cantidad_nueva_int), now, int(item_id), int(lote_id)))
-            # Solo actualiza listas que aún no fueron impresas ni tienen escaneos.
-            # Si una lista ya fue emitida/operada, no se modifica silenciosamente: el
-            # objetivo operativo se verá integrado en métricas, pero la lista histórica
-            # queda trazable para revisión operacional.
             c.execute(
                 """
                 UPDATE picking_list_items
                 SET cantidad=?
                 WHERE lote_id=? AND item_id=?
                   AND picking_list_id IN (
-                    SELECT pl.id
-                    FROM picking_lists pl
-                    WHERE pl.lote_id=?
-                      AND pl.estado NOT IN ('ANULADA','COMPLETADA')
-                      AND COALESCE(pl.printed_at, '') = ''
-                      AND NOT EXISTS (
-                          SELECT 1 FROM scans s
-                          WHERE s.lote_id=pl.lote_id
-                            AND s.picking_list_id=pl.id
-                            AND s.item_id=?
-                      )
+                    SELECT id FROM picking_lists
+                    WHERE lote_id=? AND estado NOT IN ('ANULADA','COMPLETADA')
                   )
                 """,
-                (int(cantidad_nueva_int), int(lote_id), int(item_id), int(lote_id), int(item_id)),
+                (int(cantidad_nueva_int), int(lote_id), int(item_id), int(lote_id)),
             )
         c.commit()
 
@@ -6030,15 +6038,6 @@ def search_picking_assignment(lote_id: int, query: str) -> pd.DataFrame:
     df = df[mask].copy()
     if df.empty:
         return df
-
-    # Integra avisos operacionales en la consulta: tanto la cantidad del lote
-    # como la cantidad de una lista se leen contra el objetivo operativo vigente.
-    # Esto evita que el buscador de SKU muestre cantidades antiguas si hubo ajuste.
-    try:
-        df = apply_quantity_adjustments_df(lote_id, df, item_col="item_id", qty_col="cantidad_lote")
-        df = apply_quantity_adjustments_df(lote_id, df, item_col="item_id", qty_col="cantidad_lista")
-    except Exception:
-        pass
 
     for col in ["cantidad_lote", "cantidad_lista", "validado_pda"]:
         if col in df.columns:
@@ -9269,14 +9268,9 @@ def export_lote(lote_id):
 # ============================================================
 
 def render_control_integrado(active_lote: int):
-    """Control operativo integrado al panel Supervisor.
-
-    Usa el objetivo operativo vigente: cantidades originales del FULL ajustadas
-    por avisos operacionales y excluyendo productos retirados/bloqueados.
-    Así el supervisor no ve faltantes físicos falsos por productos ya ajustados.
-    """
+    """Control operativo integrado al panel Supervisor."""
     lote = get_lote(active_lote)
-    items = get_operational_items(active_lote)
+    items = get_items(active_lote)
     if items.empty:
         st.warning("El lote no tiene productos.")
         return
@@ -9293,7 +9287,7 @@ def render_control_integrado(active_lote: int):
     c1, c2, c3, c4 = st.columns(4)
     total = int(view["unidades"].sum())
     done = int(view["acopiadas"].sum())
-    c1.metric("Objetivo operativo", total)
+    c1.metric("Unidades", total)
     c2.metric("Acopiadas", done)
     c3.metric("Pendientes", max(total - done, 0))
     c4.metric("Avance", f"{(done / total * 100) if total else 0:.1f}%")
@@ -9340,7 +9334,7 @@ def render_control_integrado(active_lote: int):
             "codigo_universal": "Código Universal",
             "sku": "SKU",
             "descripcion": "Producto",
-            "unidades": "Objetivo operativo",
+            "unidades": "Solicitadas",
             "acopiadas": "Acopiadas",
             "pendiente": "Pendiente",
             "estado": "Estado",
@@ -9348,7 +9342,7 @@ def render_control_integrado(active_lote: int):
             "vence": "Vence",
             "procesado_at": "Último escaneo",
         })
-        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Objetivo operativo", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo"]
+        cols = ["Estado", "Código ML", "Código Universal", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence", "Último escaneo"]
         st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
         return
 
@@ -9357,7 +9351,7 @@ def render_control_integrado(active_lote: int):
         vence = clean_text(r.get("vence", ""))
         proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
         badges_parts = [
-            f"<span class='badge'>Objetivo operativo: {int(r['unidades'])}</span>",
+            f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
             f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
             f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
             f"<span class='badge'>{esc(r['estado'])}</span>",
@@ -10231,8 +10225,8 @@ elif page == "Supervisor":
                 if pend.empty:
                     st.success("No hay productos pendientes.")
                 else:
-                    out = pend.rename(columns={"codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto", "unidades": "Objetivo operativo", "acopiadas": "Acopiadas", "pendiente": "Pendiente", "identificacion": "Identificación", "vence": "Vence"})
-                    cols = ["Código ML", "SKU", "Producto", "Objetivo operativo", "Acopiadas", "Pendiente", "Identificación", "Vence"]
+                    out = pend.rename(columns={"codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto", "unidades": "Solicitadas", "acopiadas": "Acopiadas", "pendiente": "Pendiente", "identificacion": "Identificación", "vence": "Vence"})
+                    cols = ["Código ML", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence"]
                     st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
 
         with tab_incid:
@@ -11002,7 +10996,7 @@ elif page == "Control":
                     vence = clean_text(r.get("vence", ""))
                     proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
                     badges_parts = [
-                        f"<span class='badge'>Objetivo operativo: {int(r['unidades'])}</span>",
+                        f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
                         f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
                         f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
                     ]
