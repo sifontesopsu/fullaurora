@@ -2202,18 +2202,11 @@ def get_lote(lote_id):
 
 
 def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
-    """Cantidad objetivo operativa por producto considerando avisos.
+    """Última cantidad objetivo administrativa por producto.
 
-    Regla de producción:
-    - Si existe aviso "Ajuste de cantidad" sin confirmación completa ML+Kame,
-      la cantidad nueva sigue siendo la meta física pendiente.
-    - Si el ajuste ya está confirmado en ML y Kame, el diferencial deja de ser
-      pendiente físico para Supervisor/Cierre/Pendientes. En ese caso el objetivo
-      operativo se baja a lo ya acopiado cuando la cantidad nueva sea mayor que
-      lo acopiado.
-
-    Esto evita falsos pendientes en FULL ya ajustados administrativamente, sin
-    cambiar la auditoría ni borrar el aviso operacional.
+    Un aviso de tipo Ajuste de cantidad cambia la cantidad operacional del FULL.
+    La confirmación ML/Kame puede quedar pendiente, pero el operador debe ver y
+    trabajar con la nueva cantidad objetivo para no validar con una meta antigua.
     """
     try:
         lid = int(lote_id)
@@ -2222,17 +2215,12 @@ def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
     with db() as c:
         rows = c.execute(
             """
-            SELECT av.item_id,
-                   av.cantidad_nueva,
-                   av.confirmado_ml,
-                   av.confirmado_inventario,
-                   i.acopiadas
-            FROM avisos_operacionales av
-            LEFT JOIN items i ON i.id=av.item_id AND i.lote_id=av.lote_id
-            WHERE av.lote_id=?
-              AND COALESCE(av.cantidad_nueva,'') <> ''
-              AND LOWER(COALESCE(av.tipo_aviso,'')) LIKE '%ajuste%'
-            ORDER BY av.id ASC
+            SELECT item_id, cantidad_nueva
+            FROM avisos_operacionales
+            WHERE lote_id=?
+              AND COALESCE(cantidad_nueva,'') <> ''
+              AND LOWER(COALESCE(tipo_aviso,'')) LIKE '%ajuste%'
+            ORDER BY id ASC
             """,
             (lid,),
         ).fetchall()
@@ -2240,20 +2228,11 @@ def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
     for r in rows:
         try:
             iid = int(r["item_id"] or 0)
-            qty_new = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
-            acopiadas = int(r["acopiadas"] or 0)
-            confirmed = int(r["confirmado_ml"] or 0) == 1 and int(r["confirmado_inventario"] or 0) == 1
+            qty = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
         except Exception:
             continue
-        if not iid or qty_new < 0:
-            continue
-
-        effective_qty = qty_new
-        if confirmed and qty_new > acopiadas:
-            # El ajuste ya fue cerrado administrativamente. La diferencia no debe
-            # seguir apareciendo como faltante físico del FULL.
-            effective_qty = max(acopiadas, 0)
-        out[iid] = int(effective_qty)
+        if iid and qty >= 0:
+            out[iid] = qty
     return out
 
 
@@ -2346,6 +2325,30 @@ def apply_operational_exclusions_df(lote_id: int, df: pd.DataFrame, item_col: st
 def get_operational_items(lote_id: int) -> pd.DataFrame:
     """Items que sí cuentan para operación física: escaneo, picking, etiquetas y cierre."""
     return apply_operational_exclusions_df(lote_id, get_items(lote_id), item_col="id", qty_col="unidades")
+
+
+def get_label_reprint_items(lote_id: int) -> pd.DataFrame:
+    """Base segura para etiquetas/reimpresión individual.
+
+    No debe ocultar productos solo por tener aviso operacional de ajuste de
+    cantidad. Los avisos de ajuste pueden estar confirmados en ML/Kame y ya no
+    contar como pendiente físico, pero el producto debe seguir disponible para
+    reposición/reimpresión de etiquetas si su cantidad objetivo es mayor a cero.
+
+    Solo se excluyen productos realmente retirados/bloqueados o con cantidad
+    objetivo cero.
+    """
+    df = get_items(lote_id)
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "id" in out.columns:
+        blocked = get_operationally_blocked_item_ids(lote_id)
+        if blocked:
+            out = out[~out["id"].map(lambda x: to_int(x) in blocked)].copy()
+    if "unidades" in out.columns:
+        out = out[out["unidades"].map(to_int) > 0].copy()
+    return out.reset_index(drop=True)
 
 
 def get_adjusted_out_items_count(lote_id: int) -> int:
@@ -3965,7 +3968,10 @@ def picking_list_is_covered_by_historical_blocks(lote_id: int, picking_list_id: 
 
 
 def label_control_view(lote_id: int) -> pd.DataFrame:
-    items = get_operational_items(lote_id)
+    # Etiquetas/reimpresión no deben ocultar productos por avisos de ajuste.
+    # Se usa una base dedicada: incluye ajustes +10/-10 con cantidad vigente,
+    # excluyendo solo retirados/bloqueados o cantidad objetivo 0.
+    items = get_label_reprint_items(lote_id)
     if items.empty:
         return items
     summary = get_label_print_summary(lote_id)
