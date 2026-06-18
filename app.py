@@ -2202,11 +2202,17 @@ def get_lote(lote_id):
 
 
 def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
-    """Última cantidad objetivo administrativa por producto.
+    """Cantidad objetivo operativa por producto considerando avisos.
 
-    Un aviso de tipo Ajuste de cantidad cambia la cantidad operacional del FULL.
-    La confirmación ML/Kame puede quedar pendiente, pero el operador debe ver y
-    trabajar con la nueva cantidad objetivo para no validar con una meta antigua.
+    Regla elegida para producción (opción 1), aplicada sobre la última versión segura:
+    - Si existe aviso "Ajuste de cantidad" sin confirmación completa ML+Kame,
+      la cantidad nueva sigue siendo la meta operativa.
+    - Si el ajuste ya está confirmado en ML y Kame, la diferencia administrativa
+      deja de contar como pendiente físico.
+
+    Esto evita falsos pendientes en Supervisor/Cierre sin ocultar el aviso ni
+    borrar trazabilidad. Los productos con ajuste siguen existiendo para
+    búsqueda/reimpresión; solo cambia el objetivo físico que infla pendientes.
     """
     try:
         lid = int(lote_id)
@@ -2215,26 +2221,43 @@ def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
     with db() as c:
         rows = c.execute(
             """
-            SELECT item_id, cantidad_nueva
-            FROM avisos_operacionales
-            WHERE lote_id=?
-              AND COALESCE(cantidad_nueva,'') <> ''
-              AND LOWER(COALESCE(tipo_aviso,'')) LIKE '%ajuste%'
-            ORDER BY id ASC
+            SELECT av.item_id,
+                   av.cantidad_nueva,
+                   av.confirmado_ml,
+                   av.confirmado_inventario,
+                   i.acopiadas
+            FROM avisos_operacionales av
+            LEFT JOIN items i ON i.id=av.item_id AND i.lote_id=av.lote_id
+            WHERE av.lote_id=?
+              AND COALESCE(av.cantidad_nueva,'') <> ''
+              AND LOWER(COALESCE(av.tipo_aviso,'')) LIKE '%ajuste%'
+            ORDER BY av.id ASC
             """,
             (lid,),
         ).fetchall()
+
     out = {}
     for r in rows:
         try:
             iid = int(r["item_id"] or 0)
-            qty = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
+            qty_new = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
+            acopiadas = int(r["acopiadas"] or 0)
+            confirmed_ml = int(r["confirmado_ml"] or 0) == 1
+            confirmed_kame = int(r["confirmado_inventario"] or 0) == 1
+            confirmed = confirmed_ml and confirmed_kame
         except Exception:
             continue
-        if iid and qty >= 0:
-            out[iid] = qty
-    return out
 
+        if not iid or qty_new < 0:
+            continue
+
+        effective_qty = qty_new
+        if confirmed and qty_new > acopiadas:
+            # Ajuste administrativo ya cerrado: la diferencia no es faltante físico.
+            effective_qty = max(acopiadas, 0)
+
+        out[iid] = int(effective_qty)
+    return out
 
 def get_effective_item_units(lote_id: int, item_id: int, default_units: int | None = None) -> int | None:
     adjustments = get_latest_quantity_adjustments(lote_id)
