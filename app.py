@@ -10829,109 +10829,232 @@ elif page == "Etiquetas":
 
         with tab_individual:
             st.info("Uso excepcional para reposiciones fuera de una lista. También queda registrado automáticamente al descargar.")
-            if view.empty:
+
+            # Buscador robusto para reposición individual.
+            # Regla de seguridad:
+            # - Primero busca dentro del lote activo y permite imprimir solo si pertenece a ese lote.
+            # - Si no existe en el lote activo, muestra en qué otro FULL aparece para evitar imprimir desde el FULL equivocado.
+            # - Incluye fallback desde items y picking_list_items para que un ajuste operacional no oculte productos válidos.
+            search_ind = st.text_input(
+                "Buscar producto",
+                key=f"label_individual_search_{active_lote}",
+                placeholder="Escribe Código ML, EAN, SKU o parte de la descripción",
+            )
+            q_ind = clean_text(search_ind).upper()
+
+            def _row_matches_query(row, q):
+                if not q:
+                    return True
+                haystack = " | ".join([
+                    clean_text(row.get("codigo_ml", "")),
+                    clean_text(row.get("codigo_universal", "")),
+                    clean_text(row.get("sku", "")),
+                    clean_text(row.get("descripcion", "")),
+                    clean_text(row.get("descripcion_ml", "")),
+                    clean_text(row.get("descripcion_kame", "")),
+                ]).upper()
+                return q in haystack
+
+            def _enrich_label_row_from_item(row_dict):
+                """Completa columnas mínimas para imprimir aunque el producto venga de fallback."""
+                out = dict(row_dict or {})
+                out["id"] = to_int(out.get("id", out.get("item_id", 0)))
+                out["unidades"] = max(0, to_int(out.get("unidades", out.get("cantidad", 0))))
+                out["descripcion"] = clean_text(out.get("descripcion_kame", "")) or clean_text(out.get("descripcion", ""))
+                if not clean_text(out.get("descripcion_ml", "")):
+                    out["descripcion_ml"] = clean_text(out.get("descripcion", ""))
+                summary = get_label_print_summary(active_lote)
+                printed_normal = printed_separators = reprinted_qty = 0
+                last_printed = ""
+                if not summary.empty and out.get("id"):
+                    m = summary[summary["item_id"].astype(int) == int(out.get("id"))]
+                    if not m.empty:
+                        printed_normal = int(m.iloc[0].get("printed_normal", 0) or 0)
+                        printed_separators = int(m.iloc[0].get("printed_separators", 0) or 0)
+                        reprinted_qty = int(m.iloc[0].get("reprinted_qty", 0) or 0)
+                        last_printed = clean_text(m.iloc[0].get("last_label_printed_at", ""))
+                out["printed_normal"] = printed_normal
+                out["printed_separators"] = printed_separators
+                out["reprinted_qty"] = reprinted_qty
+                out["last_label_printed_at"] = last_printed
+                req = int(out.get("unidades", 0) or 0)
+                out["label_pending"] = max(req - printed_normal, 0)
+                if printed_normal == 0:
+                    out["label_status"] = "SIN IMPRIMIR"
+                elif printed_normal < req:
+                    out["label_status"] = "PARCIAL"
+                elif printed_normal == req:
+                    out["label_status"] = "COMPLETO"
+                else:
+                    out["label_status"] = "SOBREIMPRESO"
+                return out
+
+            base_view = view.copy() if not view.empty else pd.DataFrame()
+            if q_ind and not base_view.empty:
+                view_ind = base_view[base_view.apply(lambda r: _row_matches_query(r, q_ind), axis=1)].copy()
+            else:
+                view_ind = base_view.copy()
+
+            fallback_notice = ""
+            if q_ind and view_ind.empty:
+                # Fallback 1: items directos del lote activo. Esto recupera productos que quedaron fuera
+                # del control visual de etiquetas por alguna exclusión, pero siguen perteneciendo al FULL.
+                try:
+                    raw_items = get_items(active_lote)
+                except Exception:
+                    raw_items = pd.DataFrame()
+                if raw_items is not None and not raw_items.empty:
+                    raw_matches = raw_items[raw_items.apply(lambda r: _row_matches_query(r, q_ind), axis=1)].copy()
+                    if not raw_matches.empty:
+                        view_ind = pd.DataFrame([_enrich_label_row_from_item(r.to_dict()) for _, r in raw_matches.iterrows()])
+                        fallback_notice = "Producto recuperado desde los items del lote activo. Se permite imprimir porque pertenece a este FULL."
+
+            if q_ind and view_ind.empty:
+                # Fallback 2: picking_list_items del lote activo. Útil si el producto llegó por rescate/picking.
+                try:
+                    with db() as c:
+                        pitems = pd.read_sql_query(
+                            """
+                            SELECT pli.item_id AS id, pli.codigo_ml, pli.codigo_universal, pli.sku,
+                                   pli.descripcion, pli.descripcion_kame, pli.descripcion_ml,
+                                   pli.familia_kame, pli.maestro_match_status,
+                                   SUM(COALESCE(pli.cantidad,0)) AS unidades
+                            FROM picking_list_items pli
+                            JOIN picking_lists pl ON pl.id = pli.picking_list_id
+                            WHERE pli.lote_id=? AND COALESCE(pl.estado,'') != 'ANULADA'
+                            GROUP BY pli.item_id, pli.codigo_ml, pli.codigo_universal, pli.sku, pli.descripcion,
+                                     pli.descripcion_kame, pli.descripcion_ml, pli.familia_kame, pli.maestro_match_status
+                            """,
+                            c,
+                            params=(int(active_lote),),
+                        )
+                    if not pitems.empty:
+                        pm = pitems[pitems.apply(lambda r: _row_matches_query(r, q_ind), axis=1)].copy()
+                        if not pm.empty:
+                            view_ind = pd.DataFrame([_enrich_label_row_from_item(r.to_dict()) for _, r in pm.iterrows()])
+                            fallback_notice = "Producto recuperado desde una lista de picking del lote activo. Se permite imprimir porque pertenece a este FULL."
+                except Exception:
+                    pass
+
+            if fallback_notice:
+                st.warning(fallback_notice)
+
+            selected_id = None
+            if q_ind and view_ind.empty:
+                # Diagnóstico seguro: si el código existe en otro FULL, avisamos claramente.
+                # No permitimos imprimir desde el lote equivocado.
+                try:
+                    qlike = f"%{q_ind}%"
+                    with db() as c:
+                        other = pd.read_sql_query(
+                            """
+                            SELECT l.id AS lote_id, l.nombre AS lote_nombre, i.codigo_ml, i.codigo_universal, i.sku,
+                                   i.descripcion, i.descripcion_ml, i.unidades
+                            FROM items i
+                            JOIN lotes l ON l.id = i.lote_id
+                            WHERE i.lote_id != ?
+                              AND (
+                                UPPER(COALESCE(i.codigo_ml,'')) LIKE ? OR
+                                UPPER(COALESCE(i.codigo_universal,'')) LIKE ? OR
+                                UPPER(COALESCE(i.sku,'')) LIKE ? OR
+                                UPPER(COALESCE(i.descripcion,'')) LIKE ? OR
+                                UPPER(COALESCE(i.descripcion_ml,'')) LIKE ? OR
+                                UPPER(COALESCE(i.descripcion_kame,'')) LIKE ?
+                              )
+                            ORDER BY l.id DESC
+                            LIMIT 10
+                            """,
+                            c,
+                            params=(int(active_lote), qlike, qlike, qlike, qlike, qlike, qlike),
+                        )
+                    if not other.empty:
+                        st.error("Ese código no pertenece al lote activo. Lo encontré en otro FULL; cambia el lote activo para imprimirlo con seguridad.")
+                        show_other = other.rename(columns={
+                            "lote_id": "Lote ID", "lote_nombre": "FULL", "codigo_ml": "Código ML",
+                            "codigo_universal": "EAN", "sku": "SKU", "descripcion": "Producto",
+                            "descripcion_ml": "Descripción ML", "unidades": "Unidades",
+                        })
+                        st.dataframe(show_other, use_container_width=True, hide_index=True, height=180)
+                    else:
+                        st.warning("No encontré productos con ese código en este lote. Revisa que el lote activo sea el correcto o busca por SKU/EAN.")
+                except Exception:
+                    st.warning("No encontré productos con ese código en este lote. Revisa que el lote activo sea el correcto o busca por SKU/EAN.")
+            elif view_ind.empty:
                 st.warning("El lote activo no tiene productos disponibles para reposición individual.")
             else:
-                # Búsqueda robusta: el buscador nativo del selectbox puede no encontrar
-                # códigos ML/EAN/SKU en algunos casos. Aquí filtramos nosotros contra
-                # Código ML, Código Universal/EAN, SKU y descripciones, sin cambiar la
-                # lógica de impresión ni la trazabilidad.
-                search_ind = st.text_input(
-                    "Buscar producto",
-                    key=f"label_individual_search_{active_lote}",
-                    placeholder="Escribe Código ML, EAN, SKU o parte de la descripción",
-                )
-                q_ind = clean_text(search_ind).upper()
-                view_ind = view.copy()
                 if q_ind:
-                    def _match_individual_label(row):
-                        haystack = " | ".join([
-                            clean_text(row.get("codigo_ml", "")),
-                            clean_text(row.get("codigo_universal", "")),
-                            clean_text(row.get("sku", "")),
-                            clean_text(row.get("descripcion", "")),
-                            clean_text(row.get("descripcion_ml", "")),
-                            clean_text(row.get("descripcion_kame", "")),
-                        ]).upper()
-                        return q_ind in haystack
-                    view_ind = view_ind[view_ind.apply(_match_individual_label, axis=1)].copy()
+                    st.caption(f"Coincidencias encontradas en este FULL: {len(view_ind)}")
+                options = []
+                option_map = {}
+                for _, r in view_ind.iterrows():
+                    label = (
+                        f"{clean_text(r.get('descripcion',''))[:80]} | "
+                        f"ML {clean_text(r.get('codigo_ml',''))} | "
+                        f"EAN {clean_text(r.get('codigo_universal',''))} | "
+                        f"SKU {clean_text(r.get('sku',''))} | "
+                        f"Estado {clean_text(r.get('label_status',''))}"
+                    )
+                    options.append(label)
+                    option_map[label] = int(r["id"])
+                selected = st.selectbox(
+                    "Producto encontrado",
+                    options,
+                    index=0 if options else None,
+                    key=f"label_individual_select_{active_lote}_{hashlib.sha1(q_ind.encode()).hexdigest()[:8]}",
+                )
+                selected_id = option_map.get(selected) if selected else None
 
-                if view_ind.empty:
-                    st.warning("No encontré productos con ese código en este lote. Revisa que el lote activo sea el correcto o busca por SKU/EAN.")
-                    selected_id = None
+            if selected_id:
+                source_df = view_ind if not view_ind.empty else view
+                row = source_df[source_df["id"].astype(int) == int(selected_id)].iloc[0].to_dict()
+                req = int(row.get("unidades", 0))
+                printed = int(row.get("printed_normal", 0))
+                pending = max(req - printed, 0)
+                status = clean_text(row.get("label_status", ""))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Unidades", req)
+                m2.metric("Impresas", printed)
+                m3.metric("Pendientes", pending)
+                m4.metric("Estado", status)
+                st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
+                st.caption(
+                    f"Código ML: {clean_text(row.get('codigo_ml',''))} · "
+                    f"EAN: {clean_text(row.get('codigo_universal',''))} · "
+                    f"SKU: {clean_text(row.get('sku',''))}"
+                )
+                qty_key_ind = f"qty_individual_{active_lote}_{selected_id}"
+                qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1, key=qty_key_ind)
+                qty_ind = max(1, int(st.session_state.get(qty_key_ind, qty_ind) or 1))
+                if printed >= req:
+                    st.warning("Este producto ya tiene todas sus etiquetas normales impresas. La descarga se registrará como REIMPRESIÓN.")
+                elif int(qty_ind) > pending:
+                    st.warning(f"La cantidad supera lo pendiente ({pending}). Puede dejar el producto SOBREIMPRESO.")
+
+                prep_key = f"prepared_individual_zpl_{active_lote}_{selected_id}"
+                if st.button("Preparar ZPL individual con esta cantidad", key=f"prepare_individual_zpl_{active_lote}_{selected_id}_{qty_ind}"):
+                    zpl_text = zpl_for_item_with_separators_exact_pq(row, int(qty_ind))
+                    st.session_state[prep_key] = {
+                        "qty": int(qty_ind),
+                        "zpl": zpl_text.encode("utf-8"),
+                        "fname": f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl",
+                        "row": row,
+                    }
+
+                prepared = st.session_state.get(prep_key)
+                if prepared:
+                    prepared_qty = int(prepared.get("qty") or 1)
+                    st.success(f"ZPL preparado con ^PQ{prepared_qty}. Al descargar, queda registrado automáticamente.")
+                    st.download_button(
+                        "Descargar ZPL individual",
+                        data=prepared.get("zpl"),
+                        file_name=prepared.get("fname"),
+                        mime="text/plain",
+                        key=f"download_individual_prepared_{active_lote}_{selected_id}_{prepared_qty}",
+                        on_click=register_individual_download,
+                        args=(active_lote, prepared.get("row") or row, prepared_qty),
+                    )
                 else:
-                    if q_ind:
-                        st.caption(f"Coincidencias encontradas: {len(view_ind)}")
-                    options = []
-                    option_map = {}
-                    for _, r in view_ind.iterrows():
-                        label = (
-                            f"{clean_text(r.get('descripcion',''))[:80]} | "
-                            f"ML {clean_text(r.get('codigo_ml',''))} | "
-                            f"EAN {clean_text(r.get('codigo_universal',''))} | "
-                            f"SKU {clean_text(r.get('sku',''))} | "
-                            f"Estado {clean_text(r.get('label_status',''))}"
-                        )
-                        options.append(label)
-                        option_map[label] = int(r["id"])
-                    selected = st.selectbox(
-                        "Producto encontrado",
-                        options,
-                        index=0 if options else None,
-                        key=f"label_individual_select_{active_lote}_{hashlib.sha1(q_ind.encode()).hexdigest()[:8]}",
-                    )
-                    selected_id = option_map.get(selected) if selected else None
-
-                if selected_id:
-                    row = view[view["id"].astype(int) == int(selected_id)].iloc[0].to_dict()
-                    req = int(row.get("unidades", 0))
-                    printed = int(row.get("printed_normal", 0))
-                    pending = max(req - printed, 0)
-                    status = clean_text(row.get("label_status", ""))
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Unidades", req)
-                    m2.metric("Impresas", printed)
-                    m3.metric("Pendientes", pending)
-                    m4.metric("Estado", status)
-                    st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
-                    st.caption(
-                        f"Código ML: {clean_text(row.get('codigo_ml',''))} · "
-                        f"EAN: {clean_text(row.get('codigo_universal',''))} · "
-                        f"SKU: {clean_text(row.get('sku',''))}"
-                    )
-                    qty_key_ind = f"qty_individual_{active_lote}_{selected_id}"
-                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1, key=qty_key_ind)
-                    qty_ind = max(1, int(st.session_state.get(qty_key_ind, qty_ind) or 1))
-                    if printed >= req:
-                        st.warning("Este producto ya tiene todas sus etiquetas normales impresas. La descarga se registrará como REIMPRESIÓN.")
-                    elif int(qty_ind) > pending:
-                        st.warning(f"La cantidad supera lo pendiente ({pending}). Puede dejar el producto SOBREIMPRESO.")
-
-                    prep_key = f"prepared_individual_zpl_{active_lote}_{selected_id}"
-                    if st.button("Preparar ZPL individual con esta cantidad", key=f"prepare_individual_zpl_{active_lote}_{selected_id}_{qty_ind}"):
-                        zpl_text = zpl_for_item_with_separators_exact_pq(row, int(qty_ind))
-                        st.session_state[prep_key] = {
-                            "qty": int(qty_ind),
-                            "zpl": zpl_text.encode("utf-8"),
-                            "fname": f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl",
-                            "row": row,
-                        }
-
-                    prepared = st.session_state.get(prep_key)
-                    if prepared:
-                        prepared_qty = int(prepared.get("qty") or 1)
-                        st.success(f"ZPL preparado con ^PQ{prepared_qty}. Al descargar, queda registrado automáticamente.")
-                        st.download_button(
-                            "Descargar ZPL individual",
-                            data=prepared.get("zpl"),
-                            file_name=prepared.get("fname"),
-                            mime="text/plain",
-                            key=f"download_individual_prepared_{active_lote}_{selected_id}_{prepared_qty}",
-                            on_click=register_individual_download,
-                            args=(active_lote, prepared.get("row") or row, prepared_qty),
-                        )
-                    else:
-                        st.caption("Primero prepara el ZPL para fijar la cantidad exacta. No hay marcado manual.")
+                    st.caption("Primero prepara el ZPL para fijar la cantidad exacta. No hay marcado manual.")
 
         with tab_historial:
             st.subheader("Control por lista de picking")
