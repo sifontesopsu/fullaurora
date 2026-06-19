@@ -10830,16 +10830,58 @@ elif page == "Etiquetas":
         with tab_individual:
             st.info("Uso excepcional para reposiciones fuera de una lista. También queda registrado automáticamente al descargar.")
             if view.empty:
-                st.warning("El lote activo no tiene productos.")
+                st.warning("El lote activo no tiene productos disponibles para reposición individual.")
             else:
-                options = []
-                option_map = {}
-                for _, r in view.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:70]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))} | Estado {clean_text(r.get('label_status',''))}"
-                    options.append(label)
-                    option_map[label] = int(r["id"])
-                selected = st.selectbox("Buscar producto", options, index=0 if options else None, placeholder="Escribe nombre, Código ML o SKU")
-                selected_id = option_map.get(selected) if selected else None
+                # Búsqueda robusta: el buscador nativo del selectbox puede no encontrar
+                # códigos ML/EAN/SKU en algunos casos. Aquí filtramos nosotros contra
+                # Código ML, Código Universal/EAN, SKU y descripciones, sin cambiar la
+                # lógica de impresión ni la trazabilidad.
+                search_ind = st.text_input(
+                    "Buscar producto",
+                    key=f"label_individual_search_{active_lote}",
+                    placeholder="Escribe Código ML, EAN, SKU o parte de la descripción",
+                )
+                q_ind = clean_text(search_ind).upper()
+                view_ind = view.copy()
+                if q_ind:
+                    def _match_individual_label(row):
+                        haystack = " | ".join([
+                            clean_text(row.get("codigo_ml", "")),
+                            clean_text(row.get("codigo_universal", "")),
+                            clean_text(row.get("sku", "")),
+                            clean_text(row.get("descripcion", "")),
+                            clean_text(row.get("descripcion_ml", "")),
+                            clean_text(row.get("descripcion_kame", "")),
+                        ]).upper()
+                        return q_ind in haystack
+                    view_ind = view_ind[view_ind.apply(_match_individual_label, axis=1)].copy()
+
+                if view_ind.empty:
+                    st.warning("No encontré productos con ese código en este lote. Revisa que el lote activo sea el correcto o busca por SKU/EAN.")
+                    selected_id = None
+                else:
+                    if q_ind:
+                        st.caption(f"Coincidencias encontradas: {len(view_ind)}")
+                    options = []
+                    option_map = {}
+                    for _, r in view_ind.iterrows():
+                        label = (
+                            f"{clean_text(r.get('descripcion',''))[:80]} | "
+                            f"ML {clean_text(r.get('codigo_ml',''))} | "
+                            f"EAN {clean_text(r.get('codigo_universal',''))} | "
+                            f"SKU {clean_text(r.get('sku',''))} | "
+                            f"Estado {clean_text(r.get('label_status',''))}"
+                        )
+                        options.append(label)
+                        option_map[label] = int(r["id"])
+                    selected = st.selectbox(
+                        "Producto encontrado",
+                        options,
+                        index=0 if options else None,
+                        key=f"label_individual_select_{active_lote}_{hashlib.sha1(q_ind.encode()).hexdigest()[:8]}",
+                    )
+                    selected_id = option_map.get(selected) if selected else None
+
                 if selected_id:
                     row = view[view["id"].astype(int) == int(selected_id)].iloc[0].to_dict()
                     req = int(row.get("unidades", 0))
@@ -10852,7 +10894,11 @@ elif page == "Etiquetas":
                     m3.metric("Pendientes", pending)
                     m4.metric("Estado", status)
                     st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
-                    st.caption(f"Código ML: {clean_text(row.get('codigo_ml',''))} · SKU: {clean_text(row.get('sku',''))}")
+                    st.caption(
+                        f"Código ML: {clean_text(row.get('codigo_ml',''))} · "
+                        f"EAN: {clean_text(row.get('codigo_universal',''))} · "
+                        f"SKU: {clean_text(row.get('sku',''))}"
+                    )
                     qty_key_ind = f"qty_individual_{active_lote}_{selected_id}"
                     qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1, key=qty_key_ind)
                     qty_ind = max(1, int(st.session_state.get(qty_key_ind, qty_ind) or 1))
