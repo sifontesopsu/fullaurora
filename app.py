@@ -2202,17 +2202,66 @@ def get_lote(lote_id):
 
 
 def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
-    """Cantidad objetivo operativa por producto considerando avisos.
+    """Cantidad objetivo vigente por producto para inventario/listas/etiquetas.
 
-    Regla elegida para producción (opción 1), aplicada sobre la última versión segura:
-    - Si existe aviso "Ajuste de cantidad" sin confirmación completa ML+Kame,
-      la cantidad nueva sigue siendo la meta operativa.
-    - Si el ajuste ya está confirmado en ML y Kame, la diferencia administrativa
-      deja de contar como pendiente físico.
+    Esta función NO calcula pendiente físico. Solo responde: ¿cuál es la cantidad
+    vigente del producto después de avisos de ajuste de cantidad?
 
-    Esto evita falsos pendientes en Supervisor/Cierre sin ocultar el aviso ni
-    borrar trazabilidad. Los productos con ajuste siguen existiendo para
-    búsqueda/reimpresión; solo cambia el objetivo físico que infla pendientes.
+    Regla:
+    - Toma el último aviso de "Ajuste de cantidad" con cantidad_nueva.
+    - Aplica aunque el aviso esté ACTIVO o RESUELTO, porque resolver el aviso no
+      debe revertir el ajuste.
+    - No capea por acopiadas. Ese capeo pertenece solamente a Supervisor/Cierre.
+    """
+    try:
+        lid = int(lote_id)
+    except Exception:
+        return {}
+    with db() as c:
+        rows = c.execute(
+            """
+            SELECT item_id, cantidad_nueva
+            FROM avisos_operacionales
+            WHERE lote_id=?
+              AND COALESCE(cantidad_nueva,'') <> ''
+              AND LOWER(COALESCE(tipo_aviso,'')) LIKE '%ajuste%'
+            ORDER BY id ASC
+            """,
+            (lid,),
+        ).fetchall()
+    out = {}
+    for r in rows:
+        try:
+            iid = int(r["item_id"] or 0)
+            qty_new = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
+        except Exception:
+            continue
+        if iid:
+            out[iid] = max(0, int(qty_new))
+    return out
+
+
+def get_latest_label_quantity_adjustments(lote_id: int) -> dict[int, int]:
+    """Cantidad de referencia para etiquetas/reimpresión.
+
+    Es intencionalmente igual al objetivo vigente de ajuste de cantidad, sin
+    convertir avisos confirmados en cero ni en acopiadas. Etiquetas necesita saber
+    cuántas etiquetas corresponden al producto, no cuánto falta físicamente.
+    """
+    return get_latest_quantity_adjustments(lote_id)
+
+
+def get_latest_physical_quantity_adjustments(lote_id: int) -> dict[int, int]:
+    """Cantidad objetivo física para Supervisor/Cierre/Escaneo.
+
+    Regla de producción elegida:
+    - Ajuste de cantidad SIN confirmación completa ML+Kame: la cantidad nueva es
+      la meta física, por lo que puede generar pendiente.
+    - Ajuste de cantidad CON ML+Kame confirmado: la diferencia administrativa ya
+      no cuenta como faltante físico. Si cantidad_nueva es mayor que acopiadas,
+      se capea a acopiadas para no mostrar pendiente falso.
+    - Si cantidad_nueva es menor o igual a acopiadas, se mantiene cantidad_nueva;
+      eso evita mostrar pendiente, y cualquier exceso queda como historia real.
     """
     try:
         lid = int(lote_id)
@@ -2235,32 +2284,31 @@ def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
             """,
             (lid,),
         ).fetchall()
-
     out = {}
     for r in rows:
         try:
             iid = int(r["item_id"] or 0)
             qty_new = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
             acopiadas = int(r["acopiadas"] or 0)
-            confirmed_ml = int(r["confirmado_ml"] or 0) == 1
-            confirmed_kame = int(r["confirmado_inventario"] or 0) == 1
-            confirmed = confirmed_ml and confirmed_kame
+            confirmed = int(r["confirmado_ml"] or 0) == 1 and int(r["confirmado_inventario"] or 0) == 1
         except Exception:
             continue
-
         if not iid or qty_new < 0:
             continue
-
-        effective_qty = qty_new
-        if confirmed and qty_new > acopiadas:
-            # Ajuste administrativo ya cerrado: la diferencia no es faltante físico.
+        effective_qty = int(qty_new)
+        if confirmed and effective_qty > acopiadas:
             effective_qty = max(acopiadas, 0)
-
         out[iid] = int(effective_qty)
     return out
 
+
 def get_effective_item_units(lote_id: int, item_id: int, default_units: int | None = None) -> int | None:
-    adjustments = get_latest_quantity_adjustments(lote_id)
+    """Cantidad física vigente para escaneo/picking pendiente.
+
+    Mantiene el nombre histórico de la función, pero su semántica queda limitada
+    al flujo físico. Etiquetas no debe usar esta función.
+    """
+    adjustments = get_latest_physical_quantity_adjustments(lote_id)
     try:
         iid = int(item_id)
     except Exception:
@@ -2269,6 +2317,11 @@ def get_effective_item_units(lote_id: int, item_id: int, default_units: int | No
 
 
 def apply_quantity_adjustments_df(lote_id: int, df: pd.DataFrame, item_col: str = 'id', qty_col: str = 'unidades') -> pd.DataFrame:
+    """Aplica cantidad vigente de avisos de ajuste, sin capeo físico.
+
+    Uso: inventario, snapshot, etiquetas, reserva y vistas donde la cantidad
+    vigente del producto debe conservarse como número real de referencia.
+    """
     if df is None or df.empty or item_col not in df.columns or qty_col not in df.columns:
         return df
     adjustments = get_latest_quantity_adjustments(lote_id)
@@ -2287,37 +2340,61 @@ def apply_quantity_adjustments_df(lote_id: int, df: pd.DataFrame, item_col: str 
     return out
 
 
+def apply_physical_quantity_adjustments_df(lote_id: int, df: pd.DataFrame, item_col: str = 'id', qty_col: str = 'unidades') -> pd.DataFrame:
+    """Aplica cantidad física para Supervisor/Cierre/Escaneo.
+
+    Esta es la única ruta que puede capear un ajuste confirmado ML+Kame contra
+    acopiadas para eliminar falsos pendientes físicos.
+    """
+    if df is None or df.empty or item_col not in df.columns or qty_col not in df.columns:
+        return df
+    adjustments = get_latest_physical_quantity_adjustments(lote_id)
+    if not adjustments:
+        return df
+    out = df.copy()
+    def _apply(row):
+        try:
+            iid = int(row[item_col])
+            if iid in adjustments:
+                return int(adjustments[iid])
+        except Exception:
+            pass
+        return to_int(row[qty_col])
+    out[qty_col] = out.apply(_apply, axis=1).astype(int)
+    return out
+
+
 
 def get_operationally_blocked_item_ids(lote_id: int) -> set[int]:
-    """Productos que no deben entrar al flujo operativo.
+    """Productos que no deben entrar al flujo operativo físico.
 
-    Ajuste chico solicitado:
-    - Si un producto tiene aviso activo de retiro/bloqueo, no debe aparecer para
-      crear picking ni etiquetas, y no debe sumar como pendiente físico.
-    - No se borra ni se oculta de auditoría/Supervisor; solo se excluye del
-      objetivo operativo para evitar faltantes falsos y etiquetas de más.
+    Producto retirado del lote es permanente para ese FULL, aunque el aviso sea
+    resuelto administrativamente. "No escanear / esperar instrucción" bloquea
+    solo mientras esté ACTIVO.
     """
     try:
         lid = int(lote_id)
     except Exception:
         return set()
-    blocking_types = {
-        "PRODUCTO RETIRADO DEL LOTE",
-        "NO ESCANEAR / ESPERAR INSTRUCCIÓN",
-    }
     with db() as c:
         rows = c.execute(
             """
-            SELECT item_id, tipo_aviso
+            SELECT item_id, tipo_aviso, estado
             FROM avisos_operacionales
-            WHERE lote_id=? AND estado='ACTIVO'
+            WHERE lote_id=?
             """,
             (lid,),
         ).fetchall()
     blocked = set()
     for r in rows:
         tipo = clean_text(r["tipo_aviso"]).upper()
-        if tipo in blocking_types:
+        estado = clean_text(r["estado"]).upper()
+        bloquea = False
+        if tipo == "PRODUCTO RETIRADO DEL LOTE":
+            bloquea = True
+        elif tipo == "NO ESCANEAR / ESPERAR INSTRUCCIÓN" and estado == "ACTIVO":
+            bloquea = True
+        if bloquea:
             try:
                 iid = int(r["item_id"] or 0)
                 if iid:
@@ -2328,10 +2405,10 @@ def get_operationally_blocked_item_ids(lote_id: int) -> set[int]:
 
 
 def apply_operational_exclusions_df(lote_id: int, df: pd.DataFrame, item_col: str = "id", qty_col: str = "unidades") -> pd.DataFrame:
-    """Filtra productos fuera del objetivo operativo actual.
+    """Filtra productos fuera del objetivo físico actual.
 
-    No cambia la base de datos. Solo evita que productos retirados/bloqueados o
-    ajustados a cantidad 0 inflen métricas, picking y pendientes.
+    No cambia SQLite. Solo evita que retirados, bloqueados o cantidad física 0
+    inflen métricas, picking, escaneo y cierre.
     """
     if df is None or df.empty:
         return df
@@ -2346,25 +2423,31 @@ def apply_operational_exclusions_df(lote_id: int, df: pd.DataFrame, item_col: st
 
 
 def get_operational_items(lote_id: int) -> pd.DataFrame:
-    """Items que sí cuentan para operación física: escaneo, picking, etiquetas y cierre."""
-    return apply_operational_exclusions_df(lote_id, get_items(lote_id), item_col="id", qty_col="unidades")
+    """Base única para operación física: escaneo, picking, supervisor y cierre.
+
+    Parte de get_items() para respetar la cantidad vigente del producto y luego
+    aplica la regla física de avisos confirmados ML+Kame.
+    """
+    df = get_items(lote_id)
+    df = apply_physical_quantity_adjustments_df(lote_id, df, item_col="id", qty_col="unidades")
+    return apply_operational_exclusions_df(lote_id, df, item_col="id", qty_col="unidades")
 
 
 def get_label_reprint_items(lote_id: int) -> pd.DataFrame:
-    """Base segura para etiquetas/reimpresión individual.
+    """Base única para etiquetas/reimpresión individual.
 
-    No debe ocultar productos solo por tener aviso operacional de ajuste de
-    cantidad. Los avisos de ajuste pueden estar confirmados en ML/Kame y ya no
-    contar como pendiente físico, pero el producto debe seguir disponible para
-    reposición/reimpresión de etiquetas si su cantidad objetivo es mayor a cero.
-
-    Solo se excluyen productos realmente retirados/bloqueados o con cantidad
-    objetivo cero.
+    No usa la cantidad física de Supervisor. Por eso evita falsos estados como
+    Unidades=0 / Impresas=36 / SOBREIMPRESO cuando el aviso ya estaba confirmado.
     """
-    df = get_items(lote_id)
+    with db() as c:
+        df = pd.read_sql_query(
+            "SELECT * FROM items WHERE lote_id=? ORDER BY area, CAST(nro AS INTEGER), id",
+            c,
+            params=(lote_id,),
+        )
     if df is None or df.empty:
         return df
-    out = df.copy()
+    out = apply_quantity_adjustments_df(lote_id, df, item_col="id", qty_col="unidades")
     if "id" in out.columns:
         blocked = get_operationally_blocked_item_ids(lote_id)
         if blocked:
@@ -9299,7 +9382,7 @@ def export_lote(lote_id):
 def render_control_integrado(active_lote: int):
     """Control operativo integrado al panel Supervisor."""
     lote = get_lote(active_lote)
-    items = get_items(active_lote)
+    items = get_operational_items(active_lote)
     if items.empty:
         st.warning("El lote no tiene productos.")
         return
@@ -10900,7 +10983,7 @@ elif page == "Etiquetas":
                 # Fallback 1: items directos del lote activo. Esto recupera productos que quedaron fuera
                 # del control visual de etiquetas por alguna exclusión, pero siguen perteneciendo al FULL.
                 try:
-                    raw_items = get_items(active_lote)
+                    raw_items = get_label_reprint_items(active_lote)
                 except Exception:
                     raw_items = pd.DataFrame()
                 if raw_items is not None and not raw_items.empty:
@@ -11128,7 +11211,7 @@ elif page == "Control":
         st.warning("No hay lote activo.")
     else:
         lote = get_lote(active_lote)
-        items = get_items(active_lote)
+        items = get_operational_items(active_lote)
         if items.empty:
             st.warning("El lote no tiene productos.")
         else:
