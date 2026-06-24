@@ -879,6 +879,118 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
 
     normalized_events.sort(key=event_order_key)
 
+    def _snapshot_item_from_event(item_ev: dict, parent_ev: dict) -> dict | None:
+        try:
+            item_id = int(item_ev.get("item_id"))
+        except Exception:
+            return None
+        return {
+            "id": item_id,
+            "lote_id": int(parent_ev.get("lote_id")),
+            "area": clean_text(item_ev.get("area", "")),
+            "nro": clean_text(item_ev.get("nro", "")),
+            "codigo_ml": norm_code(item_ev.get("codigo_ml", "")),
+            "codigo_universal": norm_code(item_ev.get("codigo_universal", "")),
+            "sku": norm_code(item_ev.get("sku", "")),
+            "descripcion": clean_text(item_ev.get("descripcion_kame", "")) or clean_text(item_ev.get("descripcion", "")),
+            "descripcion_kame": clean_text(item_ev.get("descripcion_kame", "")) or clean_text(item_ev.get("descripcion", "")),
+            "descripcion_ml": clean_text(item_ev.get("descripcion_ml", "")) or clean_text(item_ev.get("descripcion", "")),
+            "descripcion_fuente": clean_text(item_ev.get("descripcion_fuente", "")),
+            "familia_kame": clean_text(item_ev.get("familia_kame", "")),
+            "maestro_match_status": clean_text(item_ev.get("maestro_match_status", "")),
+            "origen_item": clean_text(item_ev.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+            "motivo_anexo": clean_text(item_ev.get("motivo_anexo", "")),
+            "usuario_anexo": clean_text(item_ev.get("usuario_anexo", "")),
+            "fecha_anexo": clean_text(item_ev.get("fecha_anexo", "")),
+            "anexo_ml_confirmado": to_int(item_ev.get("anexo_ml_confirmado", 0)),
+            "anexo_ml_confirmado_at": clean_text(item_ev.get("anexo_ml_confirmado_at", "")),
+            "anexo_ml_confirmado_by": clean_text(item_ev.get("anexo_ml_confirmado_by", "")),
+            "anexo_ml_confirmado_comment": clean_text(item_ev.get("anexo_ml_confirmado_comment", "")),
+            "anexo_kame_confirmado": to_int(item_ev.get("anexo_kame_confirmado", 0)),
+            "anexo_kame_confirmado_at": clean_text(item_ev.get("anexo_kame_confirmado_at", "")),
+            "anexo_kame_confirmado_by": clean_text(item_ev.get("anexo_kame_confirmado_by", "")),
+            "anexo_kame_confirmado_comment": clean_text(item_ev.get("anexo_kame_confirmado_comment", "")),
+            "unidades": to_int(item_ev.get("unidades", 0)),
+            "acopiadas": 0,
+            "identificacion": clean_text(item_ev.get("identificacion", "")),
+            "vence": clean_text(item_ev.get("vence", "")),
+            "instrucciones": clean_text(item_ev.get("instrucciones", "")),
+            "dia": clean_text(item_ev.get("dia", "")),
+            "hora": clean_text(item_ev.get("hora", "")),
+            "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(parent_ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+            "updated_at": clean_text(item_ev.get("item_updated_at", "")) or clean_text(parent_ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+        }
+
+    def _latest_complete_snapshot_maps(events_list: list[dict]) -> tuple[dict[int, dict[int, dict]], dict[int, dict]]:
+        """Selecciona un solo snapshot completo por lote para evitar mezclas históricas."""
+        groups = {}
+        for order, ev in enumerate(events_list):
+            if clean_text(ev.get("event_type", "")) != "lote_snapshot_chunk":
+                continue
+            try:
+                lid = int(ev.get("lote_id"))
+            except Exception:
+                continue
+            if not (ev.get("items") or []):
+                continue
+            total_chunks = to_int(ev.get("chunk_total", 0)) or 1
+            chunk_index = to_int(ev.get("chunk_index", 0))
+            snap_hash = clean_text(ev.get("snapshot_hash", ""))
+            if not snap_hash:
+                snap_hash = "SNAP:" + "|".join([
+                    clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", "")),
+                    clean_text(ev.get("productos_total", "")),
+                    clean_text(ev.get("unidades_total", "")),
+                    clean_text(ev.get("chunk_total", "")),
+                ])
+            key = (lid, snap_hash)
+            g = groups.setdefault(key, {
+                "lote_id": lid, "snapshot_hash": snap_hash, "chunk_total": total_chunks,
+                "chunks": {}, "last_order": order,
+                "last_ts": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", "")),
+                "productos_total": to_int(ev.get("productos_total", 0)),
+                "unidades_total": to_int(ev.get("unidades_total", 0)),
+            })
+            g["chunk_total"] = max(int(g.get("chunk_total") or 1), int(total_chunks))
+            g["chunks"][chunk_index] = ev
+            g["last_order"] = max(int(g.get("last_order") or 0), int(order))
+            ts = clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or clean_text(ev.get("received_at", ""))
+            if ts:
+                g["last_ts"] = max(clean_text(g.get("last_ts", "")), ts)
+
+        by_lote = {}
+        for g in groups.values():
+            expected = int(g.get("chunk_total") or 1)
+            if expected <= 0 or len(g.get("chunks", {})) < expected:
+                continue
+            lid = int(g["lote_id"])
+            score = (clean_text(g.get("last_ts", "")), int(g.get("last_order") or 0))
+            if lid not in by_lote or score > by_lote[lid]["score"]:
+                by_lote[lid] = {"group": g, "score": score}
+
+        selected_items = {}
+        selected_meta = {}
+        for lid, packed in by_lote.items():
+            g = packed["group"]
+            imap = {}
+            for _, ev in sorted(g["chunks"].items(), key=lambda kv: kv[0]):
+                for item_ev in (ev.get("items") or []):
+                    item = _snapshot_item_from_event(item_ev, ev)
+                    if item:
+                        imap[int(item["id"])] = item
+            if imap:
+                selected_items[int(lid)] = imap
+                selected_meta[int(lid)] = {
+                    "snapshot_hash": clean_text(g.get("snapshot_hash", "")),
+                    "productos_total": int(g.get("productos_total") or len(imap)),
+                    "unidades_total": int(g.get("unidades_total") or sum(to_int(x.get("unidades", 0)) for x in imap.values())),
+                    "chunk_total": int(g.get("chunk_total") or 1),
+                    "last_ts": clean_text(g.get("last_ts", "")),
+                }
+        return selected_items, selected_meta
+
+    selected_snapshot_items, selected_snapshot_meta = _latest_complete_snapshot_maps(normalized_events)
+
     lotes = {}
     items_by_lote = {}
     deleted_lotes = set()
@@ -1319,6 +1431,20 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
             }
         elif et == "lote_eliminado":
             deleted_lotes.add(lote_id)
+
+    # Si existe un snapshot completo, ese snapshot manda como base del lote.
+    # Esto evita mezclar snapshots históricos con cantidades diferentes después
+    # de reinicios/rescates. Los anexos manuales que no estén dentro del snapshot
+    # se conservan por trazabilidad.
+    for lid, snap_items in selected_snapshot_items.items():
+        if not snap_items:
+            continue
+        manual_items = {}
+        for iid, it in (items_by_lote.get(lid, {}) or {}).items():
+            if int(iid) not in snap_items and clean_text(it.get("origen_item", "")).upper() == "ANEXO_MANUAL":
+                manual_items[int(iid)] = it
+        items_by_lote[lid] = dict(snap_items)
+        items_by_lote[lid].update(manual_items)
 
     # Si existen items de un lote pero falta lote_creado, recuperamos el lote igual.
     # Esto soluciona respaldos donde el snapshot de productos llegó a Sheets, pero
@@ -1786,6 +1912,13 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     extra = ""
     if unmatched_scan_count or ambiguous_scan_count:
         extra = f" Atención: {unmatched_scan_count} acopio(s) recuperado(s) desde Sheets y {ambiguous_scan_count} ambiguo(s). Se conservan como scans válidos del mismo lote para trazabilidad."
+    if selected_snapshot_meta:
+        snap_notes = []
+        for lid in sorted(set(active_lote_ids).intersection(selected_snapshot_meta.keys())):
+            m = selected_snapshot_meta.get(lid, {})
+            snap_notes.append(f"lote {lid}: {m.get('productos_total', 0)} producto(s) / {m.get('unidades_total', 0)} unidad(es) / {m.get('chunk_total', 0)} chunk(s)")
+        if snap_notes:
+            extra += " Snapshot base usado: " + "; ".join(snap_notes) + "."
     return True, f"Restauración completa: {restored_lotes} lote(s), {restored_items} producto(s), {restored_scans} escaneo(s), {restored_incidencias} incidencia(s), {restored_reimpresiones} reimpresión(es), {restored_label_prints} evento(s) de etiquetas, {restored_avisos} aviso(s) operacional(es), {restored_picking} lista(s) picking.{extra}"
 
 
@@ -2431,6 +2564,25 @@ def get_operational_items(lote_id: int) -> pd.DataFrame:
     df = get_items(lote_id)
     df = apply_physical_quantity_adjustments_df(lote_id, df, item_col="id", qty_col="unidades")
     return apply_operational_exclusions_df(lote_id, df, item_col="id", qty_col="unidades")
+
+
+def get_lote_reference_items(lote_id: int) -> pd.DataFrame:
+    """Base de referencia del FULL/lote sin capeo físico.
+
+    Uso exclusivo para mostrar totales reales del lote en Escaneo/diagnóstico.
+    No debe usarse para validar si falta preparar producto ni para cierre.
+
+    Regla:
+    - Parte de items restaurados desde el último snapshot/lote_item.
+    - Aplica ajustes de cantidad como cantidad vigente del producto.
+    - No capea avisos confirmados contra acopiadas.
+    - No excluye retirados/bloqueados, porque el total del FULL debe quedar
+      trazable aunque el pendiente operativo sea menor.
+    """
+    df = get_items(lote_id)
+    if df is None or df.empty:
+        return df
+    return apply_quantity_adjustments_df(lote_id, df, item_col="id", qty_col="unidades")
 
 
 def get_label_reprint_items(lote_id: int) -> pd.DataFrame:
@@ -9935,17 +10087,30 @@ elif page == "Escaneo":
     else:
         lote_scan = get_lote(active_lote)
         lote_cerrado = clean_text(lote_scan.get("status", "ACTIVO")).upper() == "CERRADO"
+        # Escaneo necesita dos lecturas separadas:
+        # 1) referencia real del FULL restaurado, sin capeo físico por avisos;
+        # 2) pendiente operativo, que sí considera avisos confirmados y bloqueos.
+        items_ref = get_lote_reference_items(active_lote)
         items = get_operational_items(active_lote)
-        total = int(items["unidades"].sum()) if not items.empty else 0
-        done = int(items["acopiadas"].sum()) if not items.empty else 0
+        total_full = int(items_ref["unidades"].sum()) if items_ref is not None and not items_ref.empty else 0
+        done_full = int(items_ref["acopiadas"].sum()) if items_ref is not None and not items_ref.empty else 0
+        total_operativo = int(items["unidades"].sum()) if items is not None and not items.empty else 0
+        done_operativo = int(items["acopiadas"].sum()) if items is not None and not items.empty else 0
+        pendiente_operativo = 0
+        if items is not None and not items.empty:
+            pendiente_operativo = int((items["unidades"].astype(int) - items["acopiadas"].astype(int)).clip(lower=0).sum())
         excluidos_operativos = get_adjusted_out_items_count(active_lote)
-        st.progress(done / total if total else 0)
+        st.progress(min(done_operativo, total_operativo) / total_operativo if total_operativo else 0)
         a, b, c = st.columns(3)
-        a.metric("Solicitado", total)
-        b.metric("Acopiado", done)
-        c.metric("Pendiente operativo", max(total - done, 0))
-        if excluidos_operativos > 0:
-            st.caption(f"Objetivo operativo: {excluidos_operativos} producto(s) retirado(s), bloqueado(s) o ajustado(s) a 0 no suman como pendiente físico.")
+        a.metric("Solicitado FULL", total_full)
+        b.metric("Acopiado", done_full)
+        c.metric("Pendiente operativo", pendiente_operativo)
+        if total_operativo != total_full or excluidos_operativos > 0:
+            st.caption(
+                f"Objetivo físico vigente: {total_operativo}. "
+                f"Solicitado FULL conserva el total restaurado sin capear por avisos confirmados. "
+                f"{excluidos_operativos} producto(s) retirado(s), bloqueado(s) o ajustado(s) a 0 no suman como pendiente físico."
+            )
         st.divider()
 
         # Sesión de trazabilidad: se define una vez, no por cada escaneo.
