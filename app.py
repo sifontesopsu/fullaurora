@@ -649,6 +649,12 @@ def sheet_event_semantic_identity(ev: dict) -> str:
         clean_text(ev.get("scan_secundario", "")),
         clean_text(ev.get("tipo", "")) or clean_text(ev.get("tipo_aviso", "")),
         clean_text(ev.get("comentario", "")) or clean_text(ev.get("detail", "")),
+        # Los snapshots vienen en varios chunks con mismo timestamp/lote. Sin
+        # estos campos la deduplicación los colapsa y la restauración queda con
+        # un fragmento parcial o mezcla de snapshots.
+        clean_text(ev.get("snapshot_hash", "")),
+        clean_text(ev.get("chunk_index", "")),
+        clean_text(ev.get("chunk_total", "")),
     ])
 
 
@@ -1446,6 +1452,20 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
         items_by_lote[lid] = dict(snap_items)
         items_by_lote[lid].update(manual_items)
 
+    # Reconciliaciones oficiales PDF se aplican aun cuando el snapshot seleccionado
+    # sea anterior; son idempotentes y preservan la corrección en futuros rescates.
+    reconciliation_events_by_lote = {}
+    for ev in normalized_events:
+        if clean_text(ev.get("event_type", "")).lower() == PDF_RECONCILIATION_EVENT:
+            try:
+                lid = int(ev.get("lote_id"))
+            except Exception:
+                continue
+            reconciliation_events_by_lote.setdefault(lid, []).append(ev)
+    for lid, rec_events in reconciliation_events_by_lote.items():
+        if lid in items_by_lote:
+            apply_pdf_reconciliation_events_to_item_map(items_by_lote[lid], rec_events, lid, set(items_by_lote[lid].keys()))
+
     # Si existen items de un lote pero falta lote_creado, recuperamos el lote igual.
     # Esto soluciona respaldos donde el snapshot de productos llegó a Sheets, pero
     # el evento encabezado no quedó registrado o no fue exportado.
@@ -1512,24 +1532,9 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
         original_item_id = to_int(sr.get("original_item_id", 0))
         resolved_id = None
         status = "ACOPIO_RECUPERADO_SHEETS"
-        if original_item_id and original_item_id in lookups.get("id", {}):
-            resolved_id = original_item_id
-            status = "MATCH_ITEM_ID"
-        else:
-            candidates = []
-            for field in ["codigo_ml", "codigo_universal", "sku"]:
-                code = norm_code(sr.get(field, ""))
-                if code:
-                    ids = lookups.get(field, {}).get(code, set())
-                    if len(ids) == 1:
-                        candidates.append(next(iter(ids)))
-            unique_candidates = sorted(set(candidates))
-            if len(unique_candidates) == 1:
-                resolved_id = int(unique_candidates[0])
-                status = "MATCH_CODE_SAME_LOTE"
-            elif len(unique_candidates) > 1:
-                ambiguous_scan_count += 1
-                status = "AMBIGUOUS_SAME_LOTE"
+        resolved_id, status = resolve_restore_item_identity(items_by_lote.get(lid, {}), sr, original_item_id)
+        if status == "AMBIGUOUS_SAME_LOTE":
+            ambiguous_scan_count += 1
         if resolved_id is None:
             # Conservamos el id histórico para traza, pero el visor usará el snapshot guardado en scans.
             resolved_id = original_item_id or 0
@@ -1748,9 +1753,8 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                     list_id_db = int(cur.lastrowid)
                 c.execute("DELETE FROM picking_list_items WHERE picking_list_id=?", (list_id_db,))
                 for pit in plist.get("items", []):
-                    try:
-                        item_id = int(pit.get("item_id"))
-                    except Exception:
+                    item_id, _ = resolve_restore_item_identity(items_by_lote.get(int(plist["lote_id"]), {}), pit, to_int(pit.get("item_id", 0)))
+                    if not item_id:
                         continue
                     c.execute(
                         """
@@ -1767,6 +1771,16 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
                          to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")), plist["created_at"]),
                     )
                 restored_picking += 1
+
+        # Después de reconstruir scans y listas, ajusta solo excesos de cantidad
+        # contra el objetivo oficial restaurado/reconciliado.
+        for _lid in sorted(active_lote_ids):
+            _notes = reconcile_all_active_picking_quantities(c, int(_lid))
+            for _note in _notes:
+                c.execute(
+                    "INSERT INTO audit_events (lote_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+                    (int(_lid), "RECONCILIACION_PICKING_RESTAURACION", _note, now),
+                )
 
         # Restaura estado local de etiquetas desde eventos resumen zpl_etiquetas_generado.
         # No guarda producto por producto en Sheets, pero reconstruye label_prints/label_blocks
@@ -2334,6 +2348,433 @@ def get_lote(lote_id):
 
 
 
+
+# ============================================================
+# Integridad de lote: reconciliación contra PDF corregido ML
+# ============================================================
+PDF_RECONCILIATION_EVENT = "lote_pdf_reconciliado"
+
+
+def _item_identity_maps(items_map: dict[int, dict]) -> dict[str, dict[str, set[int]]]:
+    """Índices por código para restauración segura.
+
+    Los item_id locales pueden cambiar entre snapshots/restauraciones. Por eso
+    los códigos de negocio (ML/EAN/SKU) tienen prioridad sobre un item_id
+    histórico cuando ambos discrepan.
+    """
+    out = {"codigo_ml": {}, "codigo_universal": {}, "sku": {}}
+    for iid, it in (items_map or {}).items():
+        try:
+            iid_int = int(iid)
+        except Exception:
+            continue
+        for field in out:
+            code = norm_code((it or {}).get(field, ""))
+            if code and not (field == "codigo_universal" and code == "N/A"):
+                out[field].setdefault(code, set()).add(iid_int)
+    return out
+
+
+def resolve_restore_item_identity(items_map: dict[int, dict], raw: dict, original_item_id=None) -> tuple[int | None, str]:
+    """Resuelve un item del mismo lote dando prioridad a ML/EAN/SKU.
+
+    Esto evita que un item_id viejo de una lista picking apunte a otro producto
+    después de una restauración. Solo se cae al id histórico cuando no hay
+    códigos útiles para validar la identidad.
+    """
+    raw = raw or {}
+    maps = _item_identity_maps(items_map)
+    supplied = []
+    for field in ("codigo_ml", "codigo_universal", "sku"):
+        code = norm_code(raw.get(field, ""))
+        if code and not (field == "codigo_universal" and code == "N/A"):
+            supplied.append((field, code))
+
+    # Código ML es el identificador más fuerte dentro del FULL.
+    for field in ("codigo_ml", "sku", "codigo_universal"):
+        code = norm_code(raw.get(field, ""))
+        if not code or (field == "codigo_universal" and code == "N/A"):
+            continue
+        ids = maps.get(field, {}).get(code, set())
+        if len(ids) == 1:
+            return int(next(iter(ids))), "MATCH_CODE_SAME_LOTE"
+        if len(ids) > 1:
+            return None, "AMBIGUOUS_SAME_LOTE"
+
+    try:
+        iid = int(original_item_id if original_item_id is not None else raw.get("item_id", 0))
+    except Exception:
+        iid = 0
+    if iid and iid in (items_map or {}):
+        # Sin código verificable, conservar id histórico como último recurso.
+        if not supplied:
+            return iid, "MATCH_ITEM_ID"
+        # Hay códigos pero no encontraron otro candidato: no se inventa un match;
+        # el id queda como fallback trazable.
+        return iid, "MATCH_ITEM_ID_FALLBACK"
+    return None, "UNMATCHED_SAME_LOTE"
+
+
+def _new_reconciliation_item(raw: dict, lote_id: int, item_id: int) -> dict:
+    raw = raw or {}
+    now = clean_text(raw.get("created_at", "")) or now_cl().isoformat(timespec="seconds")
+    desc = clean_text(raw.get("descripcion_kame", "")) or clean_text(raw.get("descripcion", ""))
+    return {
+        "id": int(item_id), "lote_id": int(lote_id),
+        "area": clean_text(raw.get("area", "")), "nro": clean_text(raw.get("nro", "")),
+        "codigo_ml": norm_code(raw.get("codigo_ml", "")),
+        "codigo_universal": norm_code(raw.get("codigo_universal", "")),
+        "sku": norm_code(raw.get("sku", "")),
+        "descripcion": desc, "descripcion_kame": desc,
+        "descripcion_ml": clean_text(raw.get("descripcion_ml", "")) or desc,
+        "descripcion_fuente": clean_text(raw.get("descripcion_fuente", "")),
+        "familia_kame": clean_text(raw.get("familia_kame", "")),
+        "maestro_match_status": clean_text(raw.get("maestro_match_status", "")),
+        "origen_item": clean_text(raw.get("origen_item", "PDF_FULL")) or "PDF_FULL",
+        "motivo_anexo": clean_text(raw.get("motivo_anexo", "")),
+        "usuario_anexo": clean_text(raw.get("usuario_anexo", "")),
+        "fecha_anexo": clean_text(raw.get("fecha_anexo", "")),
+        "anexo_ml_confirmado": to_int(raw.get("anexo_ml_confirmado", 0)),
+        "anexo_ml_confirmado_at": clean_text(raw.get("anexo_ml_confirmado_at", "")),
+        "anexo_ml_confirmado_by": clean_text(raw.get("anexo_ml_confirmado_by", "")),
+        "anexo_ml_confirmado_comment": clean_text(raw.get("anexo_ml_confirmado_comment", "")),
+        "anexo_kame_confirmado": to_int(raw.get("anexo_kame_confirmado", 0)),
+        "anexo_kame_confirmado_at": clean_text(raw.get("anexo_kame_confirmado_at", "")),
+        "anexo_kame_confirmado_by": clean_text(raw.get("anexo_kame_confirmado_by", "")),
+        "anexo_kame_confirmado_comment": clean_text(raw.get("anexo_kame_confirmado_comment", "")),
+        "unidades": max(0, to_int(raw.get("unidades", raw.get("cantidad", 0)))),
+        "acopiadas": max(0, to_int(raw.get("acopiadas", 0))),
+        "identificacion": clean_text(raw.get("identificacion", "")),
+        "vence": clean_text(raw.get("vence", "")),
+        "instrucciones": clean_text(raw.get("instrucciones", "")),
+        "dia": clean_text(raw.get("dia", "")), "hora": clean_text(raw.get("hora", "")),
+        "created_at": now, "updated_at": now,
+        "fuente_rescate": "PDF_RECONCILIACION",
+        "rescue_note": "Reconciliado contra PDF corregido de Mercado Libre",
+    }
+
+
+def apply_pdf_reconciliation_events_to_item_map(items_map: dict[int, dict], reconciliation_events: list[dict], lote_id: int, used_ids: set[int] | None = None) -> int:
+    """Aplica eventos idempotentes de PDF corregido sobre un mapa de items.
+
+    Las acciones se guardan en Sheets. Por eso un reinicio/restauración no vuelve
+    a la versión antigua del FULL aunque existan snapshots históricos previos.
+    """
+    if not reconciliation_events:
+        return 0
+    used_ids = used_ids if used_ids is not None else set(items_map.keys())
+    applied = 0
+    for ev in reconciliation_events:
+        if clean_text(ev.get("event_type", "")).lower() != PDF_RECONCILIATION_EVENT:
+            continue
+        for ch in ev.get("changes", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            action = clean_text(ch.get("action", "")).upper()
+            raw = dict(ch.get("item") or ch)
+            original_id = to_int(ch.get("item_id", raw.get("item_id", 0)))
+            item_id, _ = resolve_restore_item_identity(items_map, raw, original_id)
+            if item_id is None:
+                requested = to_int(ch.get("item_id", 0))
+                if requested and requested not in items_map:
+                    item_id = requested
+                else:
+                    key = _product_key_from_values(raw.get("codigo_ml", ""), raw.get("codigo_universal", ""), raw.get("sku", ""), original_id)
+                    item_id = _stable_negative_id(f"PDFREC:{lote_id}:{key}", used_ids)
+                used_ids.add(int(item_id))
+                items_map[int(item_id)] = _new_reconciliation_item(raw, lote_id, int(item_id))
+            item = items_map[int(item_id)]
+            if action == "REMOVE":
+                item["unidades"] = 0
+                item["origen_item"] = "PDF_CORREGIDO_RETIRADO"
+                item["motivo_anexo"] = clean_text(ch.get("motivo", "Retirado por PDF corregido Mercado Libre"))
+                item["updated_at"] = clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds")
+                applied += 1
+                continue
+            if action in {"UPDATE", "ADD", "SET_QTY"}:
+                for field in ["area", "nro", "codigo_ml", "codigo_universal", "sku", "identificacion", "vence", "instrucciones", "dia", "hora"]:
+                    if field in raw and clean_text(raw.get(field, "")):
+                        item[field] = norm_code(raw[field]) if field in {"codigo_ml", "codigo_universal", "sku"} else clean_text(raw[field])
+                if clean_text(raw.get("descripcion", "")):
+                    item["descripcion"] = clean_text(raw.get("descripcion", ""))
+                    item["descripcion_kame"] = clean_text(raw.get("descripcion_kame", raw.get("descripcion", "")))
+                if clean_text(raw.get("descripcion_ml", "")):
+                    item["descripcion_ml"] = clean_text(raw.get("descripcion_ml", ""))
+                item["unidades"] = max(0, to_int(raw.get("unidades", ch.get("unidades_after", item.get("unidades", 0)))))
+                if action == "ADD":
+                    item["origen_item"] = "PDF_CORREGIDO_AGREGADO"
+                elif clean_text(item.get("origen_item", "")).upper() == "PDF_CORREGIDO_RETIRADO":
+                    item["origen_item"] = "PDF_FULL"
+                item["updated_at"] = clean_text(ev.get("created_at", "")) or now_cl().isoformat(timespec="seconds")
+                applied += 1
+    return applied
+
+
+def _load_raw_lote_items(lote_id: int) -> pd.DataFrame:
+    with db() as c:
+        return pd.read_sql_query(
+            "SELECT * FROM items WHERE lote_id=? ORDER BY area, CAST(nro AS INTEGER), id",
+            c, params=(int(lote_id),),
+        )
+
+
+def _match_pdf_row_to_local_item(pdf_row: dict, local_rows: list[dict]) -> dict | None:
+    ml = norm_code(pdf_row.get("codigo_ml", ""))
+    sku = norm_code(pdf_row.get("sku", ""))
+    candidates = []
+    for item in local_rows:
+        if clean_text(item.get("origen_item", "")).upper() == "ANEXO_MANUAL":
+            continue
+        ml_match = bool(ml and norm_code(item.get("codigo_ml", "")) == ml)
+        sku_match = bool(sku and norm_code(item.get("sku", "")) == sku)
+        if ml_match or sku_match:
+            candidates.append(item)
+    if not candidates:
+        return None
+    # Si ML y SKU apuntan al mismo registro, es match seguro. Si solo uno
+    # coincide y es único, también. En caso ambiguo no se corrige a ciegas.
+    exact = [x for x in candidates if (not ml or norm_code(x.get("codigo_ml", "")) == ml) and (not sku or norm_code(x.get("sku", "")) == sku)]
+    if len(exact) == 1:
+        return exact[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def build_pdf_reconciliation_plan(lote_id: int, uploaded_pdf) -> dict:
+    """Compara el lote local con un PDF oficial corregido sin modificar nada."""
+    pdf_df, totals = build_full_input_from_pdf(uploaded_pdf)
+    if pdf_df is None or pdf_df.empty:
+        return {"ok": False, "error": "No pude extraer productos válidos del PDF."}
+    expected_products = to_int(totals.get("expected_products", 0))
+    expected_units = to_int(totals.get("expected_units", 0))
+    parsed_products = int(len(pdf_df))
+    parsed_units = int(pd.to_numeric(pdf_df["unidades"], errors="coerce").fillna(0).sum())
+    if expected_products and parsed_products != expected_products:
+        return {"ok": False, "error": f"PDF inconsistente: declara {expected_products} productos, pero se extrajeron {parsed_products}."}
+    if expected_units and parsed_units != expected_units:
+        return {"ok": False, "error": f"PDF inconsistente: declara {expected_units} unidades, pero se extrajeron {parsed_units}."}
+
+    raw_df = _load_raw_lote_items(lote_id)
+    if raw_df.empty:
+        return {"ok": False, "error": "Primero restaura o carga el lote localmente para reconciliarlo."}
+    local_rows = [dict(r) for _, r in raw_df.iterrows()]
+    active_local = [r for r in local_rows if to_int(r.get("unidades", 0)) > 0 and clean_text(r.get("origen_item", "")).upper() != "ANEXO_MANUAL"]
+    matched_ids = set()
+    changes = []
+    conflicts = []
+
+    for _, pr in pdf_df.iterrows():
+        pdf_item = {k: pr.get(k, "") for k in pdf_df.columns}
+        pdf_item["unidades"] = to_int(pdf_item.get("unidades", 0))
+        local = _match_pdf_row_to_local_item(pdf_item, local_rows)
+        if local is None:
+            changes.append({"action": "ADD", "item_id": 0, "unidades_before": 0, "unidades_after": pdf_item["unidades"], "item": pdf_item, "motivo": "Producto presente en PDF corregido y ausente localmente"})
+            continue
+        iid = int(local["id"])
+        matched_ids.add(iid)
+        before = to_int(local.get("unidades", 0))
+        after = pdf_item["unidades"]
+        if before != after:
+            if to_int(local.get("acopiadas", 0)) > after:
+                conflicts.append(f"{norm_code(local.get('codigo_ml',''))}: PDF={after}, pero ya hay {to_int(local.get('acopiadas',0))} unidades acopiadas.")
+            changes.append({"action": "UPDATE", "item_id": iid, "unidades_before": before, "unidades_after": after, "item": pdf_item, "motivo": "Cantidad corregida por PDF oficial de Mercado Libre"})
+
+    for local in active_local:
+        iid = int(local["id"])
+        if iid in matched_ids:
+            continue
+        if to_int(local.get("acopiadas", 0)) > 0:
+            conflicts.append(f"{norm_code(local.get('codigo_ml',''))}: no aparece en PDF, pero tiene {to_int(local.get('acopiadas',0))} unidades acopiadas.")
+        changes.append({
+            "action": "REMOVE", "item_id": iid,
+            "unidades_before": to_int(local.get("unidades", 0)), "unidades_after": 0,
+            "item": {k: local.get(k, "") for k in ["area", "nro", "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_kame", "descripcion_ml", "identificacion", "vence", "instrucciones", "dia", "hora"]},
+            "motivo": "Producto ausente del PDF oficial corregido de Mercado Libre",
+        })
+
+    local_active_units = int(sum(to_int(x.get("unidades", 0)) for x in active_local))
+    pdf_hash = hashlib.sha256(uploaded_pdf.getvalue() if hasattr(uploaded_pdf, "getvalue") else uploaded_pdf.read()).hexdigest()
+    return {
+        "ok": not conflicts,
+        "error": " · ".join(conflicts) if conflicts else "",
+        "lote_id": int(lote_id),
+        "pdf_name": clean_text(getattr(uploaded_pdf, "name", "PDF corregido")),
+        "pdf_hash": pdf_hash,
+        "expected_products": expected_products or parsed_products,
+        "expected_units": expected_units or parsed_units,
+        "local_products": int(len(active_local)),
+        "local_units": local_active_units,
+        "changes": changes,
+        "conflicts": conflicts,
+    }
+
+
+def _rebalance_picking_item_quantities(c, lote_id: int, item_id: int, target_qty: int) -> tuple[bool, str]:
+    """Ajusta listas activas sin borrar validaciones históricas."""
+    rows = c.execute(
+        """
+        SELECT pli.id, pli.picking_list_id, pli.cantidad
+        FROM picking_list_items pli
+        JOIN picking_lists pl ON pl.id=pli.picking_list_id
+        WHERE pli.lote_id=? AND pli.item_id=? AND UPPER(COALESCE(pl.estado,'')) NOT IN ('ANULADA','COMPLETADA')
+        ORDER BY pli.id
+        """, (int(lote_id), int(item_id))
+    ).fetchall()
+    if not rows:
+        return True, ""
+    scan_by_list = {}
+    scans = c.execute(
+        "SELECT picking_list_id, COALESCE(SUM(cantidad),0) AS n FROM scans WHERE lote_id=? AND item_id=? GROUP BY picking_list_id",
+        (int(lote_id), int(item_id))
+    ).fetchall()
+    for r in scans:
+        scan_by_list[to_int(r["picking_list_id"])] = to_int(r["n"])
+    if sum(scan_by_list.get(to_int(r["picking_list_id"]), 0) for r in rows) > int(target_qty):
+        return False, "Las validaciones históricas superan la nueva cantidad del PDF. No se modificó la lista."
+
+    remaining = int(target_qty)
+    min_later = [0] * len(rows)
+    acc = 0
+    for idx in range(len(rows)-1, -1, -1):
+        min_later[idx] = acc
+        acc += scan_by_list.get(to_int(rows[idx]["picking_list_id"]), 0)
+    for idx, r in enumerate(rows):
+        floor = scan_by_list.get(to_int(r["picking_list_id"]), 0)
+        existing = max(to_int(r["cantidad"]), floor)
+        desired = max(floor, min(existing, max(floor, remaining - min_later[idx])))
+        c.execute("UPDATE picking_list_items SET cantidad=? WHERE id=?", (int(desired), int(r["id"])))
+        remaining -= int(desired)
+    # Si el PDF aumentó la cantidad, no se infla una lista ya emitida: la
+    # diferencia queda disponible para asignar en una lista complementaria.
+    return True, ""
+
+
+def reconcile_all_active_picking_quantities(c, lote_id: int) -> list[str]:
+    """Alinea listas activas con las cantidades oficiales ya restauradas.
+
+    No borra listas ni escaneos. Solo reduce cantidades de listas cuando superan
+    el objetivo oficial; si un PDF aumentó cantidad, la diferencia queda sin
+    asignar para una lista complementaria en vez de inflar una lista ya impresa.
+    """
+    notes = []
+    rows = c.execute(
+        "SELECT id, unidades FROM items WHERE lote_id=? ORDER BY id",
+        (int(lote_id),),
+    ).fetchall()
+    for row in rows:
+        ok, msg = _rebalance_picking_item_quantities(c, int(lote_id), int(row["id"]), max(0, to_int(row["unidades"])))
+        if not ok:
+            notes.append(clean_text(msg))
+    return [x for x in notes if x]
+
+
+def apply_pdf_reconciliation_plan(plan: dict, usuario: str, comentario: str) -> tuple[bool, str]:
+    """Aplica una reconciliación validada, auditable y restaurable desde Sheets."""
+    if not plan or not plan.get("ok"):
+        return False, clean_text((plan or {}).get("error", "Plan de reconciliación inválido."))
+    lote_id = int(plan.get("lote_id", 0))
+    if not lote_id:
+        return False, "Lote inválido."
+    if is_lote_closed(lote_id):
+        return False, "El lote está cerrado. Reábrelo antes de reconciliar contra un PDF corregido."
+    usuario = clean_text(usuario) or "SIN_USUARIO"
+    comentario = clean_text(comentario) or "Reconciliación contra PDF oficial corregido de Mercado Libre"
+    now = now_cl().isoformat(timespec="seconds")
+    applied_changes = []
+
+    with db() as c:
+        for ch in plan.get("changes", []):
+            action = clean_text(ch.get("action", "")).upper()
+            item_data = dict(ch.get("item") or {})
+            item_id = to_int(ch.get("item_id", 0))
+            if action == "ADD":
+                desc = clean_text(item_data.get("descripcion_kame", "")) or clean_text(item_data.get("descripcion", ""))
+                cur = c.execute(
+                    """
+                    INSERT INTO items
+                    (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+                     descripcion_fuente, familia_kame, maestro_match_status, origen_item, motivo_anexo, usuario_anexo, fecha_anexo,
+                     unidades, acopiadas, identificacion, vence, instrucciones, dia, hora, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PDF_CORREGIDO_AGREGADO', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (lote_id, clean_text(item_data.get("area", "")), clean_text(item_data.get("nro", "")), norm_code(item_data.get("codigo_ml", "")),
+                     norm_code(item_data.get("codigo_universal", "")), norm_code(item_data.get("sku", "")), desc, desc,
+                     clean_text(item_data.get("descripcion_ml", "")) or desc, clean_text(item_data.get("descripcion_fuente", "")),
+                     clean_text(item_data.get("familia_kame", "")), clean_text(item_data.get("maestro_match_status", "")),
+                     comentario, usuario, now, to_int(ch.get("unidades_after", item_data.get("unidades", 0))),
+                     clean_text(item_data.get("identificacion", "")), clean_text(item_data.get("vence", "")), clean_text(item_data.get("instrucciones", "")),
+                     clean_text(item_data.get("dia", "")), clean_text(item_data.get("hora", "")), now, now),
+                )
+                item_id = int(cur.lastrowid)
+                ch["item_id"] = item_id
+            else:
+                row = c.execute("SELECT * FROM items WHERE lote_id=? AND id=?", (lote_id, item_id)).fetchone()
+                if not row:
+                    c.rollback()
+                    return False, f"No encontré el item {item_id} durante la reconciliación."
+                if action == "REMOVE":
+                    if to_int(row["acopiadas"]) > 0:
+                        c.rollback()
+                        return False, f"No se puede retirar {norm_code(row['codigo_ml'])}: tiene acopio histórico."
+                    c.execute(
+                        "UPDATE items SET unidades=0, origen_item='PDF_CORREGIDO_RETIRADO', motivo_anexo=?, usuario_anexo=?, fecha_anexo=?, updated_at=? WHERE lote_id=? AND id=?",
+                        (clean_text(ch.get("motivo", "Retirado por PDF corregido")), usuario, now, now, lote_id, item_id),
+                    )
+                elif action in {"UPDATE", "SET_QTY"}:
+                    target = to_int(ch.get("unidades_after", item_data.get("unidades", 0)))
+                    if to_int(row["acopiadas"]) > target:
+                        c.rollback()
+                        return False, f"No se puede bajar {norm_code(row['codigo_ml'])} a {target}: tiene {to_int(row['acopiadas'])} acopiadas."
+                    desc = clean_text(item_data.get("descripcion_kame", "")) or clean_text(row["descripcion_kame"]) or clean_text(item_data.get("descripcion", ""))
+                    c.execute(
+                        """
+                        UPDATE items
+                        SET codigo_ml=?, codigo_universal=?, sku=?, descripcion=?, descripcion_kame=?, descripcion_ml=?,
+                            origen_item=CASE WHEN UPPER(COALESCE(origen_item,''))='PDF_CORREGIDO_RETIRADO' THEN 'PDF_FULL' ELSE origen_item END,
+                            unidades=?, identificacion=?, vence=?, instrucciones=?, updated_at=?
+                        WHERE lote_id=? AND id=?
+                        """,
+                        (norm_code(item_data.get("codigo_ml", row["codigo_ml"])), norm_code(item_data.get("codigo_universal", row["codigo_universal"])),
+                         norm_code(item_data.get("sku", row["sku"])), desc, desc,
+                         clean_text(item_data.get("descripcion_ml", "")) or clean_text(row["descripcion_ml"]), target,
+                         clean_text(item_data.get("identificacion", row["identificacion"])), clean_text(item_data.get("vence", row["vence"])),
+                         clean_text(item_data.get("instrucciones", row["instrucciones"])), now, lote_id, item_id),
+                    )
+                else:
+                    continue
+            ok_pick, msg_pick = _rebalance_picking_item_quantities(c, lote_id, item_id, to_int(ch.get("unidades_after", item_data.get("unidades", 0))))
+            if not ok_pick:
+                c.rollback()
+                return False, msg_pick
+            applied_changes.append(ch)
+        c.commit()
+
+    payload = {
+        **build_lote_payload(lote_id),
+        "created_at": now,
+        "usuario": usuario,
+        "archivo_pdf": clean_text(plan.get("pdf_name", "PDF corregido")),
+        "pdf_hash": clean_text(plan.get("pdf_hash", "")),
+        "productos_pdf": to_int(plan.get("expected_products", 0)),
+        "unidades_pdf": to_int(plan.get("expected_units", 0)),
+        "comentario": comentario,
+        "changes": applied_changes,
+        "tipo": "RECONCILIACION_PDF_CORREGIDO",
+    }
+    enqueue_backup_event(PDF_RECONCILIATION_EVENT, payload)
+    for ch in applied_changes:
+        it = ch.get("item") or {}
+        log_audit_event(lote_id, to_int(ch.get("item_id", 0)) or None, "RECONCILIACION_PDF_CORREGIDO", clean_text(ch.get("motivo", comentario)), to_int(ch.get("unidades_after", 0)), norm_code(it.get("codigo_ml", "")), norm_code(it.get("sku", "")), usuario)
+    queue_lote_snapshot_from_sqlite(lote_id, motivo="RECONCILIACION_PDF_CORREGIDO", usuario=usuario, force=True)
+    return True, f"Reconciliación aplicada: {len(applied_changes)} cambio(s). Se encoló evento y snapshot para que futuros rescates recuperen el PDF corregido."
+
+
+def get_pdf_reconciled_removed_count(lote_id: int) -> int:
+    with db() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM items WHERE lote_id=? AND UPPER(COALESCE(origen_item,''))='PDF_CORREGIDO_RETIRADO'", (int(lote_id),)).fetchone()
+    return to_int(row["n"] if row else 0)
+
 def get_latest_quantity_adjustments(lote_id: int) -> dict[int, int]:
     """Cantidad objetivo vigente por producto para inventario/listas/etiquetas.
 
@@ -2385,69 +2826,30 @@ def get_latest_label_quantity_adjustments(lote_id: int) -> dict[int, int]:
 
 
 def get_latest_physical_quantity_adjustments(lote_id: int) -> dict[int, int]:
-    """Cantidad objetivo física para Supervisor/Cierre/Escaneo.
+    """Compatibilidad histórica: la meta física usa la cantidad vigente del lote.
 
-    Regla de producción elegida:
-    - Ajuste de cantidad SIN confirmación completa ML+Kame: la cantidad nueva es
-      la meta física, por lo que puede generar pendiente.
-    - Ajuste de cantidad CON ML+Kame confirmado: la diferencia administrativa ya
-      no cuenta como faltante físico. Si cantidad_nueva es mayor que acopiadas,
-      se capea a acopiadas para no mostrar pendiente falso.
-    - Si cantidad_nueva es menor o igual a acopiadas, se mantiene cantidad_nueva;
-      eso evita mostrar pendiente, y cualquier exceso queda como historia real.
+    Un aviso confirmado acredita gestión administrativa, pero no puede convertir
+    una cantidad de producto en cero ni restarla por segunda vez. La cantidad
+    oficial vive en items/snapshot o en una reconciliación PDF explícita.
     """
-    try:
-        lid = int(lote_id)
-    except Exception:
-        return {}
-    with db() as c:
-        rows = c.execute(
-            """
-            SELECT av.item_id,
-                   av.cantidad_nueva,
-                   av.confirmado_ml,
-                   av.confirmado_inventario,
-                   i.acopiadas
-            FROM avisos_operacionales av
-            LEFT JOIN items i ON i.id=av.item_id AND i.lote_id=av.lote_id
-            WHERE av.lote_id=?
-              AND COALESCE(av.cantidad_nueva,'') <> ''
-              AND LOWER(COALESCE(av.tipo_aviso,'')) LIKE '%ajuste%'
-            ORDER BY av.id ASC
-            """,
-            (lid,),
-        ).fetchall()
-    out = {}
-    for r in rows:
-        try:
-            iid = int(r["item_id"] or 0)
-            qty_new = int(float(str(r["cantidad_nueva"]).replace(',', '.')))
-            acopiadas = int(r["acopiadas"] or 0)
-            confirmed = int(r["confirmado_ml"] or 0) == 1 and int(r["confirmado_inventario"] or 0) == 1
-        except Exception:
-            continue
-        if not iid or qty_new < 0:
-            continue
-        effective_qty = int(qty_new)
-        if confirmed and effective_qty > acopiadas:
-            effective_qty = max(acopiadas, 0)
-        out[iid] = int(effective_qty)
-    return out
-
+    return get_latest_quantity_adjustments(lote_id)
 
 def get_effective_item_units(lote_id: int, item_id: int, default_units: int | None = None) -> int | None:
-    """Cantidad física vigente para escaneo/picking pendiente.
+    """Cantidad oficial actual del item para validar escaneo/lista.
 
-    Mantiene el nombre histórico de la función, pero su semántica queda limitada
-    al flujo físico. Etiquetas no debe usar esta función.
+    No descuenta avisos por una segunda vía. El valor de items ya representa el
+    objetivo vigente y una reconciliación PDF puede llevarlo a 0 de forma segura.
     """
-    adjustments = get_latest_physical_quantity_adjustments(lote_id)
     try:
-        iid = int(item_id)
+        with db() as c:
+            row = c.execute("SELECT unidades, origen_item FROM items WHERE lote_id=? AND id=?", (int(lote_id), int(item_id))).fetchone()
+        if row:
+            if clean_text(row["origen_item"]).upper() == "PDF_CORREGIDO_RETIRADO":
+                return 0
+            return max(0, to_int(row["unidades"]))
     except Exception:
-        return default_units
-    return adjustments.get(iid, default_units)
-
+        pass
+    return default_units
 
 def apply_quantity_adjustments_df(lote_id: int, df: pd.DataFrame, item_col: str = 'id', qty_col: str = 'unidades') -> pd.DataFrame:
     """Aplica cantidad vigente de avisos de ajuste, sin capeo físico.
@@ -2463,6 +2865,8 @@ def apply_quantity_adjustments_df(lote_id: int, df: pd.DataFrame, item_col: str 
     out = df.copy()
     def _apply(row):
         try:
+            if clean_text(row.get("origen_item", "")).upper() == "PDF_CORREGIDO_RETIRADO":
+                return 0
             iid = int(row[item_col])
             if iid in adjustments:
                 return int(adjustments[iid])
@@ -2556,13 +2960,13 @@ def apply_operational_exclusions_df(lote_id: int, df: pd.DataFrame, item_col: st
 
 
 def get_operational_items(lote_id: int) -> pd.DataFrame:
-    """Base única para operación física: escaneo, picking, supervisor y cierre.
+    """Base física del lote para escaneo, picking, Supervisor y cierre.
 
-    Parte de get_items() para respetar la cantidad vigente del producto y luego
-    aplica la regla física de avisos confirmados ML+Kame.
+    Se opera contra la cantidad oficial vigente del lote. Los avisos dejan
+    trazabilidad y bloquean cuando corresponde, pero no reducen otra vez el
+    total si Mercado Libre/PDF ya incorporó el ajuste.
     """
     df = get_items(lote_id)
-    df = apply_physical_quantity_adjustments_df(lote_id, df, item_col="id", qty_col="unidades")
     return apply_operational_exclusions_df(lote_id, df, item_col="id", qty_col="unidades")
 
 
@@ -2747,6 +3151,8 @@ def snapshot_items_from_sqlite(lote_id: int) -> list[dict]:
     if df_items.empty:
         return out
     for r in df_items.itertuples(index=False):
+        if int(getattr(r, "unidades", 0) or 0) <= 0 or clean_text(getattr(r, "origen_item", "")).upper() == "PDF_CORREGIDO_RETIRADO":
+            continue
         out.append({
             "item_id": int(r.id),
             "area": clean_text(getattr(r, "area", "")),
@@ -7841,6 +8247,56 @@ def render_rescate_sheets():
         st.dataframe(diag_df, use_container_width=True, hide_index=True, height=360)
 
     st.divider()
+    with st.expander("Reconciliar lote contra PDF corregido de Mercado Libre", expanded=False):
+        st.warning("Usa esto solo cuando Mercado Libre entregue un PDF corregido. No borra escaneos, listas ni auditoría: compara, muestra diferencias y exige confirmación antes de aplicar.")
+        if int(selected_lote_id) not in local_lote_ids():
+            st.info("Primero restaura este lote localmente con el botón de abajo. Después vuelve aquí para reconciliarlo contra el PDF corregido.")
+        else:
+            pdf_corr = st.file_uploader("PDF corregido de Mercado Libre", type=["pdf"], key=f"pdf_reconcile_{selected_lote_id}")
+            usuario_corr = st.selectbox("Usuario que autoriza la reconciliación", SCAN_OPERATORS + ["ADMIN"], key=f"pdf_reconcile_user_{selected_lote_id}")
+            comentario_corr = st.text_input("Motivo / respaldo", value="PDF corregido por Mercado Libre", key=f"pdf_reconcile_note_{selected_lote_id}")
+            if pdf_corr is not None:
+                try:
+                    plan = build_pdf_reconciliation_plan(int(selected_lote_id), pdf_corr)
+                except Exception as e:
+                    plan = {"ok": False, "error": f"No pude comparar el PDF: {e}"}
+                if not plan.get("ok"):
+                    st.error(clean_text(plan.get("error", "No se pudo construir el plan de reconciliación.")))
+                else:
+                    q1, q2, q3, q4 = st.columns(4)
+                    q1.metric("Local actual", f"{plan.get('local_products',0)} productos / {plan.get('local_units',0)} unid.")
+                    q2.metric("PDF corregido", f"{plan.get('expected_products',0)} productos / {plan.get('expected_units',0)} unid.")
+                    q3.metric("Cambios", len(plan.get("changes", [])))
+                    q4.metric("Diferencia", int(plan.get("expected_units",0)) - int(plan.get("local_units",0)))
+                    diff_rows = []
+                    for ch in plan.get("changes", []):
+                        it = ch.get("item") or {}
+                        diff_rows.append({
+                            "Acción": clean_text(ch.get("action", "")),
+                            "Código ML": norm_code(it.get("codigo_ml", "")),
+                            "SKU": norm_code(it.get("sku", "")),
+                            "Producto": clean_text(it.get("descripcion_ml", "")) or clean_text(it.get("descripcion", "")),
+                            "Antes": to_int(ch.get("unidades_before", 0)),
+                            "Después": to_int(ch.get("unidades_after", 0)),
+                            "Motivo": clean_text(ch.get("motivo", "")),
+                        })
+                    if diff_rows:
+                        st.dataframe(pd.DataFrame(diff_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.success("El lote ya coincide con este PDF; no hay cambios que aplicar.")
+                    confirm_pdf = st.checkbox(
+                        f"Confirmo aplicar esta reconciliación documental al lote {selected_lote_id}. El PDF declara {plan.get('expected_products')} productos y {plan.get('expected_units')} unidades.",
+                        key=f"pdf_reconcile_confirm_{selected_lote_id}",
+                    )
+                    if st.button("Aplicar reconciliación PDF", type="primary", disabled=(not confirm_pdf or not diff_rows), key=f"pdf_reconcile_apply_{selected_lote_id}"):
+                        ok_apply, msg_apply = apply_pdf_reconciliation_plan(plan, usuario_corr, comentario_corr)
+                        if ok_apply:
+                            st.success(msg_apply)
+                            st.info("El respaldo quedó en cola. Espera que sincronice Sheets antes de usar Rescate de nuevo; el próximo snapshot debe reflejar exactamente el PDF corregido.")
+                            st.rerun()
+                        else:
+                            st.error(msg_apply)
+
     if items_df.empty:
         st.error("No se puede restaurar: falta snapshot de productos lote_item/lote_snapshot_chunk en Sheets.")
         return
@@ -7943,6 +8399,33 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             continue
         lote_events.append(_ev)
     lote_events.sort(key=_event_key)
+
+    # Elegir un único snapshot completo y más reciente. Nunca se mezclan
+    # snapshots históricos porque cada uno representa una fotografía total del lote.
+    snapshot_groups = {}
+    for idx, ev in enumerate(lote_events):
+        if clean_text(ev.get("event_type", "")) != "lote_snapshot_chunk":
+            continue
+        total_chunks = max(1, to_int(ev.get("chunk_total", 0)) or 1)
+        chunk_index = to_int(ev.get("chunk_index", 0)) or 1
+        snap_hash = clean_text(ev.get("snapshot_hash", "")) or ("SNAP:" + "|".join([
+            clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")),
+            clean_text(ev.get("productos_total", "")), clean_text(ev.get("unidades_total", "")), str(total_chunks),
+        ]))
+        g = snapshot_groups.setdefault(snap_hash, {"chunks": {}, "total": total_chunks, "order": idx, "ts": sheet_event_timestamp(ev)})
+        g["total"] = max(int(g["total"]), total_chunks)
+        g["chunks"][chunk_index] = ev
+        g["order"] = max(int(g["order"]), idx)
+        g["ts"] = max(clean_text(g.get("ts", "")), clean_text(sheet_event_timestamp(ev)))
+    valid_snapshots = []
+    for h, g in snapshot_groups.items():
+        if len(g.get("chunks", {})) >= int(g.get("total", 1)):
+            valid_snapshots.append((clean_text(g.get("ts", "")), int(g.get("order", 0)), h, g))
+    selected_snapshot_hash = ""
+    selected_snapshot_events = set()
+    if valid_snapshots:
+        _, _, selected_snapshot_hash, selected_group = max(valid_snapshots, key=lambda x: (x[0], x[1]))
+        selected_snapshot_events = {sheet_event_semantic_identity(ev) for ev in selected_group.get("chunks", {}).values()}
 
     meta = {
         "id": target,
@@ -8085,8 +8568,12 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
         if et == "lote_creado":
             meta["status"] = clean_text(ev.get("status", meta["status"])) or meta["status"]
         elif et == "lote_item":
-            add_or_update_item({**ev, "unidades": ev.get("unidades", ev.get("cantidad", 0))}, "LOTE_ITEM", "snapshot primario desde lote_item")
+            # lote_item es respaldo legado: solo se usa si no existe snapshot chunk completo.
+            if not selected_snapshot_hash:
+                add_or_update_item({**ev, "unidades": ev.get("unidades", ev.get("cantidad", 0))}, "LOTE_ITEM", "snapshot primario desde lote_item")
         elif et == "lote_snapshot_chunk":
+            if selected_snapshot_hash and sheet_event_semantic_identity(ev) not in selected_snapshot_events:
+                continue
             for it in ev.get("items") or []:
                 if isinstance(it, dict):
                     add_or_update_item({**it, "created_at": ev.get("created_at", "")}, "LOTE_ITEM", "snapshot primario desde lote_snapshot_chunk")
@@ -8104,6 +8591,22 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
             meta["close_note"] = ""
         elif et == "lote_eliminado":
             meta["status"] = "ELIMINADO"
+
+    # Aplicar reconciliaciones oficiales de PDF después del snapshot base y antes de
+    # reconstruir picking/scans. Así un reboot conserva la corrección de ML.
+    reconciliation_events = [ev for ev in lote_events if clean_text(ev.get("event_type", "")).lower() == PDF_RECONCILIATION_EVENT]
+    reconciliation_count = apply_pdf_reconciliation_events_to_item_map(items_by_id, reconciliation_events, target, used_ids)
+    if reconciliation_count:
+        key_to_id.clear()
+        for iid, it in items_by_id.items():
+            for key in [
+                _product_key_from_values(it.get("codigo_ml", ""), "", "", ""),
+                _product_key_from_values("", it.get("codigo_universal", ""), "", ""),
+                _product_key_from_values("", "", it.get("sku", ""), ""),
+            ]:
+                if key:
+                    key_to_id[key] = int(iid)
+        warnings.append(f"Se aplicaron {reconciliation_count} cambio(s) de PDF corregido.")
 
     # 2) Picking con estado final por código/lista. Anulación es terminal.
     picking_lists = {}
@@ -8212,25 +8715,9 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
         original_id = to_int(ev.get("item_id", 0))
         resolved_id = None
         status = "ACOPIO_RECUPERADO_SHEETS"
-        if original_id and original_id in items_by_id:
-            resolved_id = original_id
-            status = "MATCH_ITEM_ID"
-        else:
-            candidates = []
-            for key in [
-                _product_key_from_values(ev.get("codigo_ml", ""), "", "", ""),
-                _product_key_from_values("", ev.get("codigo_universal", ""), "", ""),
-                _product_key_from_values("", "", ev.get("sku", ""), ""),
-            ]:
-                if key and key in key_to_id:
-                    candidates.append(key_to_id[key])
-            uniq = sorted(set(candidates))
-            if len(uniq) == 1:
-                resolved_id = uniq[0]
-                status = "MATCH_CODE_SAME_LOTE"
-            elif len(uniq) > 1:
-                ambiguous_scans += 1
-                status = "AMBIGUOUS_SAME_LOTE"
+        resolved_id, status = resolve_restore_item_identity(items_by_id, ev, original_id)
+        if status == "AMBIGUOUS_SAME_LOTE":
+            ambiguous_scans += 1
         if resolved_id is None:
             before_count = len(items_by_id)
             resolved_id = add_or_update_item({**ev, "unidades": max(qty, 0)}, "SCAN_FALLBACK", "producto reconstruido desde scan sin snapshot") or original_id or 0
@@ -8279,17 +8766,8 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
     postventa_cierres = []
 
     def resolve_event_item(ev: dict):
-        original_id = to_int(ev.get("item_id", 0))
-        if original_id and original_id in items_by_id:
-            return original_id
-        for key in [
-            _product_key_from_values(ev.get("codigo_ml", ""), "", "", ""),
-            _product_key_from_values("", ev.get("codigo_universal", ""), "", ""),
-            _product_key_from_values("", "", ev.get("sku", ""), ""),
-        ]:
-            if key and key in key_to_id:
-                return key_to_id[key]
-        return None
+        resolved, _ = resolve_restore_item_identity(items_by_id, ev, to_int(ev.get("item_id", 0)))
+        return resolved
 
     for ev in lote_events:
         et = clean_text(ev.get("event_type", ""))
@@ -8532,6 +9010,8 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int) -> dict:
         "unmatched_scans": unmatched_scans,
         "ambiguous_scans": ambiguous_scans,
         "warnings": warnings,
+        "snapshot_hash": selected_snapshot_hash,
+        "pdf_reconciliation_changes": reconciliation_count,
     }
     return {
         "meta": meta,
@@ -8901,6 +9381,12 @@ def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, repla
                     clean_text(sr.get("descripcion", "")), clean_text(sr.get("descripcion_kame", sr.get("descripcion", ""))), clean_text(sr.get("descripcion_ml", sr.get("descripcion", ""))),
                     clean_text(sr.get("familia_kame", "")), clean_text(sr.get("maestro_match_status", "")), clean_text(sr.get("restore_match_status", "")),
                 ),
+            )
+        _notes = reconcile_all_active_picking_quantities(c, int(lote_id))
+        for _note in _notes:
+            c.execute(
+                "INSERT INTO audit_events (lote_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+                (int(lote_id), "RECONCILIACION_PICKING_RESTAURACION", _note, now_cl().isoformat(timespec="seconds")),
             )
         for inc in state.get("incidencias", []):
             c.execute(
@@ -10107,9 +10593,9 @@ elif page == "Escaneo":
         c.metric("Pendiente operativo", pendiente_operativo)
         if total_operativo != total_full or excluidos_operativos > 0:
             st.caption(
-                f"Objetivo físico vigente: {total_operativo}. "
-                f"Solicitado FULL conserva el total restaurado sin capear por avisos confirmados. "
-                f"{excluidos_operativos} producto(s) retirado(s), bloqueado(s) o ajustado(s) a 0 no suman como pendiente físico."
+                f"Objetivo operativo: {total_operativo}. "
+                f"Solicitado FULL conserva el total oficial restaurado. "
+                f"{excluidos_operativos} producto(s) retirado(s), bloqueado(s) o corregido(s) a 0 no suman como pendiente."
             )
         st.divider()
 
