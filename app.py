@@ -6060,6 +6060,9 @@ def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo:
         return False, "Debes ingresar un motivo claro de reimpresión."
 
     now = now_cl().isoformat(timespec="seconds")
+    # Esta ruta no es la habitual, pero debe obedecer la misma regla que el resto
+    # del módulo: la etiqueta y su trazabilidad usan el título de Mercado Libre.
+    desc_label = descripcion_etiqueta_value(item)
     with db() as c:
         c.execute(
             """
@@ -6071,9 +6074,9 @@ def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo:
         )
         rows = [
             (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), int(qty), "INDIVIDUAL", "NORMAL", None, None, 1, now),
+             desc_label, int(qty), "INDIVIDUAL", "NORMAL", None, None, 1, now),
             (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, 1, now),
+             desc_label, LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, 1, now),
         ]
         c.executemany(
             """
@@ -6091,7 +6094,8 @@ def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo:
         "codigo_ml": norm_code(item.get("codigo_ml", "")),
         "codigo_universal": norm_code(item.get("codigo_universal", "")),
         "sku": norm_code(item.get("sku", "")),
-        "descripcion": clean_text(item.get("descripcion", "")),
+        "descripcion": desc_label,
+        "descripcion_ml": desc_label,
         "block_index": "",
         "block_key": "",
         "scope": "PRODUCTO",
@@ -6187,8 +6191,13 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
     # Esas confirmaciones se controlan después desde Supervisor y bloquean solo la resolución/cierre del aviso.
     if len(mensaje_operador) < 4:
         return False, "Ingresa un mensaje claro para el operador."
+
+    # El comentario interno complementa la trazabilidad, pero no puede impedir
+    # un aviso operacional urgente. Si se deja vacío, se conserva el mismo
+    # mensaje visible como respaldo interno. Así toda creación válida queda
+    # registrada y se evita que el usuario crea que guardó un aviso inexistente.
     if len(comentario_interno) < 4:
-        return False, "Ingresa comentario interno para trazabilidad."
+        comentario_interno = mensaje_operador
 
     with db() as c:
         row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
@@ -6223,6 +6232,16 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
             ),
         )
         aviso_id = int(cur.lastrowid)
+        # Verificación local antes de confirmar la transacción. No se informa
+        # éxito si SQLite no puede leer inmediatamente el aviso recién creado.
+        saved = c.execute(
+            "SELECT id, lote_id, item_id, estado FROM avisos_operacionales WHERE id=?",
+            (aviso_id,),
+        ).fetchone()
+        if not saved or int(saved["lote_id"]) != int(lote_id) or int(saved["item_id"]) != int(item_id) or clean_text(saved["estado"]) != "ACTIVO":
+            c.rollback()
+            return False, "No pude verificar el aviso en la base local. No se registró como creado."
+
         if tipo_aviso.lower().startswith("ajuste") and cantidad_nueva_int is not None and cantidad_nueva_int >= 0:
             # La cantidad objetivo cambia la meta operacional del lote de inmediato.
             # Las confirmaciones ML/Kame pueden quedar pendientes, pero el PDA y
@@ -6270,7 +6289,7 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
         "modo": "AVISO_OPERACIONAL",
     })
     log_audit_event(lote_id, int(item_id), "AVISO_OPERACIONAL_CREADO", f"{tipo_aviso} · {mensaje_operador}", cantidad_nueva_int, item.get("codigo_ml", ""), item.get("sku", ""), created_by)
-    return True, "Aviso operacional creado."
+    return True, f"Aviso operacional #{aviso_id} creado y verificado localmente."
 
 
 def resolve_aviso_operacional(aviso_id: int, resolved_by: str, resolution_comment: str):
@@ -11237,7 +11256,8 @@ elif page == "Supervisor":
                         with cc3:
                             visible_op = st.checkbox("Visible para operador", value=True, key="aviso_visible")
                         created_by = st.text_input("Creado por", key="aviso_created_by", placeholder="Ej: administrador / supervisor")
-                        comentario_interno = st.text_area("Comentario interno / respaldo administrativo", key="aviso_comentario_interno", placeholder="Indica quién autorizó, qué se ajustó en ML/inventario y por qué.")
+                        comentario_interno = st.text_area("Comentario interno / respaldo administrativo (opcional)", key="aviso_comentario_interno", placeholder="Opcional. Si lo dejas vacío, se guardará el mismo mensaje visible para el operador.")
+                        st.caption("El aviso se guarda aunque el comentario interno quede vacío; la aplicación usa el mensaje operativo como respaldo para no bloquear una alerta urgente.")
                         if st.button("Guardar aviso operacional", type="primary", key="aviso_guardar"):
                             ok_av, msg_av = create_aviso_operacional(
                                 active_lote,
