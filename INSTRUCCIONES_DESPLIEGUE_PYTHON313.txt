@@ -1,0 +1,14 @@
+FULL AURORA - DESPLIEGUE ESTABLE
+
+1. Reemplaza el contenido del repositorio con los archivos de este paquete.
+2. Confirma que app.py esté en la raíz.
+3. En Streamlit Community Cloud elimina solo la implementación actual.
+4. Vuelve a desplegar el mismo repositorio y rama.
+5. En Advanced settings selecciona Python 3.13.
+6. Restaura los Secrets si la app usa alguno.
+7. Revisa que el log diga Python 3.13 y no Python 3.14.
+
+IMPORTANTE:
+- El ZIP original tenía app.py, requirements.txt, config.toml y devcontainer.json con contenidos cruzados/corruptos.
+- Se recuperó la aplicación real desde app.py.bak.
+- No se modificó la lógica operativa; solo entorno, diagnóstico y conexión SQLite.

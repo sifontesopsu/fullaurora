@@ -1,15 +1,5 @@
-__pycache__/
-*.pyc
-.env
-
-# Base de datos local
-*.db
-*.sqlite
-*.sqlite3
-
-# Archivos temporales Excel
-~$*.xlsx
-
-# Datos operativos reales
-data/*
-!data/.gitkeep
+streamlit==1.58.0
+pandas==2.3.3
+numpy==2.3.5
+openpyxl==3.1.5
+pyarrow==22.0.0
