@@ -8833,156 +8833,11 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "sku": norm_code(pit.get("sku", "")),
                 "descripcion": clean_text(pit.get("descripcion", "")),
                 "cantidad": to_int(pit.get("cantidad", 0)),
-                # Campos internos del plan de rescate. No se insertan en SQLite;
-                # permiten reconstruir la cantidad histórica de etiquetas sin
-                # confundirla con la meta operacional vigente.
-                "_cantidad_creacion": to_int(pit.get("cantidad", 0)),
-                "_cantidad_historial": [],
                 "area": clean_text(pit.get("area", "")),
                 "nro": clean_text(pit.get("nro", "")),
                 "estado": "PENDIENTE",
                 "created_at": clean_text(pl.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
-
-    # 3.5) Reproducir ajustes de cantidad de avisos operacionales en el mismo
-    # orden temporal que tuvo la operación real. Esta lógica corre solo durante
-    # el rescate desde Sheets; no modifica el flujo normal de escaneo.
-    #
-    # En vivo, un aviso cuyo tipo comienza por "Ajuste" cambia de inmediato:
-    #   1) items.unidades; y
-    #   2) las listas picking que, en ese momento, aún no estaban completadas
-    #      ni anuladas.
-    #
-    # El snapshot histórico puede conservar la cantidad anterior. Sin esta
-    # reproducción, un scan de 40 contra una meta antigua de 36 termina como
-    # min(36, 40)=36 y genera un pendiente falso.
-    quantity_notice_events = []
-    notice_quantity_adjustments_applied = 0
-    notice_quantity_adjustments_skipped_by_reconciliation = 0
-
-    # Una reconciliación PDF posterior sobre el mismo producto debe prevalecer
-    # sobre avisos anteriores. Guardamos la posición temporal del último cambio
-    # de PDF que afectó a cada item.
-    last_reconciliation_order_by_item = {}
-    for event_order, ev in enumerate(lote_events):
-        if clean_text(ev.get("event_type", "")).lower() != PDF_RECONCILIATION_EVENT:
-            continue
-        for ch in ev.get("changes", []) or []:
-            if not isinstance(ch, dict):
-                continue
-            action = clean_text(ch.get("action", "")).upper()
-            if action not in {"REMOVE", "UPDATE", "ADD", "SET_QTY"}:
-                continue
-            raw = dict(ch.get("item") or ch)
-            original_id = to_int(ch.get("item_id", raw.get("item_id", 0)))
-            resolved_id, _ = resolve_restore_item_identity(items_by_id, raw, original_id)
-            if resolved_id is not None and int(resolved_id) in items_by_id:
-                last_reconciliation_order_by_item[int(resolved_id)] = int(event_order)
-
-    # Línea de tiempo de cada lista. Se usa el estado que tenía la lista cuando
-    # ocurrió el aviso, no solo su estado final. Así una lista completada DESPUÉS
-    # del ajuste conserva la cantidad ajustada, igual que en SQLite en vivo.
-    picking_timeline = {}
-    for event_order, ev in enumerate(lote_events):
-        et = clean_text(ev.get("event_type", ""))
-        code = (
-            clean_text(ev.get("picking_code", ""))
-            or clean_text(ev.get("codigo_lista", ""))
-            or clean_text(ev.get("picking_list_id", ""))
-        )
-        if not code:
-            continue
-        tl = picking_timeline.setdefault(code, {
-            "created_order": None,
-            "completed_order": None,
-            "anulled_order": None,
-        })
-        if et in {"picking_lista_creada", "PICKING_LISTA_CREADA"}:
-            if tl["created_order"] is None:
-                tl["created_order"] = int(event_order)
-        elif et in {"picking_lista_completada", "PICKING_LISTA_COMPLETADA"}:
-            if tl["completed_order"] is None:
-                tl["completed_order"] = int(event_order)
-        elif et in {"picking_lista_anulada", "PICKING_LISTA_ANULADA"}:
-            if tl["anulled_order"] is None:
-                tl["anulled_order"] = int(event_order)
-
-    picking_code_by_id = {
-        to_int(pl.get("id", 0)): code
-        for code, pl in picking_lists.items()
-        if to_int(pl.get("id", 0))
-    }
-
-    for event_order, ev in enumerate(lote_events):
-        et = clean_text(ev.get("event_type", ""))
-        if et not in {"aviso_operacional_creado", "AVISO_OPERACIONAL_CREADO"}:
-            continue
-
-        # Debe coincidir exactamente con la regla usada al crear el aviso en vivo.
-        tipo_aviso = clean_text(ev.get("tipo_aviso", ev.get("tipo", ""))).lower()
-        if not tipo_aviso.startswith("ajuste"):
-            continue
-        if clean_text(ev.get("cantidad_nueva", "")) == "":
-            continue
-
-        nueva_cantidad = max(0, to_int(ev.get("cantidad_nueva", 0)))
-        resolved_id, _ = resolve_restore_item_identity(
-            items_by_id, ev, to_int(ev.get("item_id", 0))
-        )
-        if resolved_id is None or int(resolved_id) not in items_by_id:
-            continue
-        resolved_id = int(resolved_id)
-
-        # Si un PDF corregido cambió este producto después del aviso, el PDF es
-        # la fuente más reciente y el aviso antiguo no debe volver a sobrescribirlo.
-        last_pdf_order = last_reconciliation_order_by_item.get(resolved_id)
-        if last_pdf_order is not None and int(last_pdf_order) > int(event_order):
-            notice_quantity_adjustments_skipped_by_reconciliation += 1
-            continue
-
-        quantity_notice_events.append({
-            "order": int(event_order),
-            "item_id": resolved_id,
-            "cantidad": int(nueva_cantidad),
-            "created_at": (
-                clean_text(ev.get("created_at", ""))
-                or clean_text(ev.get("queued_at", ""))
-                or now_cl().isoformat(timespec="seconds")
-            ),
-        })
-
-    # Aplicar en orden. Si hubo varios ajustes, el último válido queda como meta.
-    for adj in quantity_notice_events:
-        iid = int(adj["item_id"])
-        item = items_by_id[iid]
-        item["unidades"] = int(adj["cantidad"])
-        item["updated_at"] = clean_text(adj.get("created_at", "")) or item.get("updated_at", "")
-        notice_quantity_adjustments_applied += 1
-
-        # Reproducir exactamente el UPDATE de picking vigente al momento del aviso.
-        for pit in picking_item_rows:
-            if to_int(pit.get("item_id", 0)) != iid:
-                continue
-            plid = to_int(pit.get("picking_list_id", 0))
-            code = picking_code_by_id.get(plid, "")
-            tl = picking_timeline.get(code, {})
-            created_order = tl.get("created_order")
-            completed_order = tl.get("completed_order")
-            anulled_order = tl.get("anulled_order")
-
-            # La lista debe haber existido al ocurrir el aviso.
-            if created_order is not None and int(created_order) > int(adj["order"]):
-                continue
-            # Si ya estaba completada o anulada, el flujo en vivo no la actualiza.
-            if completed_order is not None and int(completed_order) < int(adj["order"]):
-                continue
-            if anulled_order is not None and int(anulled_order) < int(adj["order"]):
-                continue
-            pit.setdefault("_cantidad_historial", []).append({
-                "order": int(adj["order"]),
-                "cantidad": int(adj["cantidad"]),
-            })
-            pit["cantidad"] = int(adj["cantidad"])
 
     # 4) Scans, con match solo dentro del lote reconstruido.
     movement_by_item = {}
@@ -9065,7 +8920,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
         resolved, _ = resolve_restore_item_identity(items_by_id, ev, to_int(ev.get("item_id", 0)))
         return resolved
 
-    for event_order, ev in enumerate(lote_events):
+    for ev in lote_events:
         et = clean_text(ev.get("event_type", ""))
         et_low = et.lower()
         if et == "producto_anexado_lote":
@@ -9196,9 +9051,6 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "zpl_hash": clean_text(ev.get("zpl_hash", "")),
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
-                # Solo para reconstrucción: permite saber qué cantidad tenía la
-                # lista exactamente cuando se generó este archivo ZPL.
-                "_event_order": int(event_order),
             })
         elif et in {"postventa_full_error_creado", "POSTVENTA_FULL_ERROR_CREADO"}:
             err_id = to_int(ev.get("error_id", 0))
@@ -9313,8 +9165,6 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
         "lote_scope_key": target_scope or make_sheet_lote_scope_key(target, meta.get("nombre", ""), meta.get("archivo", ""), meta.get("hoja", "")),
         "snapshot_selection_warning": snapshot_selection_warning,
         "pdf_reconciliation_changes": reconciliation_count,
-        "notice_quantity_adjustments_applied": notice_quantity_adjustments_applied,
-        "notice_quantity_adjustments_skipped_by_reconciliation": notice_quantity_adjustments_skipped_by_reconciliation,
     }
     return {
         "meta": meta,
@@ -9510,39 +9360,8 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                         )
                 if items_df.empty:
                     continue
-
-                # La cantidad impresa es histórica: debe corresponder al momento
-                # del evento ZPL, no necesariamente a la meta actual después de
-                # un aviso operacional. Esto evita que un rescate invente que se
-                # imprimieron 40 etiquetas cuando el archivo original contenía 36.
-                historical_qty_by_item = {}
-                label_event_order = to_int(evp.get("_event_order", -1))
-                state_picking_lists = {
-                    to_int(pl.get("id", 0)): clean_text(pl.get("codigo_lista", ""))
-                    for pl in (state.get("picking_lists", []) or [])
-                }
-                for hist_item in (state.get("picking_items", []) or []):
-                    hist_plid = to_int(hist_item.get("picking_list_id", 0))
-                    hist_code = state_picking_lists.get(hist_plid, "")
-                    same_list = (
-                        (picking_id and hist_plid == int(picking_id))
-                        or (code and hist_code == code)
-                    )
-                    if not same_list:
-                        continue
-                    hist_qty = to_int(hist_item.get("_cantidad_creacion", hist_item.get("cantidad", 0)))
-                    for change in hist_item.get("_cantidad_historial", []) or []:
-                        if not isinstance(change, dict):
-                            continue
-                        change_order = to_int(change.get("order", -1))
-                        if label_event_order >= 0 and change_order <= label_event_order:
-                            hist_qty = to_int(change.get("cantidad", hist_qty))
-                    historical_qty_by_item[to_int(hist_item.get("item_id", 0))] = int(hist_qty)
-
                 for _, item in items_df.iterrows():
-                    item_id_hist = to_int(item.get("item_id", 0))
-                    qty_normal = historical_qty_by_item.get(item_id_hist, to_int(item.get("cantidad", 0)))
-                    for pkind, qty in [("NORMAL", qty_normal), ("SEPARADOR", LABEL_SEPARATOR_PER_PRODUCT)]:
+                    for pkind, qty in [("NORMAL", to_int(item.get("cantidad", 0))), ("SEPARADOR", LABEL_SEPARATOR_PER_PRODUCT)]:
                         c.execute(
                             """
                             INSERT INTO label_prints
