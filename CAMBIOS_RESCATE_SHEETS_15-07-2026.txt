@@ -1,0 +1,41 @@
+ACTUALIZACIÓN FULL AURORA — 15-07-2026
+
+CORRECCIONES INCLUIDAS
+
+1. RESCATE DESDE GOOGLE SHEETS
+- El rescate ya no descarga todo el historial en una sola petición.
+- Primero obtiene un catálogo liviano de FULL disponibles.
+- Después descarga únicamente el FULL seleccionado.
+- La descarga de eventos se realiza por páginas, con reintentos y mayor tolerancia de tiempo.
+- Se usa la identidad exacta del FULL para evitar mezclar lotes históricos con el mismo lote_id.
+- La conciliación de eventos pendientes consulta solo las llaves recientes, no el historial completo.
+
+2. AVISOS OPERACIONALES Y CANTIDADES PENDIENTES
+- El ajuste de cantidad se aplica antes de reconstruir los escaneos.
+- Caso comprobado: 36 unidades originales + 4 unidades = 40 solicitadas.
+- Si existen 40 unidades escaneadas, la restauración deja 40 procesadas y 0 pendientes.
+- Se corrigieron tanto la restauración seleccionada como la restauración heredada.
+- Al iniciar la app se reparan de forma segura los estados locales que ya hayan quedado truncados, usando los escaneos existentes.
+
+ORDEN DE INSTALACIÓN
+
+1. Abrir el proyecto actual de Google Apps Script.
+2. Reemplazar el código por el contenido de:
+   appscript_rescate_etiquetas_seguro.txt
+3. Implementar una NUEVA VERSIÓN de la aplicación web conservando la misma implementación y URL /exec.
+4. Verificar que la URL /exec continúe configurada en los secretos de Streamlit.
+5. Publicar/reemplazar la app usando el app.py incluido en este paquete.
+6. Reiniciar la app.
+
+IMPORTANTE
+- El Apps Script actualizado debe publicarse antes de usar el nuevo rescate selectivo.
+- No es necesario borrar la base local para corregir el caso 36/40: el arranque ejecuta una reparación idempotente basada en los escaneos guardados.
+- No se modificaron las reglas operativas de picking, escaneo, impresión, incidencias ni reservas Kame fuera de lo necesario para estas dos correcciones.
+
+PRUEBAS REALIZADAS
+- Compilación de app.py: correcta.
+- Validación de sintaxis del Apps Script: correcta.
+- FULL 25-06-2026: 4.989 solicitadas / 4.989 procesadas.
+- FULL 09-07-2026: restauración completa sin mezcla histórica.
+- FULL 16-07-2026: caso específico 36 → 40 restaurado como 40/40.
+- Reparación local: un registro forzado a 36 procesadas fue corregido automáticamente a 40.

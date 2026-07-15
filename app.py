@@ -807,21 +807,115 @@ def enqueue_backup_events_batch(events):
     return ids
 
 
-def get_backup_events_from_sheets():
+def _read_sheets_json(params: dict, timeout: int = 45, attempts: int = 3) -> tuple[bool, dict, str]:
+    """Lee una respuesta JSON del Apps Script con reintentos controlados.
+
+    El rescate ya no depende de una única descarga gigante. Cada petición es pequeña,
+    paginada y puede reintentarse sin volver a reconstruir todo el historial.
+    """
     url = get_backup_webhook_url()
     if not url:
-        return False, [], "No hay URL de respaldo configurada."
+        return False, {}, "No hay URL de respaldo configurada."
     sep = "&" if "?" in url else "?"
-    read_url = f"{url}{sep}{urllib.parse.urlencode({'action': 'events'})}"
-    try:
-        with urllib.request.urlopen(read_url, timeout=20) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
-        data = json.loads(text)
-        if data.get("ok") is not True:
-            return False, [], f"Apps Script respondió error: {text[:500]}"
-        return True, data.get("events") or [], f"Eventos leídos: {len(data.get('events') or [])}"
-    except Exception as e:
-        return False, [], f"No pude leer respaldo externo: {e}"
+    read_url = f"{url}{sep}{urllib.parse.urlencode(params)}"
+    last_error = ""
+    for attempt in range(max(1, int(attempts))):
+        try:
+            with urllib.request.urlopen(read_url, timeout=max(10, int(timeout))) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            if data.get("ok") is not True:
+                return False, data if isinstance(data, dict) else {}, f"Apps Script respondió error: {body[:500]}"
+            return True, data, "OK"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt + 1 < max(1, int(attempts)):
+                time.sleep(min(4.0, 1.0 + attempt * 1.5))
+    return False, {}, f"No pude leer respaldo externo después de {max(1, int(attempts))} intento(s): {last_error}"
+
+
+def get_backup_lotes_from_sheets() -> tuple[bool, list[dict], str]:
+    """Obtiene solo el catálogo liviano de FULL disponibles."""
+    ok, data, msg = _read_sheets_json({"action": "lotes"}, timeout=35, attempts=3)
+    if not ok:
+        return False, [], msg
+    rows = data.get("lotes") or []
+    return True, rows, f"FULL disponibles: {len(rows)}"
+
+
+def get_backup_events_from_sheets(
+    lote_id: int | None = None,
+    backup_lote_key: str = "",
+    lote_nombre: str = "",
+    archivo: str = "",
+    hoja: str = "",
+    lote_created_at: str = "",
+    scope_start: str = "",
+    scope_end: str = "",
+    page_size: int = 750,
+    scan_rows: int = 6000,
+    max_pages: int = 100,
+) -> tuple[bool, list[dict], str]:
+    """Descarga eventos paginados, preferentemente de un único FULL.
+
+    La versión anterior pedía todo el historial y todas las hojas estructuradas en una
+    sola respuesta, lo que provocaba timeouts. Ahora Apps Script escanea por bloques y
+    devuelve únicamente los eventos de la identidad seleccionada.
+    """
+    params = {
+        "action": "events",
+        "page_size": max(100, min(1500, int(page_size))),
+        "scan_rows": max(1000, min(10000, int(scan_rows))),
+    }
+    if lote_id is not None:
+        params["lote_id"] = int(lote_id)
+    if clean_text(backup_lote_key):
+        params["backup_lote_key"] = clean_text(backup_lote_key)
+    if clean_text(lote_nombre):
+        params["lote_nombre"] = clean_text(lote_nombre)
+    if clean_text(archivo):
+        params["archivo"] = clean_text(archivo)
+    if clean_text(hoja):
+        params["hoja"] = clean_text(hoja)
+    if clean_text(lote_created_at):
+        params["lote_created_at"] = clean_text(lote_created_at)
+    if clean_text(scope_start):
+        params["scope_start"] = clean_text(scope_start)
+    if clean_text(scope_end):
+        params["scope_end"] = clean_text(scope_end)
+
+    events: list[dict] = []
+    cursor = ""
+    seen_cursors = set()
+    for _page in range(max(1, int(max_pages))):
+        call_params = dict(params)
+        if cursor:
+            call_params["cursor"] = cursor
+        ok, data, msg = _read_sheets_json(call_params, timeout=45, attempts=3)
+        if not ok:
+            return False, events, msg
+        events.extend(data.get("events") or [])
+        next_cursor = clean_text(data.get("next_cursor", ""))
+        if not next_cursor:
+            return True, events, f"Eventos leídos: {len(events)} en {_page + 1} página(s)"
+        if next_cursor in seen_cursors:
+            return False, events, f"Apps Script repitió el cursor {next_cursor}; se detuvo para evitar un ciclo."
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return False, events, f"El rescate superó {max_pages} páginas. Eventos recuperados antes de detenerse: {len(events)}"
+
+
+def get_backup_event_keys_from_sheets(limit: int = 5000) -> tuple[bool, list[dict], str]:
+    """Lee solamente las llaves recientes para conciliar timeouts de la cola."""
+    ok, data, msg = _read_sheets_json(
+        {"action": "event_keys", "limit": max(100, min(20000, int(limit)))},
+        timeout=35,
+        attempts=3,
+    )
+    if not ok:
+        return False, [], msg
+    keys = data.get("event_keys") or []
+    return True, keys, f"Llaves leídas: {len(keys)}"
 
 
 def local_lotes_count():
@@ -1468,6 +1562,20 @@ def restore_from_backup_if_empty(allow_existing: bool = False, only_missing: boo
     for lid, rec_events in reconciliation_events_by_lote.items():
         if lid in items_by_lote:
             apply_pdf_reconciliation_events_to_item_map(items_by_lote[lid], rec_events, lid, set(items_by_lote[lid].keys()))
+
+    # Aplicar la última cantidad objetivo de cada aviso ANTES de capear los escaneos.
+    # Resolver el aviso no revierte el ajuste; por eso se consideran avisos activos y resueltos.
+    for aviso in avisos_rows.values():
+        lid = to_int(aviso.get("lote_id", 0))
+        if lid not in items_by_lote:
+            continue
+        if "ajuste" not in clean_text(aviso.get("tipo_aviso", "")).lower():
+            continue
+        if aviso.get("cantidad_nueva") is None:
+            continue
+        resolved_id, _status = resolve_restore_item_identity(items_by_lote[lid], aviso, aviso.get("item_id"))
+        if resolved_id is not None and resolved_id in items_by_lote[lid]:
+            items_by_lote[lid][resolved_id]["unidades"] = max(0, to_int(aviso.get("cantidad_nueva", 0)))
 
     # Si existen items de un lote pero falta lote_creado, recuperamos el lote igual.
     # Esto soluciona respaldos donde el snapshot de productos llegó a Sheets, pero
@@ -2140,23 +2248,19 @@ def flush_backup_queue_ids(ids, webhook_url: str | None = None, include_failed: 
 
 
 def reconcile_backup_queue_from_sheets(limit: int = 5000) -> int:
-    """Marca como enviados eventos que ya están en Sheets aunque Python haya recibido timeout."""
-    ok, events, _msg = get_backup_events_from_sheets()
-    if not ok or not events:
+    """Marca como enviados eventos que ya están en Sheets aunque Python haya recibido timeout.
+
+    Para esta conciliación no se descargan productos, snapshots ni escaneos completos:
+    basta con las llaves del índice `event_keys`.
+    """
+    ok, key_rows, _msg = get_backup_event_keys_from_sheets(limit=max(int(limit), 1000))
+    if not ok or not key_rows:
         return 0
 
     seen_uids = set()
     seen_keys = set()
-    for ev in events:
-        base = dict(ev or {})
-        raw = base.get("raw_json")
-        if raw:
-            try:
-                parsed = json.loads(raw) if isinstance(raw, str) else raw
-                if isinstance(parsed, dict):
-                    base.update(parsed)
-            except Exception:
-                pass
+    for base in key_rows:
+        base = dict(base or {})
         uid = clean_text(base.get("event_uid", ""))
         if uid:
             seen_uids.add(uid)
@@ -3638,6 +3742,50 @@ def delete_lote(lote_id):
         "deleted_at": now_cl().isoformat(timespec="seconds"),
     })
     log_audit_event(lote_id, event_type="LOTE_ELIMINADO", detail="Lote eliminado", qty=int(items_count))
+
+
+def repair_local_acopiadas_from_scans() -> int:
+    """Repara subconteos locales usando los scans vigentes como evidencia.
+
+    Es idempotente y se ejecuta al iniciar. No inventa movimientos: solo alinea
+    `items.acopiadas` con la suma de filas existentes en `scans`, respetando la
+    cantidad objetivo vigente del producto. Esto corrige bases que ya habían sido
+    restauradas con el orden antiguo (36 objetivo al capear un scan de 40).
+    """
+    repaired = 0
+    now = now_cl().isoformat(timespec="seconds")
+    with db() as c:
+        rows = c.execute(
+            """
+            SELECT i.id, i.lote_id, i.unidades, i.acopiadas,
+                   COALESCE(SUM(s.cantidad), 0) AS scan_qty
+            FROM items i
+            LEFT JOIN scans s ON s.lote_id=i.lote_id AND s.item_id=i.id
+            GROUP BY i.id, i.lote_id, i.unidades, i.acopiadas
+            """
+        ).fetchall()
+        for row in rows:
+            current = max(0, to_int(row["acopiadas"]))
+            units = max(0, to_int(row["unidades"]))
+            scan_qty = max(0, to_int(row["scan_qty"]))
+            corrected = min(units, max(current, scan_qty))
+            if corrected == current:
+                continue
+            c.execute(
+                "UPDATE items SET acopiadas=?, updated_at=? WHERE id=? AND lote_id=?",
+                (corrected, now, int(row["id"]), int(row["lote_id"])),
+            )
+            c.execute(
+                "INSERT INTO audit_events (lote_id, item_id, event_type, detail, qty, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    int(row["lote_id"]), int(row["id"]), "REPARACION_ACOPIO_DESDE_SCANS",
+                    f"Acopiadas corregidas de {current} a {corrected} usando scans locales vigentes.",
+                    corrected, now,
+                ),
+            )
+            repaired += 1
+        c.commit()
+    return repaired
 
 
 def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo, operador_validador='', picking_list_id=None):
@@ -8018,8 +8166,26 @@ def local_lote_scope_map() -> dict:
     return out
 
 
-def get_sheet_events_normalized() -> tuple[bool, list[dict], str]:
-    ok, events, msg = get_backup_events_from_sheets()
+def get_sheet_events_normalized(
+    lote_id: int | None = None,
+    backup_lote_key: str = "",
+    lote_nombre: str = "",
+    archivo: str = "",
+    hoja: str = "",
+    lote_created_at: str = "",
+    scope_start: str = "",
+    scope_end: str = "",
+) -> tuple[bool, list[dict], str]:
+    ok, events, msg = get_backup_events_from_sheets(
+        lote_id=lote_id,
+        backup_lote_key=backup_lote_key,
+        lote_nombre=lote_nombre,
+        archivo=archivo,
+        hoja=hoja,
+        lote_created_at=lote_created_at,
+        scope_start=scope_start,
+        scope_end=scope_end,
+    )
     if not ok:
         return False, [], msg
     normalized = []
@@ -8040,6 +8206,67 @@ def get_sheet_events_normalized() -> tuple[bool, list[dict], str]:
 
     normalized.sort(key=key)
     return True, normalized, f"Eventos normalizados: {len(normalized)}"
+
+
+def get_sheet_lotes_catalog_normalized() -> tuple[bool, pd.DataFrame, str]:
+    """Convierte el catálogo remoto en candidatos de rescate sin descargar eventos."""
+    ok, rows, msg = get_backup_lotes_from_sheets()
+    if not ok:
+        return False, pd.DataFrame(), msg
+    local_scopes = local_lote_scope_map()
+    by_scope = {}
+    for raw in rows:
+        row = normalize_sheet_event(raw)
+        try:
+            lote_id = int(row.get("lote_id"))
+        except Exception:
+            continue
+        nombre = clean_text(row.get("lote_nombre", "")) or f"Lote {lote_id}"
+        archivo = clean_text(row.get("archivo", ""))
+        hoja = clean_text(row.get("hoja", ""))
+        local_scope = make_sheet_lote_scope_key(lote_id, nombre, archivo, hoja)
+        remote_key = clean_text(row.get("rescue_key", "")) or clean_text(row.get("backup_lote_key", "")) or local_scope
+        selection_scope = "REMOTE-" + hashlib.sha256(remote_key.encode("utf-8")).hexdigest()[:24]
+        local_ids = local_scopes.get(local_scope, [])
+        created_at = clean_text(row.get("lote_created_at", "")) or clean_text(row.get("created_at", "")) or clean_text(row.get("received_at", ""))
+        ultimo = clean_text(row.get("ultimo_evento", "")) or created_at
+        rec = {
+            "lote_scope_key": selection_scope,
+            "local_scope_key": local_scope,
+            "remote_rescue_key": remote_key,
+            "backup_lote_key": clean_text(row.get("backup_lote_key", "")),
+            "lote_created_at": clean_text(row.get("lote_created_at", "")) or created_at,
+            "scope_start": clean_text(row.get("scope_start", "")) or created_at,
+            "scope_end": clean_text(row.get("scope_end", "")),
+            "lote_id": lote_id,
+            "lote_nombre": nombre,
+            "archivo": archivo,
+            "hoja": hoja,
+            "estado": clean_text(row.get("status", row.get("estado", "ACTIVO"))).upper() or "ACTIVO",
+            "created_at": created_at,
+            "ultimo_evento": ultimo,
+            "productos": to_int(row.get("total_lineas", row.get("productos", 0))),
+            "unidades": to_int(row.get("total_unidades", row.get("unidades", 0))),
+            "escaneos": 0,
+            "unidades_escaneadas": 0,
+            "picking_listas": 0,
+            "incidencias": 0,
+            "avisos": 0,
+            "reimpresiones": 0,
+            "reservas_kame": 0,
+            "existe_local": "SI" if local_ids else "NO",
+            "local_ids": ",".join(str(x) for x in local_ids),
+        }
+        previous = by_scope.get(selection_scope)
+        if previous is None or clean_text(rec["ultimo_evento"]) >= clean_text(previous.get("ultimo_evento", "")):
+            by_scope[selection_scope] = rec
+    if not by_scope:
+        return True, pd.DataFrame(), msg
+    df = pd.DataFrame(list(by_scope.values()))
+    df["created_at_fmt"] = df["created_at"].map(fmt_dt)
+    df["ultimo_evento_fmt"] = df["ultimo_evento"].map(fmt_dt)
+    df = df.sort_values(["ultimo_evento", "lote_nombre", "lote_id"], ascending=[False, True, False]).reset_index(drop=True)
+    return True, df, msg
 
 
 def summarize_sheet_lotes(events: list[dict]) -> pd.DataFrame:
@@ -8223,21 +8450,19 @@ def render_rescate_sheets():
     with c2:
         st.info("Usa este módulo para revisar FULL antiguos o recuperar un lote real cuando SQLite/Streamlit tenga una base local parcial.")
 
-    if load_now or "sheet_rescue_events" not in st.session_state:
-        ok, events, msg = get_sheet_events_normalized()
+    if load_now or "sheet_rescue_candidates" not in st.session_state:
+        ok, candidates, msg = get_sheet_lotes_catalog_normalized()
         if not ok:
             st.error(msg)
             return
-        st.session_state["sheet_rescue_events"] = events
+        st.session_state["sheet_rescue_candidates"] = candidates
         st.session_state["sheet_rescue_msg"] = msg
+        if load_now:
+            # Al actualizar el catálogo se invalida el detalle, evitando usar una copia vieja.
+            st.session_state["sheet_rescue_detail_cache"] = {}
 
-    events = st.session_state.get("sheet_rescue_events") or []
-    if not events:
-        st.warning("No hay eventos disponibles desde Sheets.")
-        return
-
-    candidates = summarize_sheet_lotes(events)
-    if candidates.empty:
+    candidates = st.session_state.get("sheet_rescue_candidates")
+    if candidates is None or candidates.empty:
         st.warning("No encontré lotes candidatos en Sheets.")
         return
 
@@ -8258,21 +8483,15 @@ def render_rescate_sheets():
     if not mostrar_locales:
         show = show[show["existe_local"] != "SI"]
 
-    table_cols = ["estado", "lote_id", "lote_nombre", "archivo", "created_at_fmt", "ultimo_evento_fmt", "productos", "unidades", "unidades_escaneadas", "picking_listas", "incidencias", "avisos", "reservas_kame", "existe_local"]
+    table_cols = ["estado", "lote_id", "lote_nombre", "archivo", "created_at_fmt", "productos", "unidades", "existe_local"]
     st.dataframe(show[table_cols].rename(columns={
         "estado": "Estado",
         "lote_id": "Lote ID",
         "lote_nombre": "Lote",
         "archivo": "Archivo",
         "created_at_fmt": "Creado",
-        "ultimo_evento_fmt": "Último evento",
-        "productos": "Productos",
-        "unidades": "Unidades",
-        "unidades_escaneadas": "Escaneado",
-        "picking_listas": "Picking",
-        "incidencias": "Incidencias",
-        "avisos": "Avisos",
-        "reservas_kame": "Reservas Kame",
+        "productos": "Productos declarados",
+        "unidades": "Unidades declaradas",
         "existe_local": "Local",
     }), use_container_width=True, hide_index=True, height=320)
 
@@ -8296,15 +8515,46 @@ def render_rescate_sheets():
     selected_lote_id = int(selected_row["lote_id"])
     selected_exists_local = clean_text(selected_row.get("existe_local", "")) == "SI"
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Productos", int(selected_row.get("productos") or 0))
-    m2.metric("Unidades", format_kame_qty(float(selected_row.get("unidades") or 0)) if 'format_kame_qty' in globals() else int(selected_row.get("unidades") or 0))
-    m3.metric("Escaneado", format_kame_qty(float(selected_row.get("unidades_escaneadas") or 0)) if 'format_kame_qty' in globals() else int(selected_row.get("unidades_escaneadas") or 0))
-    m4.metric("Estado", clean_text(selected_row.get("estado", "")))
+    detail_cache = st.session_state.setdefault("sheet_rescue_detail_cache", {})
+    detail_key = clean_text(selected_row.get("remote_rescue_key", "")) or selected_scope_key
+    refresh_detail = st.button("Recargar detalle del FULL seleccionado", use_container_width=False, key=f"refresh_sheet_detail_{hashlib.sha1(detail_key.encode('utf-8')).hexdigest()[:10]}")
+    if refresh_detail or detail_key not in detail_cache:
+        with st.spinner("Descargando únicamente los eventos de este FULL..."):
+            ok_detail, detail_events, detail_msg = get_sheet_events_normalized(
+                lote_id=selected_lote_id,
+                backup_lote_key=clean_text(selected_row.get("backup_lote_key", "")),
+                lote_nombre=clean_text(selected_row.get("lote_nombre", "")),
+                archivo=clean_text(selected_row.get("archivo", "")),
+                hoja=clean_text(selected_row.get("hoja", "")),
+                lote_created_at=clean_text(selected_row.get("lote_created_at", "")),
+                scope_start=clean_text(selected_row.get("scope_start", "")),
+                scope_end=clean_text(selected_row.get("scope_end", "")),
+            )
+        if not ok_detail:
+            st.error(detail_msg)
+            return
+        detail_cache[detail_key] = {"events": detail_events, "msg": detail_msg}
+        st.session_state["sheet_rescue_detail_cache"] = detail_cache
 
-    state_preview = build_sheet_lote_state_clean(events, selected_lote_id, lote_scope_key=selected_scope_key)
-    items_df = get_sheet_lote_items_from_events(events, selected_lote_id, lote_scope_key=selected_scope_key)
-    events_df = get_sheet_lote_events_df(events, selected_lote_id, lote_scope_key=selected_scope_key)
+    events = (detail_cache.get(detail_key) or {}).get("events") or []
+    if not events:
+        st.warning("Este FULL no tiene eventos recuperables en la hoja principal de respaldo.")
+        return
+
+    # Los eventos ya llegan filtrados en Apps Script por la identidad exacta del FULL.
+    # No se vuelve a filtrar por lote_id histórico dentro de Python.
+    state_preview = build_sheet_lote_state_clean(events, selected_lote_id, lote_scope_key="")
+    items_df = get_sheet_lote_items_from_events(events, selected_lote_id, lote_scope_key="")
+    events_df = get_sheet_lote_events_df(events, selected_lote_id, lote_scope_key="")
+
+    preview_items = state_preview.get("items", []) or []
+    preview_units = sum(to_int(x.get("unidades", 0)) for x in preview_items if isinstance(x, dict))
+    preview_done = sum(to_int(x.get("acopiadas", 0)) for x in preview_items if isinstance(x, dict))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Productos", len(preview_items))
+    m2.metric("Unidades", format_kame_qty(float(preview_units)) if 'format_kame_qty' in globals() else preview_units)
+    m3.metric("Escaneado", format_kame_qty(float(preview_done)) if 'format_kame_qty' in globals() else preview_done)
+    m4.metric("Estado", clean_text(selected_row.get("estado", "")))
     integ_preview = state_preview.get("integrity", {}) or {}
     if integ_preview.get("snapshot_selection_warning"):
         st.warning(
@@ -8408,7 +8658,7 @@ def render_rescate_sheets():
             events,
             int(selected_lote_id),
             replace_existing=True,
-            lote_scope_key=selected_scope_key,
+            lote_scope_key="",
         )
         st.session_state["_auto_restore_ok"] = ok_restore
         st.session_state["_auto_restore_msg"] = msg_restore
@@ -8809,6 +9059,16 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
             picking_lists[code]["anulada_by"] = clean_text(ev.get("usuario", "")) or "SIN_USUARIO"
             picking_lists[code]["anulada_motivo"] = clean_text(ev.get("comentario", ""))
 
+    # Incorporar anexos antes de reconstruir picking y escaneos. Así sus movimientos
+    # se resuelven contra el producto real y no contra un fallback temporal.
+    for ev in lote_events:
+        if clean_text(ev.get("event_type", "")) == "producto_anexado_lote":
+            add_or_update_item(
+                {**ev, "unidades": ev.get("unidades", ev.get("cantidad", 0)), "origen_item": "ANEXO_MANUAL"},
+                "LOTE_ITEM",
+                "producto anexado manualmente",
+            )
+
     # 3) Agregar productos faltantes desde picking NO anulado. Esto no inventa: usa líneas completas que están en eventos.
     picking_item_rows = []
     fallback_from_picking = 0
@@ -8838,6 +9098,26 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "estado": "PENDIENTE",
                 "created_at": clean_text(pl.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
+
+    # Aplicar avisos de ajuste antes de reconstruir acopiadas. La versión anterior
+    # capaba el scan con la cantidad del snapshot (por ejemplo min(36, 40)=36) y
+    # recién después restauraba el aviso de 40, dejando 4 unidades pendientes falsas.
+    latest_quantity_adjustments = {}
+    for ev in lote_events:
+        et = clean_text(ev.get("event_type", ""))
+        if et not in {"aviso_operacional_creado", "AVISO_OPERACIONAL_CREADO"}:
+            continue
+        if "ajuste" not in clean_text(ev.get("tipo_aviso", ev.get("tipo", ""))).lower():
+            continue
+        if not clean_text(ev.get("cantidad_nueva", "")):
+            continue
+        resolved_id, _status = resolve_restore_item_identity(items_by_id, ev, to_int(ev.get("item_id", 0)))
+        if resolved_id is None or resolved_id not in items_by_id:
+            continue
+        latest_quantity_adjustments[int(resolved_id)] = max(0, to_int(ev.get("cantidad_nueva", 0)))
+    for adjusted_item_id, adjusted_qty in latest_quantity_adjustments.items():
+        items_by_id[adjusted_item_id]["unidades"] = int(adjusted_qty)
+        items_by_id[adjusted_item_id]["updated_at"] = now_cl().isoformat(timespec="seconds")
 
     # 4) Scans, con match solo dentro del lote reconstruido.
     movement_by_item = {}
@@ -9165,6 +9445,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
         "lote_scope_key": target_scope or make_sheet_lote_scope_key(target, meta.get("nombre", ""), meta.get("archivo", ""), meta.get("hoja", "")),
         "snapshot_selection_warning": snapshot_selection_warning,
         "pdf_reconciliation_changes": reconciliation_count,
+        "quantity_adjustments_applied": len(latest_quantity_adjustments),
     }
     return {
         "meta": meta,
@@ -10328,6 +10609,7 @@ def render_auditoria_integrada(active_lote: int):
 # ============================================================
 
 init_db()
+repair_local_acopiadas_from_scans()
 load_maestro_from_repo()
 
 if "_auto_restore_checked" not in st.session_state:

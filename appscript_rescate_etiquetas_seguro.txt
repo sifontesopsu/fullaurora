@@ -1,0 +1,1199 @@
+const EVENTS_SPREADSHEET_ID = "10XrPUVVJqGNobIpVoTbZFN56QXeFoO-oY6xUp6r2m5A";
+const ERRORS_SPREADSHEET_ID = "1PhlXPcpx-QtPCTBElYzC_sdEVAMCe5UmQ0R5rSb_Nak";
+
+const EVENT_HEADERS = [
+  "received_at", "event_uid", "event_source", "event_type", "queue_id", "queued_at",
+  "lote_id", "lote_nombre", "backup_lote_key", "lote_created_at", "archivo", "hoja", "item_id",
+  "codigo_ml", "codigo_universal", "sku", "descripcion",
+  "descripcion_kame", "descripcion_ml", "descripcion_fuente", "familia_kame", "maestro_match_status",
+  "cantidad", "unidades", "modo", "tipo", "comentario", "event_key", "raw_json"
+];
+
+const EVENT_KEY_HEADERS = [
+  "event_key", "event_uid", "event_source", "first_seen_at",
+  "event_type", "lote_id", "item_id", "sku", "created_at"
+];
+
+function doPost(e) {
+  let lock;
+  try {
+    lock = LockService.getScriptLock();
+    // No dejamos a Streamlit esperando 15s si otro POST ya está escribiendo.
+    // La app marcará el evento como pendiente y lo reintentará después.
+    if (!lock.tryLock(1000)) {
+      return json_({ ok: false, transient: true, retry: true, code: "LOCK_BUSY", error: "Apps Script ocupado: otro proceso mantiene el lock" });
+    }
+
+    const data = JSON.parse((e && e.postData && e.postData.contents) || "{}");
+    const ss = SpreadsheetApp.openById(EVENTS_SPREADSHEET_ID);
+    const eventos = getOrCreateSheet_(ss, "eventos", EVENT_HEADERS);
+    ensureHeaders_(eventos, EVENT_HEADERS);
+
+    const eventKey = buildEventKey_(data);
+    if (eventAlreadyExists_(ss, eventos, eventKey)) {
+      return json_({
+        ok: true,
+        duplicate: true,
+        event_key: eventKey,
+        event_uid: data.event_uid || "",
+        message: "Evento duplicado ignorado por llave estable"
+      });
+    }
+
+    appendObjectRow_(eventos, {
+      received_at: new Date(),
+      event_uid: data.event_uid || "",
+      event_source: data.event_source || "",
+      event_type: data.event_type || "",
+      queue_id: data.queue_id || "",
+      queued_at: data.queued_at || "",
+      lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "",
+      backup_lote_key: data.backup_lote_key || "",
+      lote_created_at: data.lote_created_at || "",
+      archivo: data.archivo || "",
+      hoja: data.hoja || "",
+      item_id: data.item_id || "",
+      codigo_ml: data.codigo_ml || "",
+      codigo_universal: data.codigo_universal || "",
+      sku: data.sku || "",
+      descripcion: data.descripcion || "",
+      descripcion_kame: data.descripcion_kame || data.descripcion || "",
+      descripcion_ml: data.descripcion_ml || "",
+      descripcion_fuente: data.descripcion_fuente || "",
+      familia_kame: data.familia_kame || "",
+      maestro_match_status: data.maestro_match_status || "",
+      cantidad: data.cantidad || "",
+      unidades: data.unidades || "",
+      modo: data.modo || "",
+      tipo: data.tipo || "",
+      comentario: data.comentario || data.detail || "",
+      event_key: eventKey,
+      raw_json: JSON.stringify(data)
+    });
+
+    rememberEventKey_(ss, data, eventKey);
+
+    const warnings = [];
+    try {
+      writeStructured_(ss, data, eventKey);
+    } catch (structuredErr) {
+      warnings.push(String(structuredErr));
+      logError_("writeStructured_", structuredErr, e);
+    }
+
+    return json_({ ok: true, event_key: eventKey, event_uid: data.event_uid || "", warnings: warnings });
+
+  } catch (err) {
+    logError_("doPost", err, e);
+    return json_({ ok: false, error: String(err) });
+  } finally {
+    if (lock) {
+      try { lock.releaseLock(); } catch (err) {}
+    }
+  }
+}
+
+function doGet(e) {
+  try {
+    const action = (e && e.parameter && e.parameter.action) || "";
+    const ss = SpreadsheetApp.openById(EVENTS_SPREADSHEET_ID);
+
+    // Catálogo liviano: no lee scans, snapshots, picking ni auditoría completos.
+    if (action === "lotes") {
+      return json_({ ok: true, lotes: buildLoteCatalog_(ss) });
+    }
+
+    // Rescate paginado desde la hoja madre. Las hojas estructuradas son auditoría y
+    // fallback, pero no se vuelven a duplicar dentro de la descarga normal.
+    if (action === "events") {
+      return json_(readMainEventsPage_(ss, (e && e.parameter) || {}));
+    }
+
+    // Conciliación de timeouts: Python solo necesita UID/llave, no todo el historial.
+    if (action === "event_keys") {
+      const limit = clampInt_((e && e.parameter && e.parameter.limit) || 5000, 100, 20000);
+      return json_({ ok: true, event_keys: readRecentEventKeys_(ss, limit) });
+    }
+
+    if (action === "reindex_event_keys") {
+      const eventos = getOrCreateSheet_(ss, "eventos", EVENT_HEADERS);
+      const keySheet = getOrCreateSheet_(ss, "event_keys", EVENT_KEY_HEADERS);
+      const added = ensureEventKeyIndex_(eventos, keySheet, true);
+      return json_({ ok: true, action: action, added: added });
+    }
+
+    return json_({ ok: true, message: "Webhook activo" });
+  } catch (err) {
+    logError_("doGet", err, e);
+    return json_({ ok: false, error: String(err) });
+  }
+}
+
+
+function clampInt_(value, minValue, maxValue) {
+  const n = parseInt(value, 10);
+  if (!isFinite(n)) return minValue;
+  return Math.max(minValue, Math.min(maxValue, n));
+}
+
+function normalizedText_(value) {
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
+function timestampText_(value) {
+  if (!value) return "";
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return value.toISOString();
+  }
+  return String(value).trim();
+}
+
+function eventTimestamp_(ev) {
+  return timestampText_(ev.created_at || ev.queued_at || ev.received_at || "");
+}
+
+function legacyRescueKey_(ev) {
+  return "LEGACY:" + [
+    ev.lote_id || "",
+    normalizedText_(ev.lote_nombre || ""),
+    normalizedText_(ev.archivo || ""),
+    normalizedText_(ev.hoja || ""),
+    timestampText_(ev.lote_created_at || ev.created_at || ev.queued_at || "")
+  ].join("|");
+}
+
+function catalogMatch_(records, ev) {
+  const explicit = String(ev.backup_lote_key || "").trim();
+  if (explicit) {
+    for (let i = 0; i < records.length; i++) {
+      if (String(records[i].backup_lote_key || "").trim() === explicit) return records[i];
+    }
+  }
+  const lid = String(ev.lote_id || "").trim();
+  const name = normalizedText_(ev.lote_nombre || "");
+  let matches = records.filter(function(r) {
+    return String(r.lote_id || "").trim() === lid && (!name || normalizedText_(r.lote_nombre || "") === name);
+  });
+  if (!matches.length) return null;
+  matches.sort(function(a, b) { return timestampText_(a.created_at).localeCompare(timestampText_(b.created_at)); });
+  const ts = eventTimestamp_(ev);
+  let chosen = matches[0];
+  matches.forEach(function(r) {
+    if (!ts || timestampText_(r.created_at) <= ts) chosen = r;
+  });
+  return chosen;
+}
+
+function addCatalogEvent_(catalogMap, ev) {
+  const loteId = String(ev.lote_id || "").trim();
+  if (!loteId) return;
+  const backupKey = String(ev.backup_lote_key || "").trim();
+  const rescueKey = backupKey || legacyRescueKey_(ev);
+  const createdAt = timestampText_(ev.lote_created_at || ev.created_at || ev.queued_at || ev.received_at || "");
+  const rec = catalogMap[rescueKey] || {
+    rescue_key: rescueKey,
+    backup_lote_key: backupKey,
+    lote_id: ev.lote_id || "",
+    lote_nombre: ev.lote_nombre || ("Lote " + loteId),
+    archivo: ev.archivo || "",
+    hoja: ev.hoja || "",
+    lote_created_at: createdAt,
+    created_at: createdAt,
+    ultimo_evento: createdAt,
+    total_lineas: ev.total_lineas || ev.productos_total || "",
+    total_unidades: ev.total_unidades || ev.unidades_total || "",
+    status: ev.status || ev.estado || "ACTIVO"
+  };
+  if (ev.lote_nombre) rec.lote_nombre = ev.lote_nombre;
+  if (ev.archivo) rec.archivo = ev.archivo;
+  if (ev.hoja) rec.hoja = ev.hoja;
+  if (backupKey) rec.backup_lote_key = backupKey;
+  if (createdAt && (!rec.created_at || createdAt < rec.created_at)) rec.created_at = createdAt;
+  if (createdAt && (!rec.lote_created_at || createdAt < rec.lote_created_at)) rec.lote_created_at = createdAt;
+  const lastTs = eventTimestamp_(ev);
+  if (lastTs && (!rec.ultimo_evento || lastTs > rec.ultimo_evento)) rec.ultimo_evento = lastTs;
+  if (String(ev.total_lineas || ev.productos_total || "").trim()) rec.total_lineas = ev.total_lineas || ev.productos_total;
+  if (String(ev.total_unidades || ev.unidades_total || "").trim()) rec.total_unidades = ev.total_unidades || ev.unidades_total;
+  if (ev.status || ev.estado) rec.status = ev.status || ev.estado;
+  catalogMap[rescueKey] = rec;
+}
+
+function appendMissingLotesFromMain_(ss, catalogMap) {
+  const sh = ss.getSheetByName("eventos");
+  if (!sh || sh.getLastRow() < 2) return;
+  const headers = getHeaders_(sh);
+  const typeIndex = headers.indexOf("event_type");
+  if (typeIndex < 0) return;
+  const finder = sh.getRange(2, typeIndex + 1, sh.getLastRow() - 1, 1)
+    .createTextFinder("lote_creado")
+    .matchEntireCell(true);
+  const cells = finder.findAll() || [];
+  cells.forEach(function(cell) {
+    const rowValues = sh.getRange(cell.getRow(), 1, 1, headers.length).getValues()[0];
+    const row = {};
+    headers.forEach(function(h, i) { row[h] = rowValues[i]; });
+    addCatalogEvent_(catalogMap, parseRawMerge_(row));
+  });
+}
+
+function buildLoteCatalog_(ss) {
+  const catalogMap = {};
+  const loteSheet = ss.getSheetByName("lotes");
+  if (loteSheet) {
+    sheetToObjects_(loteSheet).forEach(function(row) {
+      addCatalogEvent_(catalogMap, parseRawMerge_(row));
+    });
+  }
+  // Si writeStructured_ falló en algún momento, lote_creado sigue existiendo en eventos.
+  appendMissingLotesFromMain_(ss, catalogMap);
+
+  const records = Object.keys(catalogMap).map(function(k) { return catalogMap[k]; });
+  const stateSheet = ss.getSheetByName("lotes_estados");
+  if (stateSheet) {
+    sheetToObjects_(stateSheet).forEach(function(row) {
+      const ev = parseRawMerge_(row);
+      const rec = catalogMatch_(records, ev);
+      if (!rec) return;
+      const et = normalizedText_(ev.event_type || "");
+      if (et === "LOTE_CERRADO") rec.status = "CERRADO";
+      else if (et === "LOTE_REABIERTO") rec.status = "ACTIVO";
+      else if (et === "LOTE_ELIMINADO") rec.status = "ELIMINADO";
+      else if (ev.status) rec.status = ev.status;
+      const ts = eventTimestamp_(ev);
+      if (ts && (!rec.ultimo_evento || ts > rec.ultimo_evento)) rec.ultimo_evento = ts;
+    });
+  }
+
+  // Delimitar versiones que reutilizaron el mismo lote_id.
+  const byId = {};
+  records.forEach(function(rec) {
+    const key = String(rec.lote_id || "");
+    if (!byId[key]) byId[key] = [];
+    byId[key].push(rec);
+  });
+  Object.keys(byId).forEach(function(key) {
+    const arr = byId[key];
+    arr.sort(function(a, b) { return timestampText_(a.created_at).localeCompare(timestampText_(b.created_at)); });
+    arr.forEach(function(rec, index) {
+      rec.scope_start = timestampText_(rec.created_at);
+      rec.scope_end = index + 1 < arr.length ? timestampText_(arr[index + 1].created_at) : "";
+    });
+  });
+
+  records.sort(function(a, b) {
+    return timestampText_(b.ultimo_evento || b.created_at).localeCompare(timestampText_(a.ultimo_evento || a.created_at));
+  });
+  return records;
+}
+
+function eventMatchesLote_(ev, params) {
+  const requestedLoteId = String(params.lote_id || "").trim();
+  if (requestedLoteId && String(ev.lote_id || "").trim() !== requestedLoteId) return false;
+  if (!requestedLoteId && !params.backup_lote_key && !params.lote_nombre && !params.archivo && !params.hoja) return true;
+
+  const requestedKey = String(params.backup_lote_key || "").trim();
+  const eventKey = String(ev.backup_lote_key || "").trim();
+  if (requestedKey && eventKey) return requestedKey === eventKey;
+
+  const checks = [
+    [params.lote_nombre, ev.lote_nombre],
+    [params.archivo, ev.archivo],
+    [params.hoja, ev.hoja]
+  ];
+  let positiveIdentity = false;
+  for (let i = 0; i < checks.length; i++) {
+    const wanted = normalizedText_(checks[i][0] || "");
+    const actual = normalizedText_(checks[i][1] || "");
+    if (wanted && actual) {
+      if (wanted !== actual) return false;
+      positiveIdentity = true;
+    }
+  }
+
+  const ts = eventTimestamp_(ev);
+  const start = timestampText_(params.scope_start || params.lote_created_at || "");
+  const end = timestampText_(params.scope_end || "");
+  if (start && ts && ts < start) return false;
+  if (end && ts && ts >= end) return false;
+  if (start && ts) positiveIdentity = true;
+
+  // Con backup key solicitado, los eventos antiguos sin esa columna solo entran si
+  // coinciden por metadatos o por la ventana temporal exacta del FULL.
+  return positiveIdentity || (!requestedKey && !!requestedLoteId);
+}
+
+function readMainEventsPage_(ss, params) {
+  const sh = getOrCreateSheet_(ss, "eventos", EVENT_HEADERS);
+  ensureHeaders_(sh, EVENT_HEADERS);
+  const headers = getHeaders_(sh);
+  const lastRow = sh.getLastRow();
+  const pageSize = clampInt_(params.page_size || 750, 100, 1500);
+  const scanRows = clampInt_(params.scan_rows || 6000, 1000, 10000);
+  let cursor = clampInt_(params.cursor || 2, 2, Math.max(2, lastRow + 1));
+  const events = [];
+
+  if (lastRow < 2 || cursor > lastRow) {
+    return { ok: true, events: events, next_cursor: "", done: true, scanned_until: lastRow };
+  }
+
+  const endRow = Math.min(lastRow, cursor + scanRows - 1);
+  const values = sh.getRange(cursor, 1, endRow - cursor + 1, headers.length).getValues();
+  let nextRow = cursor;
+  for (let i = 0; i < values.length; i++) {
+    const rowNumber = cursor + i;
+    const row = {};
+    headers.forEach(function(h, col) { row[h] = values[i][col]; });
+    const ev = parseRawMerge_(row);
+    nextRow = rowNumber + 1;
+    if (eventMatchesLote_(ev, params)) events.push(ev);
+    if (events.length >= pageSize) break;
+  }
+
+  const hasMore = nextRow <= lastRow;
+  return {
+    ok: true,
+    events: events,
+    next_cursor: hasMore ? String(nextRow) : "",
+    done: !hasMore,
+    scanned_until: nextRow - 1,
+    last_row: lastRow
+  };
+}
+
+function readRecentEventKeys_(ss, limit) {
+  const sh = getOrCreateSheet_(ss, "event_keys", EVENT_KEY_HEADERS);
+  if (sh.getLastRow() < 2) return [];
+  const headers = getHeaders_(sh);
+  const count = Math.min(clampInt_(limit || 5000, 100, 20000), sh.getLastRow() - 1);
+  const start = Math.max(2, sh.getLastRow() - count + 1);
+  const values = sh.getRange(start, 1, count, headers.length).getValues();
+  return values.map(function(row) {
+    const obj = {};
+    headers.forEach(function(h, i) { obj[h] = row[i]; });
+    return { event_key: obj.event_key || "", event_uid: obj.event_uid || "" };
+  });
+}
+
+function writeStructured_(ss, data, eventKey) {
+  const et = String(data.event_type || "");
+
+  if (et === "lote_creado") {
+    const sh = getOrCreateSheet_(ss, "lotes", [
+      "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "backup_lote_key", "lote_created_at", "archivo", "hoja",
+      "total_lineas", "total_unidades", "status", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", backup_lote_key: data.backup_lote_key || "", lote_created_at: data.lote_created_at || data.created_at || data.queued_at || "",
+      archivo: data.archivo || "", hoja: data.hoja || "",
+      total_lineas: data.total_lineas || "", total_unidades: data.total_unidades || "", status: data.status || "ACTIVO",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "lote_item") {
+    const sh = getOrCreateSheet_(ss, "lote_items", [
+      "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "item_id", "area", "nro",
+      "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_kame", "descripcion_ml", "descripcion_fuente", "familia_kame", "maestro_match_status", "unidades", "identificacion", "vence",
+      "instrucciones", "dia", "hora", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", item_id: data.item_id || "", area: data.area || "", nro: data.nro || "",
+      codigo_ml: data.codigo_ml || "", codigo_universal: data.codigo_universal || "", sku: data.sku || "",
+      descripcion: data.descripcion || "", descripcion_kame: data.descripcion_kame || data.descripcion || "", descripcion_ml: data.descripcion_ml || "",
+      descripcion_fuente: data.descripcion_fuente || "", familia_kame: data.familia_kame || "", maestro_match_status: data.maestro_match_status || "",
+      unidades: data.unidades || data.cantidad || "", identificacion: data.identificacion || "",
+      vence: data.vence || "", instrucciones: data.instrucciones || "", dia: data.dia || "", hora: data.hora || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "lote_snapshot_chunk" || et === "lote_snapshot_completo") {
+    const sh = getOrCreateSheet_(ss, "lote_snapshots", [
+      "received_at", "event_key", "queue_id", "event_type", "lote_id", "lote_nombre",
+      "chunk_index", "chunk_total", "productos_total", "unidades_total", "snapshot_hash",
+      "motivo_snapshot", "usuario", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", event_type: et,
+      lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "",
+      chunk_index: data.chunk_index || "", chunk_total: data.chunk_total || "",
+      productos_total: data.productos_total || ((data.items || []).length || ""),
+      unidades_total: data.unidades_total || "", snapshot_hash: data.snapshot_hash || "",
+      motivo_snapshot: data.motivo_snapshot || "", usuario: data.usuario || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify({
+        event_type: et,
+        lote_id: data.lote_id || "",
+        lote_nombre: data.lote_nombre || "",
+        chunk_index: data.chunk_index || "",
+        chunk_total: data.chunk_total || "",
+        productos_total: data.productos_total || ((data.items || []).length || ""),
+        unidades_total: data.unidades_total || "",
+        snapshot_hash: data.snapshot_hash || "",
+        motivo_snapshot: data.motivo_snapshot || "",
+        created_at: data.created_at || data.queued_at || ""
+      })
+    });
+  }
+
+  if (et === "lote_cerrado" || et === "lote_reabierto" || et === "lote_eliminado") {
+    const sh = getOrCreateSheet_(ss, "lotes_estados", [
+      "received_at", "event_key", "queue_id", "event_type", "lote_id", "lote_nombre", "status",
+      "usuario", "comentario", "cierre_forzado", "pendientes", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", event_type: et,
+      lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "", status: data.status || "",
+      usuario: data.usuario || data.closed_by || "", comentario: data.comentario || data.close_note || "",
+      cierre_forzado: data.cierre_forzado || "", pendientes: data.pendientes || "", created_at: data.created_at || data.queued_at || "",
+      raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "incidencia_creada" || et === "INCIDENCIA_ABIERTA" ||
+      et === "incidencia_resuelta" || et === "INCIDENCIA_RESUELTA") {
+    const sh = getOrCreateSheet_(ss, "incidencias", [
+      "received_at", "event_key", "queue_id", "event_type", "incidencia_id", "lote_id", "lote_nombre", "item_id",
+      "codigo_reportado", "match_status", "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_kame", "descripcion_ml", "familia_kame", "maestro_match_status", "tipo", "cantidad", "comentario",
+      "usuario", "estado", "created_at", "resolved_at", "resolved_by", "resolution_comment", "raw_json"
+    ]);
+    const estadoInc = data.status || data.estado || ((et === "incidencia_resuelta" || et === "INCIDENCIA_RESUELTA") ? "RESUELTA" : "ABIERTA");
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", event_type: et, incidencia_id: data.incidencia_id || "",
+      lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "", item_id: data.item_id || "",
+      codigo_reportado: data.codigo_reportado || "", match_status: data.match_status || "", codigo_ml: data.codigo_ml || "",
+      codigo_universal: data.codigo_universal || "", sku: data.sku || "", descripcion: data.descripcion || "",
+      descripcion_kame: data.descripcion_kame || data.descripcion || "", descripcion_ml: data.descripcion_ml || "",
+      familia_kame: data.familia_kame || "", maestro_match_status: data.maestro_match_status || "",
+      tipo: data.tipo || "", cantidad: data.cantidad || "", comentario: data.comentario || data.resolution_comment || "",
+      usuario: data.usuario || data.resolved_by || "", estado: estadoInc, created_at: data.created_at || data.queued_at || "",
+      resolved_at: data.resolved_at || "", resolved_by: data.resolved_by || data.usuario || "", resolution_comment: data.resolution_comment || data.comentario || "",
+      raw_json: JSON.stringify(data)
+    });
+
+    // Para rapidez en Escaneo, la app envía solo incidencia_creada.
+    // Desde este mismo evento también dejamos la auditoría estructurada,
+    // evitando una segunda llamada HTTP audit_event.
+    if (et === "incidencia_creada" || et === "INCIDENCIA_ABIERTA") {
+      const auditSh = getOrCreateSheet_(ss, "auditoria", [
+        "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "item_id", "event_type_audit", "detail",
+        "qty", "codigo_ml", "sku", "mode", "created_at", "raw_json"
+      ]);
+      const detailInc = String((data.tipo || "Incidencia") + " · " + (data.comentario || "")).trim();
+      appendObjectRow_(auditSh, {
+        received_at: new Date(), event_key: eventKey + ":AUDIT", queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+        lote_nombre: data.lote_nombre || "", item_id: data.item_id || "", event_type_audit: "INCIDENCIA_ABIERTA",
+        detail: detailInc, qty: data.cantidad || "", codigo_ml: data.codigo_ml || "", sku: data.sku || "",
+        mode: data.usuario || "", created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+      });
+    }
+  }
+
+  if (et === "aviso_operacional_creado" || et === "AVISO_OPERACIONAL_CREADO" ||
+      et === "aviso_operacional_ml_confirmado" || et === "aviso_operacional_kame_confirmado" ||
+      et === "aviso_operacional_resuelto") {
+    const sh = getOrCreateSheet_(ss, "avisos_operacionales", [
+      "received_at", "event_key", "queue_id", "event_type", "lote_id", "lote_nombre", "aviso_id", "item_id",
+      "codigo_ml", "codigo_universal", "sku", "descripcion", "tipo_aviso", "mensaje_operador",
+      "cantidad_original", "cantidad_nueva", "requiere_ajuste_ml", "requiere_ajuste_inventario",
+      "confirmado_ml", "confirmado_inventario", "estado", "usuario", "comentario", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", event_type: et, lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", aviso_id: data.aviso_id || "", item_id: data.item_id || "",
+      codigo_ml: data.codigo_ml || "", codigo_universal: data.codigo_universal || "", sku: data.sku || "",
+      descripcion: data.descripcion || "", tipo_aviso: data.tipo_aviso || "", mensaje_operador: data.mensaje_operador || "",
+      cantidad_original: data.cantidad_original || "", cantidad_nueva: data.cantidad_nueva || "",
+      requiere_ajuste_ml: data.requiere_ajuste_ml || "", requiere_ajuste_inventario: data.requiere_ajuste_inventario || "",
+      confirmado_ml: data.confirmado_ml || "", confirmado_inventario: data.confirmado_inventario || data.confirmado_kame || "",
+      estado: data.estado || "", usuario: data.usuario || data.created_by || data.confirmado_by || "", comentario: data.comentario || data.resolution_comment || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "picking_lista_creada" || et === "PICKING_LISTA_CREADA" || et === "picking_lista_impresa" ||
+      et === "PICKING_LISTA_IMPRESA" || et === "picking_lista_completada" || et === "picking_lista_anulada") {
+    const sh = getOrCreateSheet_(ss, "picking_listas", [
+      "received_at", "event_key", "queue_id", "event_type", "lote_id", "lote_nombre", "picking_list_id",
+      "picking_code", "codigo_lista", "asignado_a", "estado", "created_by", "usuario", "comentario",
+      "productos", "cantidad", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", event_type: et,
+      lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "", picking_list_id: data.picking_list_id || "",
+      picking_code: data.picking_code || data.codigo_lista || "", codigo_lista: data.codigo_lista || data.picking_code || "",
+      asignado_a: data.asignado_a || "", estado: data.estado || "", created_by: data.created_by || "", usuario: data.usuario || "",
+      comentario: data.comentario || "", productos: data.productos || ((data.items || []).length || ""), cantidad: data.cantidad || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+
+    const items = data.items || [];
+    if (items && items.length) {
+      const ish = getOrCreateSheet_(ss, "picking_items", [
+        "received_at", "event_key", "queue_id", "source_event_type", "lote_id", "lote_nombre", "picking_list_id",
+        "picking_code", "codigo_lista", "asignado_a", "estado_lista", "item_id", "codigo_ml", "codigo_universal",
+        "sku", "descripcion", "descripcion_kame", "descripcion_ml", "familia_kame", "maestro_match_status", "cantidad", "area", "nro", "created_at", "raw_json"
+      ]);
+      items.forEach(function(item) {
+        appendObjectRow_(ish, {
+          received_at: new Date(), event_key: buildEventKey_(Object.assign({}, data, { event_uid: "", item_id: item.item_id || "", sku: item.sku || "" })) + ":ITEM",
+          queue_id: data.queue_id || "", source_event_type: et, lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "",
+          picking_list_id: data.picking_list_id || "", picking_code: data.picking_code || data.codigo_lista || "",
+          codigo_lista: data.codigo_lista || data.picking_code || "", asignado_a: data.asignado_a || "", estado_lista: data.estado || "",
+          item_id: item.item_id || "", codigo_ml: item.codigo_ml || "", codigo_universal: item.codigo_universal || "",
+          sku: item.sku || "", descripcion: item.descripcion || "", descripcion_kame: item.descripcion_kame || item.descripcion || "",
+          descripcion_ml: item.descripcion_ml || "", familia_kame: item.familia_kame || "", maestro_match_status: item.maestro_match_status || "",
+          cantidad: item.cantidad || "", area: item.area || "", nro: item.nro || "",
+          created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(item)
+        });
+      });
+    }
+  }
+
+  if (et === "scan_agregado") {
+    const sh = getOrCreateSheet_(ss, "picking_validaciones", [
+      "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "item_id", "picking_list_id", "picking_code",
+      "picker_asignado", "operador_validador", "codigo_ml", "codigo_universal", "sku", "descripcion",
+      "descripcion_kame", "descripcion_ml", "familia_kame", "maestro_match_status", "cantidad",
+      "modo", "scan_primario", "scan_secundario", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", item_id: data.item_id || "", picking_list_id: data.picking_list_id || "",
+      picking_code: data.picking_code || "", picker_asignado: data.picker_asignado || "", operador_validador: data.operador_validador || "",
+      codigo_ml: data.codigo_ml || "", codigo_universal: data.codigo_universal || "", sku: data.sku || "", descripcion: data.descripcion || "",
+      descripcion_kame: data.descripcion_kame || data.descripcion || "", descripcion_ml: data.descripcion_ml || "",
+      familia_kame: data.familia_kame || "", maestro_match_status: data.maestro_match_status || "",
+      cantidad: data.cantidad || "", modo: data.modo || "", scan_primario: data.scan_primario || "", scan_secundario: data.scan_secundario || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "audit_event") {
+    const sh = getOrCreateSheet_(ss, "auditoria", [
+      "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "item_id", "event_type_audit", "detail",
+      "qty", "codigo_ml", "sku", "mode", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", item_id: data.item_id || "", event_type_audit: data.event_type_audit || data.audit_type || data.audit_event_type || data.event_type || "audit_event",
+      detail: data.detail || data.detalle || data.comentario || "", qty: data.qty || data.cantidad || "", codigo_ml: data.codigo_ml || "", sku: data.sku || "",
+      mode: data.mode || data.modo || "", created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "zpl_etiquetas_generado" || et === "ZPL_ETIQUETAS_GENERADO") {
+    const sh = getOrCreateSheet_(ss, "etiquetas_impresiones", [
+      "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "print_scope", "print_kind",
+      "block_index", "block_key", "picking_list_id", "picking_code", "asignado_a", "item_id",
+      "codigo_ml", "sku", "descripcion", "descripcion_kame", "descripcion_ml", "familia_kame", "maestro_match_status", "productos_count", "cantidad_normal", "cantidad_separadores",
+      "cantidad_total", "zpl_hash", "archivo_nombre", "usuario", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", print_scope: data.print_scope || data.scope || "", print_kind: data.print_kind || "",
+      block_index: data.block_index || "", block_key: data.block_key || "", picking_list_id: data.picking_list_id || "",
+      picking_code: data.picking_code || data.codigo_lista || "", asignado_a: data.asignado_a || "", item_id: data.item_id || "",
+      codigo_ml: data.codigo_ml || "", sku: data.sku || "", descripcion: data.descripcion || "",
+      descripcion_kame: data.descripcion_kame || "", descripcion_ml: data.descripcion_ml || "",
+      familia_kame: data.familia_kame || "", maestro_match_status: data.maestro_match_status || "",
+      productos_count: data.productos_count || "", cantidad_normal: data.cantidad_normal || data.normal_qty || "",
+      cantidad_separadores: data.cantidad_separadores || data.separator_qty || "", cantidad_total: data.cantidad_total || data.total_qty || data.cantidad || "",
+      zpl_hash: data.zpl_hash || "", archivo_nombre: data.archivo_nombre || "", usuario: data.usuario || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "postventa_full_error_creado" || et === "postventa_full_error_anulado") {
+    const sh = getOrCreateSheet_(ss, "postventa_full_errores", [
+      "received_at", "event_key", "queue_id", "event_type", "error_id", "lote_id", "lote_nombre", "item_id",
+      "codigo_ml", "codigo_universal", "sku", "descripcion", "descripcion_kame", "descripcion_ml", "familia_kame", "maestro_match_status", "tipo_error", "cantidad_solicitada",
+      "cantidad_preparada", "cantidad_reportada_full", "cantidad_diferencia", "cantidad_afectada",
+      "comentario", "usuario", "estado", "created_at", "anulado_at", "anulado_by", "anulado_motivo", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", event_type: et,
+      error_id: data.error_id || "", lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "",
+      item_id: data.item_id || "", codigo_ml: data.codigo_ml || "", codigo_universal: data.codigo_universal || "",
+      sku: data.sku || "", descripcion: data.descripcion || "", descripcion_kame: data.descripcion_kame || data.descripcion || "",
+      descripcion_ml: data.descripcion_ml || "", familia_kame: data.familia_kame || "", maestro_match_status: data.maestro_match_status || "",
+      tipo_error: data.tipo_error || data.tipo || "",
+      cantidad_solicitada: data.cantidad_solicitada || "", cantidad_preparada: data.cantidad_preparada || "",
+      cantidad_reportada_full: data.cantidad_reportada_full || "", cantidad_diferencia: data.cantidad_diferencia || "",
+      cantidad_afectada: data.cantidad_afectada || data.cantidad || "", comentario: data.comentario || "",
+      usuario: data.usuario || data.anulado_by || "", estado: data.estado || (et === "postventa_full_error_anulado" ? "ANULADO" : "ACTIVO"),
+      created_at: data.created_at || data.queued_at || "", anulado_at: data.anulado_at || "", anulado_by: data.anulado_by || "",
+      anulado_motivo: data.anulado_motivo || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "postventa_full_revision_cerrada") {
+    const sh = getOrCreateSheet_(ss, "postventa_full_cierres", [
+      "received_at", "event_key", "queue_id", "cierre_id", "lote_id", "lote_nombre",
+      "total_errores", "errores_activos", "unidades_afectadas", "cerrado_por", "comentario", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", cierre_id: data.cierre_id || "",
+      lote_id: data.lote_id || "", lote_nombre: data.lote_nombre || "", total_errores: data.total_errores || "",
+      errores_activos: data.errores_activos || "", unidades_afectadas: data.unidades_afectadas || "",
+      cerrado_por: data.cerrado_por || data.usuario || "", comentario: data.comentario || "",
+      created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  if (et === "reserva_kame_generada") {
+    const sh = getOrCreateSheet_(ss, "reservas_kame", [
+      "received_at", "event_key", "queue_id", "lote_id", "lote_nombre", "folio", "folio_auto", "ficha", "fecha",
+      "glosa", "bodega_salida", "unidad_negocio", "sku_count", "unidades_total", "productos_full",
+      "packs_expandidos", "lineas_csv", "archivo_nombre", "csv_hash", "usuario", "created_at", "raw_json"
+    ]);
+    appendObjectRow_(sh, {
+      received_at: new Date(), event_key: eventKey, queue_id: data.queue_id || "", lote_id: data.lote_id || "",
+      lote_nombre: data.lote_nombre || "", folio: data.folio || "", folio_auto: data.folio_auto || "", ficha: data.ficha || "",
+      fecha: data.fecha || "", glosa: data.glosa || "", bodega_salida: data.bodega_salida || "", unidad_negocio: data.unidad_negocio || "",
+      sku_count: data.sku_count || "", unidades_total: data.unidades_total || "", productos_full: data.productos_full || "",
+      packs_expandidos: data.packs_expandidos || "", lineas_csv: data.lineas_csv || "", archivo_nombre: data.archivo_nombre || "",
+      csv_hash: data.csv_hash || "", usuario: data.usuario || "", created_at: data.created_at || data.queued_at || "", raw_json: JSON.stringify(data)
+    });
+  }
+
+  // No se escribe reserva_kame_item producto por producto.
+  // La reserva Kame queda como evento resumen + archivo_nombre + csv_hash + totales.
+}
+
+function appendMainEvents_(ss, events) {
+  const sh = ss.getSheetByName("eventos");
+  if (!sh) return;
+  const rows = sheetToObjects_(sh);
+  rows.forEach(function(row) {
+    const ev = parseRawMerge_(row);
+    events.push(ev);
+  });
+}
+
+function appendStructuredEvents_(ss, events) {
+  appendLoteItems_(ss, events);
+  appendStructuredPicking_(ss, events);
+  appendStructuredScans_(ss, events);
+  appendStructuredAudit_(ss, events);
+  appendStructuredLabels_(ss, events);
+  appendStructuredPostventa_(ss, events);
+  appendStructuredReservas_(ss, events);
+}
+
+function appendLoteItems_(ss, events) {
+  const sh = ss.getSheetByName("lote_items");
+  if (!sh) return;
+  sheetToObjects_(sh).forEach(function(r) {
+    events.push({
+      event_type: "lote_item",
+      queue_id: r.queue_id || "STRUCT_LOTE_ITEM",
+      queued_at: r.created_at || r.received_at || "",
+      created_at: r.created_at || r.received_at || "",
+      lote_id: r.lote_id || "",
+      lote_nombre: r.lote_nombre || "",
+      item_id: r.item_id || "",
+      area: r.area || "",
+      nro: r.nro || "",
+      codigo_ml: r.codigo_ml || "",
+      codigo_universal: r.codigo_universal || "",
+      sku: r.sku || "",
+      descripcion: r.descripcion || "",
+      descripcion_kame: r.descripcion_kame || r.descripcion || "",
+      descripcion_ml: r.descripcion_ml || "",
+      descripcion_fuente: r.descripcion_fuente || "",
+      familia_kame: r.familia_kame || "",
+      maestro_match_status: r.maestro_match_status || "",
+      unidades: r.unidades || "",
+      identificacion: r.identificacion || "",
+      vence: r.vence || "",
+      instrucciones: r.instrucciones || "",
+      dia: r.dia || "",
+      hora: r.hora || "",
+      event_key: r.event_key || buildEventKey_(r)
+    });
+  });
+}
+
+function appendStructuredPicking_(ss, events) {
+  const lsh = ss.getSheetByName("picking_listas");
+  const ish = ss.getSheetByName("picking_items");
+  if (!lsh && !ish) return;
+
+  const listRows = lsh ? sheetToObjects_(lsh) : [];
+  const itemRows = ish ? sheetToObjects_(ish) : [];
+  const itemsByCode = {};
+  itemRows.forEach(function(r) {
+    const key = pickingKey_(r);
+    if (!key) return;
+    if (!itemsByCode[key]) itemsByCode[key] = [];
+    itemsByCode[key].push({
+      item_id: r.item_id || "",
+      codigo_ml: r.codigo_ml || "",
+      codigo_universal: r.codigo_universal || "",
+      sku: r.sku || "",
+      descripcion: r.descripcion || "",
+      descripcion_kame: r.descripcion_kame || r.descripcion || "",
+      descripcion_ml: r.descripcion_ml || "",
+      familia_kame: r.familia_kame || "",
+      maestro_match_status: r.maestro_match_status || "",
+      cantidad: r.cantidad || "",
+      area: r.area || "",
+      nro: r.nro || ""
+    });
+  });
+
+  const seenListKeys = {};
+  listRows.forEach(function(r) {
+    const key = pickingKey_(r);
+    if (!key) return;
+    seenListKeys[key] = true;
+    const et = r.event_type || eventTypeFromPickingStatus_(r.estado || "CREADA");
+    events.push({
+      event_type: et,
+      queue_id: r.queue_id || "STRUCT_PICKING_LISTA",
+      queued_at: r.created_at || r.received_at || "",
+      created_at: r.created_at || r.received_at || "",
+      lote_id: r.lote_id || "",
+      lote_nombre: r.lote_nombre || "",
+      picking_list_id: r.picking_list_id || "",
+      picking_code: r.picking_code || r.codigo_lista || "",
+      codigo_lista: r.codigo_lista || r.picking_code || "",
+      asignado_a: r.asignado_a || "",
+      estado: r.estado || "",
+      created_by: r.created_by || "",
+      usuario: r.usuario || "",
+      comentario: r.comentario || "",
+      productos: r.productos || "",
+      cantidad: r.cantidad || "",
+      items: itemsByCode[key] || [],
+      event_key: r.event_key || buildEventKey_(r)
+    });
+  });
+
+  // Si hay picking_items pero faltó picking_listas, crear lista sintética recuperable.
+  Object.keys(itemsByCode).forEach(function(key) {
+    if (seenListKeys[key]) return;
+    const first = itemRows.find(function(r) { return pickingKey_(r) === key; }) || {};
+    events.push({
+      event_type: "picking_lista_creada",
+      queue_id: first.queue_id || "STRUCT_PICKING_ITEMS_ONLY",
+      queued_at: first.created_at || first.received_at || "",
+      created_at: first.created_at || first.received_at || "",
+      lote_id: first.lote_id || "",
+      lote_nombre: first.lote_nombre || "",
+      picking_list_id: first.picking_list_id || "",
+      picking_code: first.picking_code || first.codigo_lista || "",
+      codigo_lista: first.codigo_lista || first.picking_code || "",
+      asignado_a: first.asignado_a || "",
+      estado: first.estado_lista || "CREADA",
+      items: itemsByCode[key],
+      event_key: "STRUCT_PICKING_ITEMS_ONLY:" + key
+    });
+  });
+}
+
+function appendStructuredScans_(ss, events) {
+  const sh = ss.getSheetByName("picking_validaciones");
+  if (!sh) return;
+  sheetToObjects_(sh).forEach(function(r) {
+    events.push({
+      event_type: "scan_agregado",
+      queue_id: r.queue_id || "STRUCT_SCAN",
+      queued_at: r.created_at || r.received_at || "",
+      created_at: r.created_at || r.received_at || "",
+      lote_id: r.lote_id || "",
+      lote_nombre: r.lote_nombre || "",
+      item_id: r.item_id || "",
+      picking_list_id: r.picking_list_id || "",
+      picking_code: r.picking_code || "",
+      picker_asignado: r.picker_asignado || "",
+      operador_validador: r.operador_validador || "",
+      codigo_ml: r.codigo_ml || "",
+      codigo_universal: r.codigo_universal || "",
+      sku: r.sku || "",
+      descripcion: r.descripcion || "",
+      descripcion_kame: r.descripcion_kame || r.descripcion || "",
+      descripcion_ml: r.descripcion_ml || "",
+      familia_kame: r.familia_kame || "",
+      maestro_match_status: r.maestro_match_status || "",
+      cantidad: r.cantidad || "",
+      modo: r.modo || "PDA",
+      scan_primario: r.scan_primario || "",
+      scan_secundario: r.scan_secundario || "",
+      event_key: r.event_key || buildEventKey_(r)
+    });
+  });
+}
+
+function appendStructuredAudit_(ss, events) {
+  const sh = ss.getSheetByName("auditoria");
+  if (!sh) return;
+  sheetToObjects_(sh).forEach(function(r) {
+    events.push({
+      event_type: "audit_event",
+      queue_id: r.queue_id || "STRUCT_AUDIT",
+      queued_at: r.created_at || r.received_at || "",
+      created_at: r.created_at || r.received_at || "",
+      lote_id: r.lote_id || "",
+      lote_nombre: r.lote_nombre || "",
+      item_id: r.item_id || "",
+      detail: r.detail || "",
+      qty: r.qty || "",
+      codigo_ml: r.codigo_ml || "",
+      sku: r.sku || "",
+      mode: r.mode || "",
+      event_key: r.event_key || buildEventKey_(r)
+    });
+  });
+}
+
+function appendStructuredLabels_(ss, events) {
+  const sh = ss.getSheetByName("etiquetas_impresiones");
+  if (!sh) return;
+  sheetToObjects_(sh).forEach(function(r) {
+    events.push({
+      event_type: "zpl_etiquetas_generado",
+      queue_id: r.queue_id || "STRUCT_ZPL_ETIQUETAS",
+      queued_at: r.created_at || r.received_at || "",
+      created_at: r.created_at || r.received_at || "",
+      lote_id: r.lote_id || "",
+      lote_nombre: r.lote_nombre || "",
+      print_scope: r.print_scope || "",
+      print_kind: r.print_kind || "",
+      block_index: r.block_index || "",
+      block_key: r.block_key || "",
+      picking_list_id: r.picking_list_id || "",
+      picking_code: r.picking_code || "",
+      asignado_a: r.asignado_a || "",
+      item_id: r.item_id || "",
+      codigo_ml: r.codigo_ml || "",
+      sku: r.sku || "",
+      descripcion: r.descripcion || "",
+      descripcion_kame: r.descripcion_kame || "",
+      descripcion_ml: r.descripcion_ml || "",
+      familia_kame: r.familia_kame || "",
+      maestro_match_status: r.maestro_match_status || "",
+      productos_count: r.productos_count || "",
+      cantidad_normal: r.cantidad_normal || "",
+      cantidad_separadores: r.cantidad_separadores || "",
+      cantidad_total: r.cantidad_total || "",
+      zpl_hash: r.zpl_hash || "",
+      archivo_nombre: r.archivo_nombre || "",
+      usuario: r.usuario || "",
+      event_key: r.event_key || buildEventKey_(r)
+    });
+  });
+}
+
+
+function appendStructuredPostventa_(ss, events) {
+  const esh = ss.getSheetByName("postventa_full_errores");
+  if (esh) {
+    sheetToObjects_(esh).forEach(function(r) {
+      events.push({
+        event_type: r.event_type || (String(r.estado || "").toUpperCase() === "ANULADO" ? "postventa_full_error_anulado" : "postventa_full_error_creado"),
+        queue_id: r.queue_id || "STRUCT_POSTVENTA_FULL_ERROR",
+        queued_at: r.created_at || r.received_at || "",
+        created_at: r.created_at || r.received_at || "",
+        error_id: r.error_id || "",
+        lote_id: r.lote_id || "",
+        lote_nombre: r.lote_nombre || "",
+        item_id: r.item_id || "",
+        codigo_ml: r.codigo_ml || "",
+        codigo_universal: r.codigo_universal || "",
+        sku: r.sku || "",
+        descripcion: r.descripcion || "",
+        descripcion_kame: r.descripcion_kame || r.descripcion || "",
+        descripcion_ml: r.descripcion_ml || "",
+        familia_kame: r.familia_kame || "",
+        maestro_match_status: r.maestro_match_status || "",
+        tipo_error: r.tipo_error || "",
+        tipo: r.tipo_error || "",
+        cantidad_solicitada: r.cantidad_solicitada || "",
+        cantidad_preparada: r.cantidad_preparada || "",
+        cantidad_reportada_full: r.cantidad_reportada_full || "",
+        cantidad_diferencia: r.cantidad_diferencia || "",
+        cantidad_afectada: r.cantidad_afectada || "",
+        cantidad: r.cantidad_afectada || "",
+        comentario: r.comentario || r.anulado_motivo || "",
+        usuario: r.usuario || r.anulado_by || "",
+        estado: r.estado || "",
+        anulado_at: r.anulado_at || "",
+        anulado_by: r.anulado_by || "",
+        anulado_motivo: r.anulado_motivo || "",
+        event_key: r.event_key || buildEventKey_(r)
+      });
+    });
+  }
+  const csh = ss.getSheetByName("postventa_full_cierres");
+  if (csh) {
+    sheetToObjects_(csh).forEach(function(r) {
+      events.push({
+        event_type: "postventa_full_revision_cerrada",
+        queue_id: r.queue_id || "STRUCT_POSTVENTA_FULL_CIERRE",
+        queued_at: r.created_at || r.received_at || "",
+        created_at: r.created_at || r.received_at || "",
+        cierre_id: r.cierre_id || "",
+        lote_id: r.lote_id || "",
+        lote_nombre: r.lote_nombre || "",
+        total_errores: r.total_errores || "",
+        errores_activos: r.errores_activos || "",
+        unidades_afectadas: r.unidades_afectadas || "",
+        cerrado_por: r.cerrado_por || "",
+        comentario: r.comentario || "",
+        event_key: r.event_key || buildEventKey_(r)
+      });
+    });
+  }
+}
+
+function appendStructuredReservas_(ss, events) {
+  const sh = ss.getSheetByName("reservas_kame");
+  if (!sh) return;
+  sheetToObjects_(sh).forEach(function(r) {
+    events.push({
+      event_type: "reserva_kame_generada",
+      queue_id: r.queue_id || "STRUCT_RESERVA_KAME",
+      queued_at: r.created_at || r.received_at || "",
+      created_at: r.created_at || r.received_at || "",
+      lote_id: r.lote_id || "",
+      lote_nombre: r.lote_nombre || "",
+      folio: r.folio || "",
+      folio_auto: r.folio_auto || "",
+      ficha: r.ficha || "",
+      fecha: r.fecha || "",
+      glosa: r.glosa || "",
+      bodega_salida: r.bodega_salida || "",
+      unidad_negocio: r.unidad_negocio || "",
+      sku_count: r.sku_count || "",
+      unidades_total: r.unidades_total || "",
+      productos_full: r.productos_full || "",
+      packs_expandidos: r.packs_expandidos || "",
+      lineas_csv: r.lineas_csv || "",
+      archivo_nombre: r.archivo_nombre || "",
+      csv_hash: r.csv_hash || "",
+      usuario: r.usuario || "",
+      event_key: r.event_key || buildEventKey_(r)
+    });
+  });
+}
+
+function eventTypeFromPickingStatus_(estado) {
+  const e = String(estado || "").toUpperCase();
+  if (e === "IMPRESA") return "picking_lista_impresa";
+  if (e === "COMPLETADA") return "picking_lista_completada";
+  if (e === "ANULADA") return "picking_lista_anulada";
+  return "picking_lista_creada";
+}
+
+function pickingKey_(r) {
+  const lote = String(r.lote_id || "").trim();
+  const code = String(r.picking_code || r.codigo_lista || r.picking_list_id || "").trim();
+  if (!lote || !code) return "";
+  return lote + "|" + code;
+}
+
+function buildEventKey_(data) {
+  data = data || {};
+  const eventUid = String(data.event_uid || "").trim();
+  if (eventUid) return "UID:" + eventUid;
+
+  return [
+    data.event_type || data.source_event_type || "",
+    data.queue_id || "",
+    data.queued_at || "",
+    data.created_at || "",
+    data.lote_id || "",
+    data.picking_code || data.codigo_lista || "",
+    data.picking_list_id || "",
+    data.print_scope || data.scope || "",
+    data.print_kind || "",
+    data.block_index || "",
+    data.block_key || "",
+    data.zpl_hash || "",
+    data.item_id || "",
+    data.codigo_ml || "",
+    data.codigo_universal || "",
+    data.sku || "",
+    data.cantidad || "",
+    data.tipo || data.tipo_aviso || "",
+    data.comentario || data.detail || ""
+  ].map(function(x) { return String(x === null || x === undefined ? "" : x).trim(); }).join("|");
+}
+
+function eventAlreadyExists_(ss, eventos, eventKey) {
+  if (!eventKey) return false;
+  const keySheet = getOrCreateSheet_(ss, "event_keys", EVENT_KEY_HEADERS);
+
+  // No reconstruimos el índice completo dentro de doPost.
+  // La primera versión podía demorar demasiado y causar timeout en Streamlit,
+  // aunque Sheets sí alcanzara a escribir el evento.
+  // Para la operación diaria basta revisar el índice y las últimas filas de eventos.
+  return findEventKeyInSheet_(keySheet, eventKey) || findEventKeyInRecentEvents_(eventos, eventKey, 500);
+}
+
+function rememberEventKey_(ss, data, eventKey) {
+  if (!eventKey) return;
+  const keySheet = getOrCreateSheet_(ss, "event_keys", EVENT_KEY_HEADERS);
+  if (findEventKeyInSheet_(keySheet, eventKey)) return;
+  appendObjectRow_(keySheet, {
+    event_key: eventKey,
+    event_uid: data.event_uid || "",
+    event_source: data.event_source || "",
+    first_seen_at: new Date(),
+    event_type: data.event_type || data.source_event_type || "",
+    lote_id: data.lote_id || "",
+    item_id: data.item_id || "",
+    sku: data.sku || "",
+    created_at: data.created_at || data.queued_at || ""
+  });
+}
+
+function ensureEventKeyIndex_(eventos, keySheet, force) {
+  if (!eventos || !keySheet) return 0;
+  if (!force && keySheet.getLastRow() >= 2) return 0;
+  if (eventos.getLastRow() < 2) return 0;
+
+  const eventRows = sheetToObjects_(eventos);
+  const headers = getHeaders_(keySheet);
+  const rows = [];
+  const seen = {};
+
+  eventRows.forEach(function(r) {
+    const merged = parseRawMerge_(r);
+    const key = String(merged.event_key || buildEventKey_(merged) || "").trim();
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    const obj = {
+      event_key: key,
+      event_uid: merged.event_uid || "",
+      event_source: merged.event_source || "",
+      first_seen_at: merged.received_at || new Date(),
+      event_type: merged.event_type || merged.source_event_type || "",
+      lote_id: merged.lote_id || "",
+      item_id: merged.item_id || "",
+      sku: merged.sku || "",
+      created_at: merged.created_at || merged.queued_at || ""
+    };
+    rows.push(headers.map(function(h) {
+      const v = obj[h];
+      return v === undefined || v === null ? "" : v;
+    }));
+  });
+
+  if (!rows.length) return 0;
+
+  const startRow = keySheet.getLastRow() + 1;
+  keySheet.getRange(startRow, 1, rows.length, headers.length).setValues(rows);
+  return rows.length;
+}
+
+function findEventKeyInRecentEvents_(sheet, eventKey, maxRows) {
+  if (!sheet || !eventKey) return false;
+  const headers = getHeaders_(sheet);
+  const idx = headers.indexOf("event_key");
+  const lastRow = sheet.getLastRow();
+  if (idx < 0 || lastRow < 2) return false;
+
+  const n = Math.min(Number(maxRows || 500), lastRow - 1);
+  const start = Math.max(2, lastRow - n + 1);
+  const values = sheet.getRange(start, idx + 1, n, 1).getValues().flat();
+  return values.map(String).indexOf(String(eventKey)) !== -1;
+}
+
+function findEventKeyInSheet_(sheet, eventKey) {
+  if (!sheet || !eventKey) return false;
+  const headers = getHeaders_(sheet);
+  const idx = headers.indexOf("event_key");
+  const lastRow = sheet.getLastRow();
+  if (idx < 0 || lastRow < 2) return false;
+  const range = sheet.getRange(2, idx + 1, lastRow - 1, 1);
+  return range.createTextFinder(String(eventKey)).matchEntireCell(true).findNext() !== null;
+}
+
+function getOrCreateSheet_(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0) sh.appendRow(headers);
+  ensureHeaders_(sh, headers);
+  return sh;
+}
+
+function ensureHeaders_(sheet, headers) {
+  const current = getHeaders_(sheet);
+  if (current.length === 0) {
+    sheet.appendRow(headers);
+    return;
+  }
+  headers.forEach(function(h) {
+    if (current.indexOf(h) === -1) {
+      sheet.getRange(1, sheet.getLastColumn() + 1).setValue(h);
+      current.push(h);
+    }
+  });
+}
+
+function getHeaders_(sheet) {
+  if (!sheet || sheet.getLastRow() < 1 || sheet.getLastColumn() < 1) return [];
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h || "").trim(); });
+}
+
+function appendObjectRow_(sheet, obj) {
+  const headers = getHeaders_(sheet);
+  const row = headers.map(function(h) {
+    const v = obj[h];
+    return v === undefined || v === null ? "" : v;
+  });
+  sheet.appendRow(row);
+}
+
+function sheetToObjects_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0].map(function(h) { return String(h || "").trim(); });
+  const out = [];
+  for (let r = 1; r < values.length; r++) {
+    const obj = {};
+    headers.forEach(function(h, i) { obj[h] = values[r][i]; });
+    out.push(obj);
+  }
+  return out;
+}
+
+function parseRawMerge_(row) {
+  const out = Object.assign({}, row || {});
+  if (out.raw_json) {
+    try {
+      const parsed = JSON.parse(out.raw_json);
+      if (parsed && typeof parsed === "object") {
+        Object.keys(parsed).forEach(function(k) { out[k] = parsed[k]; });
+      }
+    } catch (err) {}
+  }
+  return out;
+}
+
+function logError_(source, err, e) {
+  try {
+    const ss = SpreadsheetApp.openById(ERRORS_SPREADSHEET_ID);
+    const sh = getOrCreateSheet_(ss, "errores", ["created_at", "source", "error", "payload"]);
+    appendObjectRow_(sh, {
+      created_at: new Date(),
+      source: source,
+      error: String(err),
+      payload: e && e.postData ? e.postData.contents : JSON.stringify(e || {})
+    });
+  } catch (innerErr) {}
+}
+
+function json_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
