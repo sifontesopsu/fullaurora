@@ -164,6 +164,54 @@ def is_supermercado(v) -> bool:
     return "SUPERMERCADO" in clean_text(v).upper()
 
 
+def requiere_revision_vencimiento(item) -> bool:
+    """Detecta si el operador debe revisar la fecha de vencimiento del producto.
+
+    Fuente principal: columna ``vence`` ya calculada al cargar PDF/Excel.
+    Respaldo defensivo: texto original de ``instrucciones`` para lotes antiguos o
+    restaurados donde la marca ``vence`` pudiera venir vacía.
+    """
+    if item is None:
+        return False
+
+    def value(field: str):
+        try:
+            if hasattr(item, "get"):
+                return item.get(field, "")
+        except Exception:
+            pass
+        try:
+            return item[field]
+        except Exception:
+            return ""
+
+    vence_norm = normalize_header(value("vence"))
+    vence_marcado = bool(vence_norm) and vence_norm not in {
+        "no", "n a", "na", "0", "false", "sin vencimiento", "no aplica"
+    }
+
+    instrucciones_norm = normalize_header(value("instrucciones"))
+    instruccion_vencimiento = (
+        "fecha de vencimiento debe estar impresa" in instrucciones_norm
+        and "90 dias" in instrucciones_norm
+    )
+    return vence_marcado or instruccion_vencimiento
+
+
+def render_revision_vencimiento_scan(item) -> bool:
+    """Muestra en el PDA una advertencia informativa, sin bloquear el escaneo."""
+    if not requiere_revision_vencimiento(item):
+        return False
+
+    st.warning(
+        "⚠️ REVISAR FECHA DE VENCIMIENTO\n\n"
+        "Verifica cada unidad: la fecha debe estar impresa en el empaque primario, "
+        "ser legible, no estar escrita a mano y ser mayor a 90 días desde la cita "
+        "de envío agendada."
+    )
+    return True
+
+
 # ============================================================
 # Base de datos nueva v3
 # ============================================================
@@ -11256,6 +11304,10 @@ elif page == "Escaneo":
             # nombre y cantidades. No los duplicamos para evitar parpadeos y confusión en PDA.
             if item_tiene_incidencia_abierta(active_lote, int(candidate["id"])):
                 st.warning("⚠️ ESTE PRODUCTO TIENE INCIDENCIAS ABIERTAS. Revisa Supervisor antes de cerrar el lote.")
+
+            # Advertencia informativa de vencimiento. Aplica tanto a productos normales
+            # como SUPERMERCADO y no modifica ni bloquea el flujo de cantidades.
+            render_revision_vencimiento_scan(candidate)
 
             # Si ya mostramos el aviso al validar Código ML, no lo duplicamos después
             # de validar SKU/EAN. Si el candidato viene de otro flujo, lo mostramos aquí.
