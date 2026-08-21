@@ -540,6 +540,8 @@ def init_db():
         ensure_column(c, "incidencias", "codigo_universal", "TEXT")
         ensure_column(c, "incidencias", "sku", "TEXT")
         ensure_column(c, "incidencias", "descripcion", "TEXT")
+        # Identidad estable de entidades que pueden sobrevivir a reinicios de SQLite.
+        ensure_column(c, "incidencias", "backup_entity_key", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_reason", "TEXT")
         ensure_column(c, "label_blocks", "last_reprint_user", "TEXT")
         ensure_column(c, "scans", "operador_validador", "TEXT")
@@ -565,6 +567,7 @@ def init_db():
         ensure_column(c, "avisos_operacionales", "confirmado_ml_by", "TEXT")
         ensure_column(c, "avisos_operacionales", "confirmado_inventario_at", "TEXT")
         ensure_column(c, "avisos_operacionales", "confirmado_inventario_by", "TEXT")
+        ensure_column(c, "avisos_operacionales", "backup_entity_key", "TEXT")
         # La reserva Kame se registra como archivo generado/resumen, no producto por producto.
         ensure_column(c, "reservas_kame", "csv_hash", "TEXT")
         ensure_column(c, "postventa_full_errores", "codigo_ml", "TEXT")
@@ -580,6 +583,7 @@ def init_db():
         ensure_column(c, "postventa_full_errores", "anulado_at", "TEXT")
         ensure_column(c, "postventa_full_errores", "anulado_by", "TEXT")
         ensure_column(c, "postventa_full_errores", "anulado_motivo", "TEXT")
+        ensure_column(c, "postventa_full_errores", "backup_entity_key", "TEXT")
         ensure_column(c, "picking_list_items", "descripcion_kame", "TEXT")
         ensure_column(c, "picking_list_items", "descripcion_ml", "TEXT")
         ensure_column(c, "picking_list_items", "familia_kame", "TEXT")
@@ -591,6 +595,9 @@ def init_db():
         ensure_column(c, "label_prints", "descripcion_ml", "TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_lotes_backup_key ON lotes (backup_lote_key)")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_incidencias_backup_entity_key ON incidencias (backup_entity_key) WHERE COALESCE(backup_entity_key,'') <> ''")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_avisos_backup_entity_key ON avisos_operacionales (backup_entity_key) WHERE COALESCE(backup_entity_key,'') <> ''")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_postventa_backup_entity_key ON postventa_full_errores (backup_entity_key) WHERE COALESCE(backup_entity_key,'') <> ''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_sku ON items (lote_id, sku)")
@@ -2484,6 +2491,49 @@ def make_backup_lote_key(nombre: str, archivo: str, hoja: str, created_at: str) 
         clean_text(created_at),
     ])
     return "LKEY-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def new_backup_entity_key(prefix: str = "EKEY") -> str:
+    """Crea una identidad estable para una entidad operativa independiente del id SQLite."""
+    prefix = re.sub(r"[^A-Z0-9]+", "", clean_text(prefix).upper()) or "EKEY"
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def historical_backup_entity_key(prefix: str, lote_key: str, ev: dict, legacy_id_field: str = "") -> str:
+    """Identidad determinística para eventos antiguos que todavía no traen backup_entity_key."""
+    explicit = clean_text((ev or {}).get("backup_entity_key", ""))
+    if explicit:
+        return explicit
+    parts = [
+        clean_text(prefix).upper(),
+        clean_text(lote_key),
+        clean_text((ev or {}).get(legacy_id_field, "")) if legacy_id_field else "",
+        clean_text((ev or {}).get("created_at", "")) or clean_text((ev or {}).get("queued_at", "")) or clean_text((ev or {}).get("received_at", "")),
+        norm_code((ev or {}).get("codigo_ml", "")),
+        norm_code((ev or {}).get("codigo_universal", "")),
+        norm_code((ev or {}).get("sku", "")),
+        clean_text((ev or {}).get("tipo", "")) or clean_text((ev or {}).get("tipo_aviso", "")) or clean_text((ev or {}).get("tipo_error", "")),
+    ]
+    raw = "|".join(parts)
+    return f"{clean_text(prefix).upper() or 'EKEY'}-H" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:28]
+
+
+def ensure_row_backup_entity_key(table: str, row_id: int, prefix: str) -> str:
+    """Obtiene/crea una llave estable para filas locales anteriores a esta migración."""
+    allowed = {"incidencias", "avisos_operacionales", "postventa_full_errores"}
+    if table not in allowed:
+        raise ValueError("Tabla no autorizada para backup_entity_key")
+    with db() as c:
+        row = c.execute(f"SELECT backup_entity_key FROM {table} WHERE id=?", (int(row_id),)).fetchone()
+        if not row:
+            return ""
+        current = clean_text(row["backup_entity_key"] if "backup_entity_key" in row.keys() else "")
+        if current:
+            return current
+        key = new_backup_entity_key(prefix)
+        c.execute(f"UPDATE {table} SET backup_entity_key=? WHERE id=?", (key, int(row_id)))
+        c.commit()
+    return key
 
 
 def ensure_lote_backup_key(lote_id: int, lote: dict | None = None) -> str:
@@ -5890,6 +5940,7 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
 
     snap = _snapshot_codigo_incidencia(codigo_reportado, item)
     now = now_cl().isoformat(timespec="seconds")
+    backup_entity_key = new_backup_entity_key("INC")
     detail_clean = f"{tipo_clean} · {comentario_clean}"
     if clean_text(snap.get("match_status")) == "NO_MATCH_CODE":
         detail_clean = f"{detail_clean} · Código reportado: {clean_text(snap.get('codigo_reportado'))} · SIN MATCH EN LOTE"
@@ -5899,8 +5950,8 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
             """
             INSERT INTO incidencias
             (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
-             codigo_ml, codigo_universal, sku, descripcion)
-            VALUES (?, ?, ?, ?, ?, ?, 'ABIERTA', ?, ?, ?, ?, ?)
+             codigo_ml, codigo_universal, sku, descripcion, backup_entity_key)
+            VALUES (?, ?, ?, ?, ?, ?, 'ABIERTA', ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(lote_id),
@@ -5914,6 +5965,7 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
                 norm_code(snap.get("codigo_universal", "")),
                 norm_code(snap.get("sku", "")),
                 clean_text(snap.get("descripcion", "")),
+                backup_entity_key,
             ),
         )
         incidencia_id = int(cur.lastrowid)
@@ -5941,6 +5993,7 @@ def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentari
     incidencia_payload = {
         **lote_payload,
         "incidencia_id": incidencia_id,
+        "backup_entity_key": backup_entity_key,
         "item_id": item_id_clean or "",
         "codigo_ml": norm_code(snap.get("codigo_ml", "")),
         "codigo_universal": norm_code(snap.get("codigo_universal", "")),
@@ -6057,10 +6110,12 @@ def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
         )
         c.commit()
 
+    backup_entity_key = clean_text(inc_dict.get("backup_entity_key", "")) or ensure_row_backup_entity_key("incidencias", int(incidencia_id), "INC")
     lote_payload = build_lote_payload(int(inc_dict["lote_id"]))
     incidencia_payload = {
         **lote_payload,
         "incidencia_id": int(incidencia_id),
+        "backup_entity_key": backup_entity_key,
         "item_id": int(inc_dict["item_id"]) if inc_dict.get("item_id") else "",
         "codigo_ml": norm_code(inc_dict.get("codigo_ml", "")),
         "codigo_universal": norm_code(inc_dict.get("codigo_universal", "")),
@@ -6402,6 +6457,7 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
         item = dict(row)
 
     now = now_cl().isoformat(timespec="seconds")
+    backup_entity_key = new_backup_entity_key("AV")
     cantidad_original = int(item.get("unidades") or 0)
     try:
         cantidad_nueva_int = int(cantidad_nueva) if clean_text(cantidad_nueva) != "" else None
@@ -6416,15 +6472,15 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
             (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
              tipo_aviso, mensaje_operador, cantidad_original, cantidad_nueva,
              requiere_ajuste_ml, requiere_ajuste_inventario, confirmado_ml, confirmado_inventario,
-             visible_operador, estado, comentario_interno, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?, ?, ?)
+             visible_operador, estado, comentario_interno, created_by, created_at, backup_entity_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?, ?, ?, ?)
             """,
             (
                 int(lote_id), int(item_id), norm_code(item.get("codigo_ml", "")), norm_code(item.get("codigo_universal", "")),
                 norm_code(item.get("sku", "")), clean_text(item.get("descripcion", "")), tipo_aviso, mensaje_operador,
                 cantidad_original, cantidad_nueva_int, 1 if requiere_conf else 0, 1 if requiere_conf else 0,
                 1 if confirmado_ml else 0, 1 if confirmado_inventario else 0, 1 if visible_operador else 0,
-                comentario_interno, created_by, now,
+                comentario_interno, created_by, now, backup_entity_key,
             ),
         )
         aviso_id = int(cur.lastrowid)
@@ -6461,6 +6517,7 @@ def create_aviso_operacional(lote_id: int, item_id: int, tipo_aviso: str, mensaj
     enqueue_backup_event("aviso_operacional_creado", {
         **build_lote_payload(lote_id),
         "aviso_id": aviso_id,
+        "backup_entity_key": backup_entity_key,
         "item_id": int(item_id),
         "codigo_ml": norm_code(item.get("codigo_ml", "")),
         "codigo_universal": norm_code(item.get("codigo_universal", "")),
@@ -6515,9 +6572,11 @@ def resolve_aviso_operacional(aviso_id: int, resolved_by: str, resolution_commen
         )
         c.commit()
 
+    backup_entity_key = clean_text(aviso.get("backup_entity_key", "")) or ensure_row_backup_entity_key("avisos_operacionales", int(aviso_id), "AV")
     enqueue_backup_event("aviso_operacional_resuelto", {
         **build_lote_payload(int(aviso["lote_id"])),
         "aviso_id": int(aviso_id),
+        "backup_entity_key": backup_entity_key,
         "item_id": int(aviso["item_id"]),
         "codigo_ml": norm_code(aviso.get("codigo_ml", "")),
         "codigo_universal": norm_code(aviso.get("codigo_universal", "")),
@@ -6590,9 +6649,11 @@ def confirmar_tarea_externa_aviso(aviso_id: int, tarea: str, usuario: str):
             msg = "Inventario Kame confirmado."
         c.commit()
 
+    backup_entity_key = clean_text(aviso.get("backup_entity_key", "")) or ensure_row_backup_entity_key("avisos_operacionales", int(aviso_id), "AV")
     enqueue_backup_event(event_type, {
         **build_lote_payload(int(aviso["lote_id"])),
         "aviso_id": int(aviso_id),
+        "backup_entity_key": backup_entity_key,
         "item_id": int(aviso["item_id"]),
         "codigo_ml": norm_code(aviso.get("codigo_ml", "")),
         "codigo_universal": norm_code(aviso.get("codigo_universal", "")),
@@ -8189,28 +8250,37 @@ def make_sheet_lote_scope_key(lote_id, lote_nombre="", archivo="", hoja="") -> s
     return "SCOPE-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def backup_lote_scope_key(backup_lote_key: str) -> str:
+    key = clean_text(backup_lote_key)
+    return "SCOPEKEY-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:24] if key else ""
+
+
 def sheet_event_lote_scope_key(ev: dict) -> str:
-    lote_nombre = clean_text(ev.get("lote_nombre", ""))
-    archivo = clean_text(ev.get("archivo", ""))
-    hoja = clean_text(ev.get("hoja", ""))
-    # Eventos nuevos llevan backup_lote_key. Solo se usa como fallback cuando una
-    # fila estructurada de Sheets no trae los metadatos del FULL.
-    if not (lote_nombre or archivo or hoja):
-        explicit = clean_text(ev.get("backup_lote_key", ""))
-        if explicit:
-            return "SCOPEKEY-" + hashlib.sha256(explicit.encode("utf-8")).hexdigest()[:24]
-    return make_sheet_lote_scope_key(ev.get("lote_id", ""), lote_nombre, archivo, hoja)
+    # La llave persistente manda siempre. El lote_id SQLite solo es fallback legado.
+    explicit = clean_text(ev.get("backup_lote_key", ""))
+    if explicit:
+        return backup_lote_scope_key(explicit)
+    return make_sheet_lote_scope_key(
+        ev.get("lote_id", ""),
+        clean_text(ev.get("lote_nombre", "")),
+        clean_text(ev.get("archivo", "")),
+        clean_text(ev.get("hoja", "")),
+    )
 
 
 def local_lote_scope_map() -> dict:
-    """Mapa de FULL locales por identidad de rescate, no solo por id SQLite."""
+    """Mapa de FULL locales. Registra llave persistente y firma legado para compatibilidad."""
     out = {}
     with db() as c:
-        rows = c.execute("SELECT id, nombre, archivo, hoja FROM lotes").fetchall()
+        rows = c.execute("SELECT id, nombre, archivo, hoja, backup_lote_key FROM lotes").fetchall()
     for r in rows:
         data = dict(r)
-        scope = make_sheet_lote_scope_key(data.get("id"), data.get("nombre", ""), data.get("archivo", ""), data.get("hoja", ""))
-        out.setdefault(scope, []).append(int(data.get("id")))
+        lid = int(data.get("id"))
+        stable = backup_lote_scope_key(data.get("backup_lote_key", ""))
+        legacy = make_sheet_lote_scope_key(lid, data.get("nombre", ""), data.get("archivo", ""), data.get("hoja", ""))
+        for scope in [stable, legacy]:
+            if scope:
+                out.setdefault(scope, []).append(lid)
     return out
 
 
@@ -8272,17 +8342,22 @@ def get_sheet_lotes_catalog_normalized() -> tuple[bool, pd.DataFrame, str]:
         nombre = clean_text(row.get("lote_nombre", "")) or f"Lote {lote_id}"
         archivo = clean_text(row.get("archivo", ""))
         hoja = clean_text(row.get("hoja", ""))
-        local_scope = make_sheet_lote_scope_key(lote_id, nombre, archivo, hoja)
-        remote_key = clean_text(row.get("rescue_key", "")) or clean_text(row.get("backup_lote_key", "")) or local_scope
-        selection_scope = "REMOTE-" + hashlib.sha256(remote_key.encode("utf-8")).hexdigest()[:24]
-        local_ids = local_scopes.get(local_scope, [])
         created_at = clean_text(row.get("lote_created_at", "")) or clean_text(row.get("created_at", "")) or clean_text(row.get("received_at", ""))
+        local_scope = make_sheet_lote_scope_key(lote_id, nombre, archivo, hoja)
+        # Para FULL históricos sin columna backup_lote_key derivamos exactamente la
+        # misma llave que usará el rescate local. Así, tras la primera restauración,
+        # los eventos nuevos (con otro lote_id local) se siguen uniendo al mismo FULL.
+        effective_backup_key = clean_text(row.get("backup_lote_key", "")) or make_backup_lote_key(nombre, archivo, hoja, created_at)
+        stable_scope = backup_lote_scope_key(effective_backup_key)
+        remote_key = clean_text(row.get("rescue_key", "")) or effective_backup_key or local_scope
+        selection_scope = "REMOTE-" + hashlib.sha256(remote_key.encode("utf-8")).hexdigest()[:24]
+        local_ids = local_scopes.get(stable_scope, []) or local_scopes.get(local_scope, [])
         ultimo = clean_text(row.get("ultimo_evento", "")) or created_at
         rec = {
             "lote_scope_key": selection_scope,
             "local_scope_key": local_scope,
             "remote_rescue_key": remote_key,
-            "backup_lote_key": clean_text(row.get("backup_lote_key", "")),
+            "backup_lote_key": effective_backup_key,
             "lote_created_at": clean_text(row.get("lote_created_at", "")) or created_at,
             "scope_start": clean_text(row.get("scope_start", "")) or created_at,
             "scope_end": clean_text(row.get("scope_end", "")),
@@ -8467,12 +8542,8 @@ def get_sheet_lote_events_df(events: list[dict], lote_id: int, lote_scope_key: s
     rows = []
     target_scope = clean_text(lote_scope_key)
     for ev in events:
-        try:
-            ev_lote_id = int(ev.get("lote_id"))
-        except Exception:
-            continue
-        if ev_lote_id != int(lote_id):
-            continue
+        # Sin scope la lista ya viene filtrada por Apps Script mediante backup_lote_key
+        # y puede incluir varios lote_id locales del mismo FULL.
         if target_scope and sheet_event_lote_scope_key(ev) != target_scope:
             continue
         rows.append({
@@ -8562,6 +8633,8 @@ def render_rescate_sheets():
     selected_row = candidates[candidates["lote_scope_key"] == selected_scope_key].iloc[0].to_dict()
     selected_lote_id = int(selected_row["lote_id"])
     selected_exists_local = clean_text(selected_row.get("existe_local", "")) == "SI"
+    selected_local_ids = [to_int(x) for x in clean_text(selected_row.get("local_ids", "")).split(",") if to_int(x)]
+    selected_runtime_lote_id = selected_local_ids[0] if selected_local_ids else selected_lote_id
 
     detail_cache = st.session_state.setdefault("sheet_rescue_detail_cache", {})
     detail_key = clean_text(selected_row.get("remote_rescue_key", "")) or selected_scope_key
@@ -8645,12 +8718,12 @@ def render_rescate_sheets():
         if not selected_exists_local:
             st.info("Primero restaura este lote localmente con el botón de abajo. Después vuelve aquí para reconciliarlo contra el PDF corregido.")
         else:
-            pdf_corr = st.file_uploader("PDF corregido de Mercado Libre", type=["pdf"], key=f"pdf_reconcile_{selected_lote_id}")
-            usuario_corr = st.selectbox("Usuario que autoriza la reconciliación", SCAN_OPERATORS + ["ADMIN"], key=f"pdf_reconcile_user_{selected_lote_id}")
-            comentario_corr = st.text_input("Motivo / respaldo", value="PDF corregido por Mercado Libre", key=f"pdf_reconcile_note_{selected_lote_id}")
+            pdf_corr = st.file_uploader("PDF corregido de Mercado Libre", type=["pdf"], key=f"pdf_reconcile_{selected_runtime_lote_id}")
+            usuario_corr = st.selectbox("Usuario que autoriza la reconciliación", SCAN_OPERATORS + ["ADMIN"], key=f"pdf_reconcile_user_{selected_runtime_lote_id}")
+            comentario_corr = st.text_input("Motivo / respaldo", value="PDF corregido por Mercado Libre", key=f"pdf_reconcile_note_{selected_runtime_lote_id}")
             if pdf_corr is not None:
                 try:
-                    plan = build_pdf_reconciliation_plan(int(selected_lote_id), pdf_corr)
+                    plan = build_pdf_reconciliation_plan(int(selected_runtime_lote_id), pdf_corr)
                 except Exception as e:
                     plan = {"ok": False, "error": f"No pude comparar el PDF: {e}"}
                 if not plan.get("ok"):
@@ -8775,7 +8848,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
     """Reconstruye un lote desde el journal de eventos, sin cruzar datos de otros FULL.
 
     Reglas:
-    - Filtra estrictamente por lote_id seleccionado.
+    - La identidad persistente backup_lote_key tiene prioridad sobre lote_id SQLite.
     - Lote_item/lote_snapshot_chunk son snapshot primario.
     - Si picking/scan referencia un producto que no existe en el snapshot primario,
       se crea un producto de respaldo con fuente_rescate=PICKING_FALLBACK/SCAN_FALLBACK.
@@ -8789,8 +8862,9 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
     _seen_lote_event_ids = set()
     for _raw_ev in (events or []):
         _ev = normalize_sheet_event(_raw_ev)
-        if _event_lote_id(_ev) != target:
-            continue
+        # Con scope se filtra por identidad persistente/legada. Sin scope, la lista
+        # viene ya filtrada por Apps Script y puede contener distintos lote_id locales
+        # del mismo FULL después de varias restauraciones.
         if target_scope and sheet_event_lote_scope_key(_ev) != target_scope:
             continue
         if sheet_event_seen_or_mark(_ev, _seen_lote_event_ids):
@@ -9234,14 +9308,17 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
             item["updated_at"] = now_cl().isoformat(timespec="seconds")
 
     # 5) Resto de eventos operativos.
-    incidencias = []
+    incidencias = {}
+    incidencia_by_legacy_id = {}
     reimpresiones = []
     avisos = {}
+    aviso_by_legacy_id = {}
     avisos_updates = {}
     auditoria = []
     reservas = []
     label_events = []
     postventa_errores = {}
+    postventa_by_legacy_id = {}
     postventa_cierres = []
 
     def resolve_event_item(ev: dict):
@@ -9281,7 +9358,11 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                     "anexo_kame_confirmado_comment": clean_text(ev.get("comentario", "")),
                 })
         elif et in {"incidencia_creada", "INCIDENCIA_ABIERTA"}:
-            incidencias.append({
+            legacy_id = to_int(ev.get("incidencia_id", 0))
+            entity_key = historical_backup_entity_key("INC", meta.get("backup_lote_key", ""), ev, "incidencia_id")
+            rec_inc = {
+                "backup_entity_key": entity_key,
+                "historical_id": legacy_id or None,
                 "lote_id": target,
                 "item_id": resolve_event_item(ev),
                 "tipo": clean_text(ev.get("tipo", "")) or "Otro",
@@ -9290,10 +9371,44 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                 "status": clean_text(ev.get("status", "ABIERTA")) or "ABIERTA",
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                "resolved_at": clean_text(ev.get("resolved_at", "")),
+                "resolved_by": clean_text(ev.get("resolved_by", "")),
+                "resolution_comment": clean_text(ev.get("resolution_comment", "")),
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
                 "codigo_universal": norm_code(ev.get("codigo_universal", "")),
                 "sku": norm_code(ev.get("sku", "")),
                 "descripcion": clean_text(ev.get("descripcion", "")),
+            }
+            incidencias[entity_key] = rec_inc
+            if legacy_id:
+                incidencia_by_legacy_id[legacy_id] = entity_key
+        elif et in {"incidencia_resuelta", "INCIDENCIA_RESUELTA"}:
+            legacy_id = to_int(ev.get("incidencia_id", 0))
+            explicit_key = clean_text(ev.get("backup_entity_key", ""))
+            entity_key = explicit_key if explicit_key in incidencias else incidencia_by_legacy_id.get(legacy_id, "")
+            if not entity_key:
+                # Si la creación histórica no estaba en el recorte, conservar igualmente la resolución.
+                entity_key = explicit_key or historical_backup_entity_key("INC", meta.get("backup_lote_key", ""), ev, "incidencia_id")
+                incidencias[entity_key] = {
+                    "backup_entity_key": entity_key, "historical_id": legacy_id or None, "lote_id": target,
+                    "item_id": resolve_event_item(ev), "tipo": clean_text(ev.get("tipo", "")) or "Otro",
+                    "cantidad": max(0, to_int(ev.get("cantidad", 0))), "comentario": "",
+                    "usuario": clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                    "status": "RESUELTA", "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
+                    "codigo_ml": norm_code(ev.get("codigo_ml", "")), "codigo_universal": norm_code(ev.get("codigo_universal", "")),
+                    "sku": norm_code(ev.get("sku", "")), "descripcion": clean_text(ev.get("descripcion", "")),
+                }
+            if explicit_key and explicit_key != entity_key:
+                incidencias[explicit_key] = incidencias.pop(entity_key)
+                incidencias[explicit_key]["backup_entity_key"] = explicit_key
+                if legacy_id:
+                    incidencia_by_legacy_id[legacy_id] = explicit_key
+                entity_key = explicit_key
+            incidencias[entity_key].update({
+                "status": "RESUELTA",
+                "resolved_at": clean_text(ev.get("resolved_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")),
+                "resolved_by": clean_text(ev.get("resolved_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
+                "resolution_comment": clean_text(ev.get("resolution_comment", "")) or clean_text(ev.get("comentario", "")),
             })
         elif "reimpresion" in et_low:
             reimpresiones.append({
@@ -9308,10 +9423,11 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
         elif et in {"aviso_operacional_creado", "AVISO_OPERACIONAL_CREADO"}:
-            aviso_id = to_int(ev.get("aviso_id", 0)) or _stable_negative_id(f"AVISO:{target}:{clean_text(ev.get('queue_id',''))}:{clean_text(ev.get('item_id',''))}", used_ids)
-            used_ids.add(aviso_id)
-            avisos[aviso_id] = {
-                "id": aviso_id,
+            aviso_id = to_int(ev.get("aviso_id", 0))
+            entity_key = historical_backup_entity_key("AV", meta.get("backup_lote_key", ""), ev, "aviso_id")
+            avisos[entity_key] = {
+                "backup_entity_key": entity_key,
+                "historical_id": aviso_id or None,
                 "lote_id": target,
                 "item_id": resolve_event_item(ev) or to_int(ev.get("item_id", 0)) or 0,
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
@@ -9339,10 +9455,20 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "resolved_by": clean_text(ev.get("resolved_by", "")),
                 "resolution_comment": clean_text(ev.get("resolution_comment", "")),
             }
+            if aviso_id:
+                aviso_by_legacy_id[aviso_id] = entity_key
         elif et in {"aviso_operacional_ml_confirmado", "AVISO_OPERACIONAL_ML_CONFIRMADO", "aviso_operacional_kame_confirmado", "AVISO_OPERACIONAL_KAME_CONFIRMADO", "aviso_operacional_resuelto", "AVISO_OPERACIONAL_RESUELTO"}:
             aviso_id = to_int(ev.get("aviso_id", 0))
-            if aviso_id:
-                upd = avisos_updates.setdefault(aviso_id, {})
+            explicit_key = clean_text(ev.get("backup_entity_key", ""))
+            entity_key = explicit_key if explicit_key in avisos else aviso_by_legacy_id.get(aviso_id, "")
+            if entity_key:
+                if explicit_key and explicit_key != entity_key:
+                    avisos[explicit_key] = avisos.pop(entity_key)
+                    avisos[explicit_key]["backup_entity_key"] = explicit_key
+                    if aviso_id:
+                        aviso_by_legacy_id[aviso_id] = explicit_key
+                    entity_key = explicit_key
+                upd = avisos_updates.setdefault(entity_key, {})
                 if "ml_confirmado" in et_low:
                     upd["confirmado_ml"] = 1
                     upd["confirmado_ml_at"] = clean_text(ev.get("confirmado_at", "")) or clean_text(ev.get("created_at", ""))
@@ -9382,11 +9508,10 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
             })
         elif et in {"postventa_full_error_creado", "POSTVENTA_FULL_ERROR_CREADO"}:
             err_id = to_int(ev.get("error_id", 0))
-            if not err_id:
-                err_id = _stable_negative_id(f"POSTVENTA:{target}:{sheet_event_semantic_identity(ev)}", used_ids)
-                used_ids.add(err_id)
-            postventa_errores[err_id] = {
-                "id": err_id,
+            entity_key = historical_backup_entity_key("PV", meta.get("backup_lote_key", ""), ev, "error_id")
+            postventa_errores[entity_key] = {
+                "backup_entity_key": entity_key,
+                "historical_id": err_id or None,
                 "lote_id": target,
                 "item_id": resolve_event_item(ev),
                 "codigo_ml": norm_code(ev.get("codigo_ml", "")),
@@ -9410,18 +9535,29 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "anulado_by": clean_text(ev.get("anulado_by", "")),
                 "anulado_motivo": clean_text(ev.get("anulado_motivo", "")),
             }
+            if err_id:
+                postventa_by_legacy_id[err_id] = entity_key
         elif et in {"postventa_full_error_anulado", "POSTVENTA_FULL_ERROR_ANULADO"}:
             err_id = to_int(ev.get("error_id", 0))
-            if err_id and err_id in postventa_errores:
-                postventa_errores[err_id].update({
+            explicit_key = clean_text(ev.get("backup_entity_key", ""))
+            entity_key = explicit_key if explicit_key in postventa_errores else postventa_by_legacy_id.get(err_id, "")
+            if entity_key:
+                if explicit_key and explicit_key != entity_key:
+                    postventa_errores[explicit_key] = postventa_errores.pop(entity_key)
+                    postventa_errores[explicit_key]["backup_entity_key"] = explicit_key
+                    if err_id:
+                        postventa_by_legacy_id[err_id] = explicit_key
+                    entity_key = explicit_key
+                postventa_errores[entity_key].update({
                     "estado": "ANULADO",
                     "anulado_at": clean_text(ev.get("anulado_at", "")) or clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")),
                     "anulado_by": clean_text(ev.get("anulado_by", "")) or clean_text(ev.get("usuario", "")) or "SIN_USUARIO",
                     "anulado_motivo": clean_text(ev.get("anulado_motivo", "")) or clean_text(ev.get("comentario", "")),
                 })
-            elif err_id:
-                postventa_errores[err_id] = {
-                    "id": err_id, "lote_id": target, "item_id": resolve_event_item(ev),
+            elif err_id or explicit_key:
+                entity_key = explicit_key or historical_backup_entity_key("PV", meta.get("backup_lote_key", ""), ev, "error_id")
+                postventa_errores[entity_key] = {
+                    "backup_entity_key": entity_key, "historical_id": err_id or None, "lote_id": target, "item_id": resolve_event_item(ev),
                     "codigo_ml": norm_code(ev.get("codigo_ml", "")), "codigo_universal": norm_code(ev.get("codigo_universal", "")),
                     "sku": norm_code(ev.get("sku", "")), "descripcion": clean_text(ev.get("descripcion", "")),
                     "descripcion_kame": clean_text(ev.get("descripcion_kame", ev.get("descripcion", ""))), "descripcion_ml": clean_text(ev.get("descripcion_ml", "")),
@@ -9480,9 +9616,9 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
                 "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or now_cl().isoformat(timespec="seconds"),
             })
 
-    for aviso_id, upd in avisos_updates.items():
-        if aviso_id in avisos:
-            avisos[aviso_id].update(upd)
+    for aviso_key, upd in avisos_updates.items():
+        if aviso_key in avisos:
+            avisos[aviso_key].update(upd)
 
     integrity = {
         "fallback_from_picking": fallback_from_picking,
@@ -9501,7 +9637,7 @@ def build_sheet_lote_state_clean(events: list[dict], lote_id: int, lote_scope_ke
         "picking_lists": list(picking_lists.values()),
         "picking_items": picking_item_rows,
         "scans": scan_rows,
-        "incidencias": incidencias,
+        "incidencias": list(incidencias.values()),
         "reimpresiones": reimpresiones,
         "avisos": list(avisos.values()),
         "auditoria": auditoria,
@@ -9577,10 +9713,30 @@ def diagnose_sheet_lote_state(state: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
-    """Reconstruye el estado visual de Etiquetas después del rescate."""
+def _restore_labels_from_state(c, lote_id: int, state: dict, item_id_map: dict | None = None, picking_id_map: dict | None = None) -> int:
+    """Reconstruye etiquetas dentro de la misma transacción del rescate."""
     restored = 0
     lid = int(lote_id)
+    item_id_map = item_id_map or {}
+    picking_id_map = picking_id_map or {}
+
+    # Base local visible dentro de esta misma conexión/transacción.
+    tx_items = pd.read_sql_query(
+        "SELECT * FROM items WHERE lote_id=? ORDER BY area, CAST(nro AS INTEGER), id",
+        c, params=(lid,),
+    )
+    blocked_ids = set()
+    for row in c.execute("SELECT item_id, tipo_aviso, estado FROM avisos_operacionales WHERE lote_id=?", (lid,)).fetchall():
+        tipo = clean_text(row["tipo_aviso"]).upper()
+        estado = clean_text(row["estado"]).upper()
+        if tipo == "PRODUCTO RETIRADO DEL LOTE" or (tipo == "NO ESCANEAR / ESPERAR INSTRUCCIÓN" and estado == "ACTIVO"):
+            if to_int(row["item_id"]):
+                blocked_ids.add(to_int(row["item_id"]))
+    if not tx_items.empty:
+        if blocked_ids:
+            tx_items = tx_items[~tx_items["id"].map(lambda x: to_int(x) in blocked_ids)].copy()
+        tx_items = tx_items[tx_items["unidades"].map(to_int) > 0].reset_index(drop=True)
+    blocks_restore_tx = build_label_blocks(tx_items, ROLL_CAPACITY_DEFAULT) if tx_items is not None and not tx_items.empty else []
     for evp in state.get("label_events", []) or []:
         scope = clean_text(evp.get("print_scope", "")).upper()
         kind = clean_text(evp.get("print_kind", "NORMAL")).upper() or "NORMAL"
@@ -9592,11 +9748,9 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                 block_key = clean_text(evp.get("block_key", ""))
                 if not block_index or not block_key:
                     continue
-                labels_view_restore = label_control_view(lid)
-                blocks_restore = build_label_blocks(labels_view_restore, ROLL_CAPACITY_DEFAULT) if not labels_view_restore.empty else []
-                # El block_key histórico puede cambiar después de rescatar porque los ids locales/snapshot
-                # pueden variar. Primero buscamos por block_key exacto y luego por block_index.
-                block = find_restored_label_block(blocks_restore, block_index, block_key)
+                # El block_key histórico puede cambiar porque los ids locales cambian.
+                # Se reconstruye con los ids locales visibles en la transacción y se cae por índice.
+                block = find_restored_label_block(blocks_restore_tx, block_index, block_key)
                 restored_block_key = clean_text(block.get("block_key", "")) if block else block_key
 
                 if not block:
@@ -9650,7 +9804,8 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
             elif scope == "PICKING":
                 # El id histórico de picking_list_id puede cambiar al rescatar desde Sheets.
                 # Por eso se valida que exista en este lote; si no, se resuelve por codigo_lista/picking_code.
-                picking_id = to_int(evp.get("picking_list_id", 0)) or to_int(evp.get("block_index", 0))
+                historical_picking_id = to_int(evp.get("picking_list_id", 0)) or to_int(evp.get("block_index", 0))
+                picking_id = to_int(picking_id_map.get(historical_picking_id, 0)) or historical_picking_id
                 block_key = clean_text(evp.get("block_key", "")) or clean_text(evp.get("picking_code", ""))
                 code = clean_text(evp.get("picking_code", "")) or clean_text(evp.get("codigo_lista", ""))
 
@@ -9704,7 +9859,12 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
                         )
                 restored += 1
             elif scope == "INDIVIDUAL":
-                item_id = to_int(evp.get("item_id", 0))
+                historical_item_id = to_int(evp.get("item_id", 0))
+                item_id = to_int(item_id_map.get(historical_item_id, 0)) or historical_item_id
+                if item_id:
+                    valid_item = c.execute("SELECT id FROM items WHERE id=? AND lote_id=?", (item_id, lid)).fetchone()
+                    if not valid_item:
+                        item_id = 0
                 if not item_id:
                     # Resolver por código si el id histórico cambió.
                     key_item = None
@@ -9739,258 +9899,409 @@ def _restore_labels_from_state(c, lote_id: int, state: dict) -> int:
 
 
 def restore_lote_from_sheet_events_clean(events: list[dict], lote_id: int, replace_existing: bool = True, lote_scope_key: str = "") -> tuple[bool, str]:
+    """Restaura un FULL sin asumir que los ids históricos de SQLite siguen disponibles.
+
+    backup_lote_key identifica el FULL de forma persistente. Los ids de lote, item,
+    picking y entidades secundarias se recrean localmente y se remapean dentro de una
+    única transacción; nunca se reemplaza una fila de otro FULL por compartir un id viejo.
+    """
     state = build_sheet_lote_state_clean(events, int(lote_id), lote_scope_key=lote_scope_key)
-    meta = state.get("meta", {})
-    items = state.get("items", [])
+    meta = state.get("meta", {}) or {}
+    items = state.get("items", []) or []
     if not items:
-        return False, f"No encontré productos reconstruibles para el lote {lote_id}. Revisa eventos lote_item, picking_lista_creada o scan_agregado."
+        return False, f"No encontré productos reconstruibles para el lote histórico {lote_id}. Revisa lote_item/lote_snapshot_chunk."
 
-    with db() as c:
-        # Nunca reemplazar un lote local distinto solo porque comparte el mismo id SQLite.
-        existing = c.execute("SELECT id, nombre, archivo, hoja FROM lotes WHERE id=?", (int(lote_id),)).fetchone()
-        selected_scope = clean_text(lote_scope_key) or clean_text((state.get("integrity", {}) or {}).get("lote_scope_key", ""))
-        if existing and selected_scope:
-            existing_data = dict(existing)
-            existing_scope = make_sheet_lote_scope_key(
-                existing_data.get("id"),
-                existing_data.get("nombre", ""),
-                existing_data.get("archivo", ""),
-                existing_data.get("hoja", ""),
-            )
-            if existing_scope != selected_scope:
-                return False, (
-                    "No se reemplazó el lote local: el mismo ID SQLite pertenece a otro FULL. "
-                    "Selecciona el FULL correcto por nombre/archivo o trabaja desde una base limpia."
-                )
-        if replace_existing:
-            lid = int(lote_id)
-            c.execute("DELETE FROM scans WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM incidencias WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM reimpresiones WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM avisos_operacionales WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM picking_list_items WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM picking_lists WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM label_prints WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM label_blocks WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM reservas_kame WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM postventa_full_errores WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM postventa_full_cierres WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM audit_events WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM items WHERE lote_id=?", (lid,))
-            c.execute("DELETE FROM lotes WHERE id=?", (lid,))
+    historical_lote_id = int(lote_id)
+    stable_lote_key = clean_text(meta.get("backup_lote_key", "")) or make_backup_lote_key(
+        clean_text(meta.get("nombre", "")), clean_text(meta.get("archivo", "")),
+        clean_text(meta.get("hoja", "")), clean_text(meta.get("created_at", "")),
+    )
+    now = now_cl().isoformat(timespec="seconds")
 
-        c.execute(
-            """
-            INSERT OR REPLACE INTO lotes
-            (id, nombre, archivo, hoja, created_at, status, closed_at, closed_by, close_note, backup_lote_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(lote_id),
-                clean_text(meta.get("nombre", "")) or f"Lote {int(lote_id)}",
-                clean_text(meta.get("archivo", "")),
-                clean_text(meta.get("hoja", "")),
-                clean_text(meta.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
+    try:
+        with db() as c:
+            # 1) Resolver el lote local por identidad estable. El id histórico solo se
+            # reutiliza si está libre; jamás se borra otro FULL por colisión numérica.
+            existing_same = c.execute(
+                "SELECT id, nombre, archivo, hoja, backup_lote_key FROM lotes WHERE backup_lote_key=? ORDER BY id LIMIT 1",
+                (stable_lote_key,),
+            ).fetchone() if stable_lote_key else None
+            occupied_historical = c.execute(
+                "SELECT id, nombre, archivo, hoja, backup_lote_key FROM lotes WHERE id=?",
+                (historical_lote_id,),
+            ).fetchone()
+
+            if existing_same:
+                local_lote_id = int(existing_same["id"])
+                resync_existing = True
+            elif occupied_historical is None:
+                local_lote_id = historical_lote_id
+                resync_existing = False
+            else:
+                # Colisión esperable tras hibernación: se asignará un id nuevo.
+                local_lote_id = 0
+                resync_existing = False
+
+            # 2) Si es re-sincronización, limpiar SOLO el FULL identificado por backup_lote_key.
+            if resync_existing and replace_existing:
+                lid = int(local_lote_id)
+                for table in [
+                    "scans", "incidencias", "reimpresiones", "avisos_operacionales",
+                    "picking_list_items", "picking_lists", "label_prints", "label_blocks",
+                    "reservas_kame", "postventa_full_errores", "postventa_full_cierres",
+                    "audit_events", "items",
+                ]:
+                    c.execute(f"DELETE FROM {table} WHERE lote_id=?", (lid,))
+                c.execute("DELETE FROM lotes WHERE id=? AND backup_lote_key=?", (lid, stable_lote_key))
+
+            # 3) Crear lote. Solo se fuerza el id histórico cuando está realmente libre.
+            lote_values = (
+                clean_text(meta.get("nombre", "")) or f"Lote {historical_lote_id}",
+                clean_text(meta.get("archivo", "")), clean_text(meta.get("hoja", "")),
+                clean_text(meta.get("created_at", "")) or now,
                 clean_text(meta.get("status", "ACTIVO")) or "ACTIVO",
-                clean_text(meta.get("closed_at", "")),
-                clean_text(meta.get("closed_by", "")),
-                clean_text(meta.get("close_note", "")),
-                clean_text(meta.get("backup_lote_key", "")) or make_backup_lote_key(
-                    clean_text(meta.get("nombre", "")),
-                    clean_text(meta.get("archivo", "")),
-                    clean_text(meta.get("hoja", "")),
-                    clean_text(meta.get("created_at", "")),
-                ),
-            ),
-        )
+                clean_text(meta.get("closed_at", "")), clean_text(meta.get("closed_by", "")),
+                clean_text(meta.get("close_note", "")), stable_lote_key,
+            )
+            if local_lote_id:
+                c.execute(
+                    """
+                    INSERT INTO lotes
+                    (id, nombre, archivo, hoja, created_at, status, closed_at, closed_by, close_note, backup_lote_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_lote_id, *lote_values),
+                )
+            else:
+                cur = c.execute(
+                    """
+                    INSERT INTO lotes
+                    (nombre, archivo, hoja, created_at, status, closed_at, closed_by, close_note, backup_lote_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    lote_values,
+                )
+                local_lote_id = int(cur.lastrowid)
 
-        for it in items:
-            c.execute(
-                """
-                INSERT OR REPLACE INTO items
-                (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
-                 descripcion_fuente, familia_kame, maestro_match_status, origen_item, motivo_anexo, usuario_anexo, fecha_anexo,
-                 anexo_ml_confirmado, anexo_ml_confirmado_at, anexo_ml_confirmado_by, anexo_ml_confirmado_comment,
-                 anexo_kame_confirmado, anexo_kame_confirmado_at, anexo_kame_confirmado_by, anexo_kame_confirmado_comment,
-                 unidades, acopiadas, identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(it.get("id")), int(lote_id), clean_text(it.get("area", "")), clean_text(it.get("nro", "")),
-                    norm_code(it.get("codigo_ml", "")), norm_code(it.get("codigo_universal", "")), norm_code(it.get("sku", "")),
-                    clean_text(it.get("descripcion", "")), clean_text(it.get("descripcion_kame", it.get("descripcion", ""))), clean_text(it.get("descripcion_ml", it.get("descripcion", ""))),
-                    clean_text(it.get("descripcion_fuente", "")), clean_text(it.get("familia_kame", "")), clean_text(it.get("maestro_match_status", "")),
-                    clean_text(it.get("origen_item", "PDF_FULL")) or "PDF_FULL", clean_text(it.get("motivo_anexo", "")),
-                    clean_text(it.get("usuario_anexo", "")), clean_text(it.get("fecha_anexo", "")),
-                    to_int(it.get("anexo_ml_confirmado", 0)), clean_text(it.get("anexo_ml_confirmado_at", "")),
-                    clean_text(it.get("anexo_ml_confirmado_by", "")), clean_text(it.get("anexo_ml_confirmado_comment", "")),
-                    to_int(it.get("anexo_kame_confirmado", 0)), clean_text(it.get("anexo_kame_confirmado_at", "")),
-                    clean_text(it.get("anexo_kame_confirmado_by", "")), clean_text(it.get("anexo_kame_confirmado_comment", "")),
-                    to_int(it.get("unidades", 0)), to_int(it.get("acopiadas", 0)),
-                    clean_text(it.get("identificacion", "")), clean_text(it.get("vence", "")), clean_text(it.get("instrucciones", "")),
-                    clean_text(it.get("dia", "")), clean_text(it.get("hora", "")),
-                    clean_text(it.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
-                    clean_text(it.get("updated_at", "")) or now_cl().isoformat(timespec="seconds"),
-                    clean_text(it.get("fuente_rescate", "")), clean_text(it.get("rescue_note", "")),
-                ),
-            )
+            # Helpers de remapeo de producto por id histórico y códigos de negocio.
+            item_id_map: dict[int, int] = {}
+            local_item_by_key: dict[str, int] = {}
+            for it in items:
+                historical_item_id = to_int(it.get("id", 0))
+                cur = c.execute(
+                    """
+                    INSERT INTO items
+                    (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml,
+                     descripcion_fuente, familia_kame, maestro_match_status, origen_item, motivo_anexo, usuario_anexo, fecha_anexo,
+                     anexo_ml_confirmado, anexo_ml_confirmado_at, anexo_ml_confirmado_by, anexo_ml_confirmado_comment,
+                     anexo_kame_confirmado, anexo_kame_confirmado_at, anexo_kame_confirmado_by, anexo_kame_confirmado_comment,
+                     unidades, acopiadas, identificacion, vence, instrucciones, dia, hora, created_at, updated_at, fuente_rescate, rescue_note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_lote_id, clean_text(it.get("area", "")), clean_text(it.get("nro", "")),
+                        norm_code(it.get("codigo_ml", "")), norm_code(it.get("codigo_universal", "")), norm_code(it.get("sku", "")),
+                        clean_text(it.get("descripcion", "")), clean_text(it.get("descripcion_kame", it.get("descripcion", ""))),
+                        clean_text(it.get("descripcion_ml", it.get("descripcion", ""))), clean_text(it.get("descripcion_fuente", "")),
+                        clean_text(it.get("familia_kame", "")), clean_text(it.get("maestro_match_status", "")),
+                        clean_text(it.get("origen_item", "PDF_FULL")) or "PDF_FULL", clean_text(it.get("motivo_anexo", "")),
+                        clean_text(it.get("usuario_anexo", "")), clean_text(it.get("fecha_anexo", "")),
+                        to_int(it.get("anexo_ml_confirmado", 0)), clean_text(it.get("anexo_ml_confirmado_at", "")),
+                        clean_text(it.get("anexo_ml_confirmado_by", "")), clean_text(it.get("anexo_ml_confirmado_comment", "")),
+                        to_int(it.get("anexo_kame_confirmado", 0)), clean_text(it.get("anexo_kame_confirmado_at", "")),
+                        clean_text(it.get("anexo_kame_confirmado_by", "")), clean_text(it.get("anexo_kame_confirmado_comment", "")),
+                        to_int(it.get("unidades", 0)), min(to_int(it.get("acopiadas", 0)), max(0, to_int(it.get("unidades", 0)))),
+                        clean_text(it.get("identificacion", "")), clean_text(it.get("vence", "")), clean_text(it.get("instrucciones", "")),
+                        clean_text(it.get("dia", "")), clean_text(it.get("hora", "")),
+                        clean_text(it.get("created_at", "")) or now, clean_text(it.get("updated_at", "")) or now,
+                        clean_text(it.get("fuente_rescate", "")), clean_text(it.get("rescue_note", "")),
+                    ),
+                )
+                new_item_id = int(cur.lastrowid)
+                if historical_item_id:
+                    item_id_map[historical_item_id] = new_item_id
+                for key in [
+                    _product_key_from_values(it.get("codigo_ml", ""), "", "", ""),
+                    _product_key_from_values("", it.get("codigo_universal", ""), "", ""),
+                    _product_key_from_values("", "", it.get("sku", ""), ""),
+                ]:
+                    if key:
+                        local_item_by_key.setdefault(key, new_item_id)
 
-        for pl in state.get("picking_lists", []):
-            c.execute(
-                """
-                INSERT OR REPLACE INTO picking_lists
-                (id, lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at,
-                 printed_at, completed_at, anulada_at, anulada_by, anulada_motivo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(pl.get("id")), int(lote_id), clean_text(pl.get("codigo_lista", "")), clean_text(pl.get("asignado_a", "")) or "SIN_ASIGNAR",
-                    clean_text(pl.get("estado", "CREADA")) or "CREADA", clean_text(pl.get("created_by", "")) or "SIN_USUARIO",
-                    clean_text(pl.get("comentario", "")), clean_text(pl.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
-                    clean_text(pl.get("printed_at", "")), clean_text(pl.get("completed_at", "")), clean_text(pl.get("anulada_at", "")),
-                    clean_text(pl.get("anulada_by", "")), clean_text(pl.get("anulada_motivo", "")),
-                ),
-            )
-        for pit in state.get("picking_items", []):
-            c.execute(
-                """
-                INSERT INTO picking_list_items
-                (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status,
-                 cantidad, area, nro, estado, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(pit.get("picking_list_id")), int(lote_id), int(pit.get("item_id")), norm_code(pit.get("codigo_ml", "")),
-                    norm_code(pit.get("codigo_universal", "")), norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")),
-                    clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")), clean_text(pit.get("descripcion_ml", "")) or clean_text(pit.get("descripcion", "")),
-                    clean_text(pit.get("familia_kame", "")), clean_text(pit.get("maestro_match_status", "")),
-                    to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")), clean_text(pit.get("nro", "")),
-                    clean_text(pit.get("estado", "PENDIENTE")) or "PENDIENTE", clean_text(pit.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
-                ),
-            )
-        for sr in state.get("scans", []):
-            c.execute(
-                """
-                INSERT INTO scans
-                (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
-                 operador_validador, picking_list_id, picking_code, picker_asignado,
-                 original_item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status, restore_match_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(lote_id), int(sr.get("item_id", 0)), norm_code(sr.get("scan_primario", "")), norm_code(sr.get("scan_secundario", "")),
-                    to_int(sr.get("cantidad", 0)), clean_text(sr.get("modo", "")), clean_text(sr.get("created_at", "")) or now_cl().isoformat(timespec="seconds"),
-                    clean_text(sr.get("operador_validador", "")) or "SIN_USUARIO", sr.get("picking_list_id"), clean_text(sr.get("picking_code", "")), clean_text(sr.get("picker_asignado", "")),
-                    sr.get("original_item_id"), norm_code(sr.get("codigo_ml", "")), norm_code(sr.get("codigo_universal", "")), norm_code(sr.get("sku", "")),
-                    clean_text(sr.get("descripcion", "")), clean_text(sr.get("descripcion_kame", sr.get("descripcion", ""))), clean_text(sr.get("descripcion_ml", sr.get("descripcion", ""))),
-                    clean_text(sr.get("familia_kame", "")), clean_text(sr.get("maestro_match_status", "")), clean_text(sr.get("restore_match_status", "")),
-                ),
-            )
-        _notes = reconcile_all_active_picking_quantities(c, int(lote_id))
-        for _note in _notes:
-            c.execute(
-                "INSERT INTO audit_events (lote_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
-                (int(lote_id), "RECONCILIACION_PICKING_RESTAURACION", _note, now_cl().isoformat(timespec="seconds")),
-            )
-        for inc in state.get("incidencias", []):
-            c.execute(
-                """
-                INSERT INTO incidencias
-                (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
-                 codigo_ml, codigo_universal, sku, descripcion)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (int(lote_id), inc.get("item_id"), clean_text(inc.get("tipo", "")) or "Otro", to_int(inc.get("cantidad", 0)), clean_text(inc.get("comentario", "")), clean_text(inc.get("usuario", "")) or "SIN_USUARIO", clean_text(inc.get("status", "ABIERTA")) or "ABIERTA", clean_text(inc.get("created_at", "")) or now_cl().isoformat(timespec="seconds"), norm_code(inc.get("codigo_ml", "")), norm_code(inc.get("codigo_universal", "")), norm_code(inc.get("sku", "")), clean_text(inc.get("descripcion", ""))),
-            )
-        for rep in state.get("reimpresiones", []):
-            c.execute(
-                """
-                INSERT INTO reimpresiones
-                (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (int(lote_id), rep.get("item_id"), rep.get("block_index"), clean_text(rep.get("block_key", "")), clean_text(rep.get("scope", "")), to_int(rep.get("cantidad", 1)), clean_text(rep.get("motivo", "")), clean_text(rep.get("usuario", "")) or "SIN_USUARIO", clean_text(rep.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
-            )
-        for av in state.get("avisos", []):
-            c.execute(
-                """
-                INSERT OR REPLACE INTO avisos_operacionales
-                (id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
-                 tipo_aviso, mensaje_operador, cantidad_original, cantidad_nueva,
-                 requiere_ajuste_ml, requiere_ajuste_inventario, confirmado_ml, confirmado_inventario,
-                 confirmado_ml_at, confirmado_ml_by, confirmado_inventario_at, confirmado_inventario_by,
-                 visible_operador, estado, comentario_interno, created_by, created_at,
-                 resolved_at, resolved_by, resolution_comment)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (int(av.get("id")), int(lote_id), int(av.get("item_id") or 0), norm_code(av.get("codigo_ml", "")), norm_code(av.get("codigo_universal", "")), norm_code(av.get("sku", "")), clean_text(av.get("descripcion", "")), clean_text(av.get("tipo_aviso", "")), clean_text(av.get("mensaje_operador", "")), to_int(av.get("cantidad_original", 0)), av.get("cantidad_nueva"), to_int(av.get("requiere_ajuste_ml", 0)), to_int(av.get("requiere_ajuste_inventario", 0)), to_int(av.get("confirmado_ml", 0)), to_int(av.get("confirmado_inventario", 0)), clean_text(av.get("confirmado_ml_at", "")), clean_text(av.get("confirmado_ml_by", "")), clean_text(av.get("confirmado_inventario_at", "")), clean_text(av.get("confirmado_inventario_by", "")), to_int(av.get("visible_operador", 1)), clean_text(av.get("estado", "ACTIVO")), clean_text(av.get("comentario_interno", "")), clean_text(av.get("created_by", "")) or "SIN_USUARIO", clean_text(av.get("created_at", "")) or now_cl().isoformat(timespec="seconds"), clean_text(av.get("resolved_at", "")), clean_text(av.get("resolved_by", "")), clean_text(av.get("resolution_comment", ""))),
-            )
-        for au in state.get("auditoria", []):
-            c.execute(
-                """
-                INSERT INTO audit_events
-                (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (int(lote_id), au.get("item_id"), clean_text(au.get("event_type", "AUDIT_EVENT")), clean_text(au.get("detail", "")), au.get("qty"), norm_code(au.get("codigo_ml", "")), norm_code(au.get("sku", "")), clean_text(au.get("mode", "")), clean_text(au.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
-            )
-        for res in state.get("reservas", []):
-            c.execute(
-                """
-                INSERT INTO reservas_kame
-                (lote_id, folio, folio_auto, ficha, fecha, glosa, bodega_salida, unidad_negocio,
-                 sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, csv_hash, usuario, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (int(lote_id), clean_text(res.get("folio", "SIN_FOLIO")), clean_text(res.get("folio_auto", "S")), clean_text(res.get("ficha", "")), clean_text(res.get("fecha", "")), clean_text(res.get("glosa", "")), clean_text(res.get("bodega_salida", "")), clean_text(res.get("unidad_negocio", "")), to_int(res.get("sku_count", 0)), to_float_qty(res.get("unidades_total", 0)), to_int(res.get("productos_full", 0)), to_int(res.get("packs_expandidos", 0)), to_int(res.get("lineas_csv", 0)), clean_text(res.get("archivo_nombre", "")), clean_text(res.get("csv_hash", "")), clean_text(res.get("usuario", "")) or "SIN_USUARIO", clean_text(res.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
-            )
+            def local_item_id(raw: dict, historical=None) -> int | None:
+                old = to_int(historical if historical is not None else (raw or {}).get("item_id", 0))
+                if old and old in item_id_map:
+                    return item_id_map[old]
+                for key in [
+                    _product_key_from_values((raw or {}).get("codigo_ml", ""), "", "", ""),
+                    _product_key_from_values("", (raw or {}).get("codigo_universal", ""), "", ""),
+                    _product_key_from_values("", "", (raw or {}).get("sku", ""), ""),
+                ]:
+                    if key and key in local_item_by_key:
+                        return local_item_by_key[key]
+                return None
 
-        for pe in state.get("postventa_errores", []):
-            c.execute(
+            # 4) Picking: ids nuevos; codigo_lista es la identidad operativa estable de la lista.
+            picking_id_map: dict[int, int] = {}
+            picking_by_code: dict[str, int] = {}
+            for pl in state.get("picking_lists", []) or []:
+                cur = c.execute(
+                    """
+                    INSERT INTO picking_lists
+                    (lote_id, codigo_lista, asignado_a, estado, created_by, comentario, created_at,
+                     printed_at, completed_at, anulada_at, anulada_by, anulada_motivo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_lote_id, clean_text(pl.get("codigo_lista", "")), clean_text(pl.get("asignado_a", "")) or "SIN_ASIGNAR",
+                        clean_text(pl.get("estado", "CREADA")) or "CREADA", clean_text(pl.get("created_by", "")) or "SIN_USUARIO",
+                        clean_text(pl.get("comentario", "")), clean_text(pl.get("created_at", "")) or now,
+                        clean_text(pl.get("printed_at", "")), clean_text(pl.get("completed_at", "")), clean_text(pl.get("anulada_at", "")),
+                        clean_text(pl.get("anulada_by", "")), clean_text(pl.get("anulada_motivo", "")),
+                    ),
+                )
+                new_pl_id = int(cur.lastrowid)
+                old_pl_id = to_int(pl.get("id", 0))
+                if old_pl_id:
+                    picking_id_map[old_pl_id] = new_pl_id
+                if clean_text(pl.get("codigo_lista", "")):
+                    picking_by_code[clean_text(pl.get("codigo_lista", ""))] = new_pl_id
+
+            def local_picking_id(raw: dict, historical=None) -> int | None:
+                old = to_int(historical if historical is not None else (raw or {}).get("picking_list_id", 0))
+                if old and old in picking_id_map:
+                    return picking_id_map[old]
+                code = clean_text((raw or {}).get("picking_code", "")) or clean_text((raw or {}).get("codigo_lista", ""))
+                return picking_by_code.get(code)
+
+            for pit in state.get("picking_items", []) or []:
+                new_item = local_item_id(pit)
+                new_pl = local_picking_id(pit)
+                if not new_item or not new_pl:
+                    raise ValueError(f"Picking sin remapeo seguro: {clean_text(pit.get('codigo_ml','')) or clean_text(pit.get('sku',''))}")
+                c.execute(
+                    """
+                    INSERT INTO picking_list_items
+                    (picking_list_id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status,
+                     cantidad, area, nro, estado, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_pl, local_lote_id, new_item, norm_code(pit.get("codigo_ml", "")), norm_code(pit.get("codigo_universal", "")),
+                        norm_code(pit.get("sku", "")), clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")),
+                        clean_text(pit.get("descripcion_kame", "")) or clean_text(pit.get("descripcion", "")),
+                        clean_text(pit.get("descripcion_ml", "")) or clean_text(pit.get("descripcion", "")), clean_text(pit.get("familia_kame", "")),
+                        clean_text(pit.get("maestro_match_status", "")), to_int(pit.get("cantidad", 0)), clean_text(pit.get("area", "")),
+                        clean_text(pit.get("nro", "")), clean_text(pit.get("estado", "PENDIENTE")) or "PENDIENTE", clean_text(pit.get("created_at", "")) or now,
+                    ),
+                )
+
+            # 5) Scans y módulos relacionados siempre apuntan a ids locales remapeados.
+            for sr in state.get("scans", []) or []:
+                new_item = local_item_id(sr)
+                if not new_item:
+                    raise ValueError(f"Scan sin producto local: {clean_text(sr.get('codigo_ml','')) or clean_text(sr.get('sku',''))}")
+                new_pl = local_picking_id(sr)
+                c.execute(
+                    """
+                    INSERT INTO scans
+                    (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at,
+                     operador_validador, picking_list_id, picking_code, picker_asignado,
+                     original_item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, maestro_match_status, restore_match_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_lote_id, new_item, norm_code(sr.get("scan_primario", "")), norm_code(sr.get("scan_secundario", "")),
+                        to_int(sr.get("cantidad", 0)), clean_text(sr.get("modo", "")), clean_text(sr.get("created_at", "")) or now,
+                        clean_text(sr.get("operador_validador", "")) or "SIN_USUARIO", new_pl, clean_text(sr.get("picking_code", "")),
+                        clean_text(sr.get("picker_asignado", "")), to_int(sr.get("original_item_id", 0)) or to_int(sr.get("item_id", 0)) or None,
+                        norm_code(sr.get("codigo_ml", "")), norm_code(sr.get("codigo_universal", "")), norm_code(sr.get("sku", "")),
+                        clean_text(sr.get("descripcion", "")), clean_text(sr.get("descripcion_kame", sr.get("descripcion", ""))),
+                        clean_text(sr.get("descripcion_ml", sr.get("descripcion", ""))), clean_text(sr.get("familia_kame", "")),
+                        clean_text(sr.get("maestro_match_status", "")), clean_text(sr.get("restore_match_status", "")),
+                    ),
+                )
+
+            _notes = reconcile_all_active_picking_quantities(c, local_lote_id)
+            for _note in _notes:
+                c.execute(
+                    "INSERT INTO audit_events (lote_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+                    (local_lote_id, "RECONCILIACION_PICKING_RESTAURACION", _note, now),
+                )
+
+            for inc in state.get("incidencias", []) or []:
+                c.execute(
+                    """
+                    INSERT INTO incidencias
+                    (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at,
+                     resolved_at, resolved_by, resolution_comment, codigo_ml, codigo_universal, sku, descripcion, backup_entity_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_lote_id, local_item_id(inc), clean_text(inc.get("tipo", "")) or "Otro", to_int(inc.get("cantidad", 0)),
+                        clean_text(inc.get("comentario", "")), clean_text(inc.get("usuario", "")) or "SIN_USUARIO",
+                        clean_text(inc.get("status", "ABIERTA")) or "ABIERTA", clean_text(inc.get("created_at", "")) or now,
+                        clean_text(inc.get("resolved_at", "")), clean_text(inc.get("resolved_by", "")), clean_text(inc.get("resolution_comment", "")),
+                        norm_code(inc.get("codigo_ml", "")), norm_code(inc.get("codigo_universal", "")), norm_code(inc.get("sku", "")),
+                        clean_text(inc.get("descripcion", "")), clean_text(inc.get("backup_entity_key", "")) or new_backup_entity_key("INC"),
+                    ),
+                )
+
+            for rep in state.get("reimpresiones", []) or []:
+                c.execute(
+                    """
+                    INSERT INTO reimpresiones
+                    (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_lote_id, local_item_id(rep), rep.get("block_index"), clean_text(rep.get("block_key", "")), clean_text(rep.get("scope", "")),
+                     to_int(rep.get("cantidad", 1)), clean_text(rep.get("motivo", "")), clean_text(rep.get("usuario", "")) or "SIN_USUARIO", clean_text(rep.get("created_at", "")) or now),
+                )
+
+            for av in state.get("avisos", []) or []:
+                new_item = local_item_id(av)
+                if not new_item:
+                    raise ValueError(f"Aviso sin producto local: {clean_text(av.get('codigo_ml','')) or clean_text(av.get('sku',''))}")
+                c.execute(
+                    """
+                    INSERT INTO avisos_operacionales
+                    (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion,
+                     tipo_aviso, mensaje_operador, cantidad_original, cantidad_nueva,
+                     requiere_ajuste_ml, requiere_ajuste_inventario, confirmado_ml, confirmado_inventario,
+                     confirmado_ml_at, confirmado_ml_by, confirmado_inventario_at, confirmado_inventario_by,
+                     visible_operador, estado, comentario_interno, created_by, created_at,
+                     resolved_at, resolved_by, resolution_comment, backup_entity_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_lote_id, new_item, norm_code(av.get("codigo_ml", "")), norm_code(av.get("codigo_universal", "")), norm_code(av.get("sku", "")),
+                        clean_text(av.get("descripcion", "")), clean_text(av.get("tipo_aviso", "")), clean_text(av.get("mensaje_operador", "")),
+                        to_int(av.get("cantidad_original", 0)), av.get("cantidad_nueva"), to_int(av.get("requiere_ajuste_ml", 0)),
+                        to_int(av.get("requiere_ajuste_inventario", 0)), to_int(av.get("confirmado_ml", 0)), to_int(av.get("confirmado_inventario", 0)),
+                        clean_text(av.get("confirmado_ml_at", "")), clean_text(av.get("confirmado_ml_by", "")), clean_text(av.get("confirmado_inventario_at", "")),
+                        clean_text(av.get("confirmado_inventario_by", "")), to_int(av.get("visible_operador", 1)), clean_text(av.get("estado", "ACTIVO")) or "ACTIVO",
+                        clean_text(av.get("comentario_interno", "")), clean_text(av.get("created_by", "")) or "SIN_USUARIO", clean_text(av.get("created_at", "")) or now,
+                        clean_text(av.get("resolved_at", "")), clean_text(av.get("resolved_by", "")), clean_text(av.get("resolution_comment", "")),
+                        clean_text(av.get("backup_entity_key", "")) or new_backup_entity_key("AV"),
+                    ),
+                )
+
+            for au in state.get("auditoria", []) or []:
+                c.execute(
+                    """
+                    INSERT INTO audit_events
+                    (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_lote_id, local_item_id(au), clean_text(au.get("event_type", "AUDIT_EVENT")), clean_text(au.get("detail", "")),
+                     au.get("qty"), norm_code(au.get("codigo_ml", "")), norm_code(au.get("sku", "")), clean_text(au.get("mode", "")), clean_text(au.get("created_at", "")) or now),
+                )
+
+            for res in state.get("reservas", []) or []:
+                c.execute(
+                    """
+                    INSERT INTO reservas_kame
+                    (lote_id, folio, folio_auto, ficha, fecha, glosa, bodega_salida, unidad_negocio,
+                     sku_count, unidades_total, productos_full, packs_expandidos, lineas_csv, archivo_nombre, csv_hash, usuario, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_lote_id, clean_text(res.get("folio", "SIN_FOLIO")), clean_text(res.get("folio_auto", "S")), clean_text(res.get("ficha", "")),
+                     clean_text(res.get("fecha", "")), clean_text(res.get("glosa", "")), clean_text(res.get("bodega_salida", "")), clean_text(res.get("unidad_negocio", "")),
+                     to_int(res.get("sku_count", 0)), to_float_qty(res.get("unidades_total", 0)), to_int(res.get("productos_full", 0)), to_int(res.get("packs_expandidos", 0)),
+                     to_int(res.get("lineas_csv", 0)), clean_text(res.get("archivo_nombre", "")), clean_text(res.get("csv_hash", "")), clean_text(res.get("usuario", "")) or "SIN_USUARIO", clean_text(res.get("created_at", "")) or now),
+                )
+
+            for pe in state.get("postventa_errores", []) or []:
+                c.execute(
+                    """
+                    INSERT INTO postventa_full_errores
+                    (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, tipo_error,
+                     cantidad_solicitada, cantidad_preparada, cantidad_reportada_full, cantidad_diferencia, cantidad_afectada,
+                     comentario, usuario, estado, created_at, anulado_at, anulado_by, anulado_motivo, backup_entity_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_lote_id, local_item_id(pe), norm_code(pe.get("codigo_ml", "")), norm_code(pe.get("codigo_universal", "")), norm_code(pe.get("sku", "")),
+                     clean_text(pe.get("descripcion", "")), clean_text(pe.get("descripcion_kame", pe.get("descripcion", ""))), clean_text(pe.get("descripcion_ml", "")), clean_text(pe.get("familia_kame", "")),
+                     clean_text(pe.get("tipo_error", "Otro")) or "Otro", to_int(pe.get("cantidad_solicitada", 0)), to_int(pe.get("cantidad_preparada", 0)), pe.get("cantidad_reportada_full"),
+                     to_int(pe.get("cantidad_diferencia", 0)), to_int(pe.get("cantidad_afectada", 0)), clean_text(pe.get("comentario", "")), clean_text(pe.get("usuario", "")) or "SIN_USUARIO",
+                     clean_text(pe.get("estado", "ACTIVO")) or "ACTIVO", clean_text(pe.get("created_at", "")) or now, clean_text(pe.get("anulado_at", "")), clean_text(pe.get("anulado_by", "")),
+                     clean_text(pe.get("anulado_motivo", "")), clean_text(pe.get("backup_entity_key", "")) or new_backup_entity_key("PV")),
+                )
+
+            for pc in state.get("postventa_cierres", []) or []:
+                c.execute(
+                    """
+                    INSERT INTO postventa_full_cierres
+                    (lote_id, lote_nombre, total_errores, errores_activos, unidades_afectadas, cerrado_por, comentario, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (local_lote_id, clean_text(pc.get("lote_nombre", meta.get("nombre", ""))), to_int(pc.get("total_errores", 0)),
+                     to_int(pc.get("errores_activos", 0)), to_int(pc.get("unidades_afectadas", 0)), clean_text(pc.get("cerrado_por", "")) or "SIN_USUARIO",
+                     clean_text(pc.get("comentario", "")), clean_text(pc.get("created_at", "")) or now),
+                )
+
+            restored_label_prints = _restore_labels_from_state(c, local_lote_id, state, item_id_map=item_id_map, picking_id_map=picking_id_map)
+
+            # 6) Validaciones de integridad ANTES del commit. Cualquier fallo revierte todo.
+            expected_products = len(items)
+            expected_units = sum(max(0, to_int(x.get("unidades", 0))) for x in items if isinstance(x, dict))
+            expected_done = sum(min(max(0, to_int(x.get("acopiadas", 0))), max(0, to_int(x.get("unidades", 0)))) for x in items if isinstance(x, dict))
+            row = c.execute(
+                "SELECT COUNT(*) n, COALESCE(SUM(unidades),0) u, COALESCE(SUM(acopiadas),0) a, COALESCE(SUM(CASE WHEN acopiadas>unidades OR acopiadas<0 OR unidades<0 THEN 1 ELSE 0 END),0) bad FROM items WHERE lote_id=?",
+                (local_lote_id,),
+            ).fetchone()
+            if int(row["n"] or 0) != expected_products or int(row["u"] or 0) != expected_units or int(row["a"] or 0) != expected_done or int(row["bad"] or 0) != 0:
+                raise ValueError(
+                    f"Validación de productos falló: esperado {expected_products}/{expected_units}/{expected_done}, "
+                    f"local {int(row['n'] or 0)}/{int(row['u'] or 0)}/{int(row['a'] or 0)}"
+                )
+
+            bad_picking = c.execute(
                 """
-                INSERT OR REPLACE INTO postventa_full_errores
-                (id, lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, tipo_error,
-                 cantidad_solicitada, cantidad_preparada, cantidad_reportada_full, cantidad_diferencia, cantidad_afectada,
-                 comentario, usuario, estado, created_at, anulado_at, anulado_by, anulado_motivo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (to_int(pe.get("id", 0)) or None, int(lote_id), pe.get("item_id"), norm_code(pe.get("codigo_ml", "")), norm_code(pe.get("codigo_universal", "")), norm_code(pe.get("sku", "")),
-                 clean_text(pe.get("descripcion", "")), clean_text(pe.get("descripcion_kame", pe.get("descripcion", ""))), clean_text(pe.get("descripcion_ml", "")), clean_text(pe.get("familia_kame", "")),
-                 clean_text(pe.get("tipo_error", "Otro")) or "Otro", to_int(pe.get("cantidad_solicitada", 0)), to_int(pe.get("cantidad_preparada", 0)),
-                 pe.get("cantidad_reportada_full"), to_int(pe.get("cantidad_diferencia", 0)), to_int(pe.get("cantidad_afectada", 0)),
-                 clean_text(pe.get("comentario", "")), clean_text(pe.get("usuario", "")) or "SIN_USUARIO", clean_text(pe.get("estado", "ACTIVO")) or "ACTIVO",
-                 clean_text(pe.get("created_at", "")) or now_cl().isoformat(timespec="seconds"), clean_text(pe.get("anulado_at", "")), clean_text(pe.get("anulado_by", "")), clean_text(pe.get("anulado_motivo", ""))),
-            )
+                SELECT COUNT(*) n FROM picking_list_items pli
+                LEFT JOIN picking_lists pl ON pl.id=pli.picking_list_id AND pl.lote_id=pli.lote_id
+                LEFT JOIN items i ON i.id=pli.item_id AND i.lote_id=pli.lote_id
+                WHERE pli.lote_id=? AND (pl.id IS NULL OR i.id IS NULL)
+                """, (local_lote_id,),
+            ).fetchone()
+            if int(bad_picking["n"] or 0):
+                raise ValueError(f"Validación picking falló: {int(bad_picking['n'] or 0)} referencia(s) huérfana(s).")
 
-        for pc in state.get("postventa_cierres", []):
-            c.execute(
+            bad_scans = c.execute(
                 """
-                INSERT OR REPLACE INTO postventa_full_cierres
-                (id, lote_id, lote_nombre, total_errores, errores_activos, unidades_afectadas, cerrado_por, comentario, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (to_int(pc.get("id", 0)) or None, int(lote_id), clean_text(pc.get("lote_nombre", meta.get("nombre", ""))),
-                 to_int(pc.get("total_errores", 0)), to_int(pc.get("errores_activos", 0)), to_int(pc.get("unidades_afectadas", 0)),
-                 clean_text(pc.get("cerrado_por", "")) or "SIN_USUARIO", clean_text(pc.get("comentario", "")),
-                 clean_text(pc.get("created_at", "")) or now_cl().isoformat(timespec="seconds")),
-            )
+                SELECT COUNT(*) n FROM scans s
+                LEFT JOIN items i ON i.id=s.item_id AND i.lote_id=s.lote_id
+                LEFT JOIN picking_lists pl ON pl.id=s.picking_list_id AND pl.lote_id=s.lote_id
+                WHERE s.lote_id=? AND (i.id IS NULL OR (s.picking_list_id IS NOT NULL AND pl.id IS NULL))
+                """, (local_lote_id,),
+            ).fetchone()
+            if int(bad_scans["n"] or 0):
+                raise ValueError(f"Validación de escaneos falló: {int(bad_scans['n'] or 0)} referencia(s) huérfana(s).")
 
-        restored_label_prints = _restore_labels_from_state(c, int(lote_id), state)
-        c.commit()
+            stable_count = c.execute("SELECT COUNT(*) n FROM lotes WHERE backup_lote_key=?", (stable_lote_key,)).fetchone()
+            if int(stable_count["n"] or 0) != 1:
+                raise ValueError("La identidad persistente del FULL no quedó única en SQLite.")
 
-    integ = state.get("integrity", {})
+            c.commit()
+
+    except Exception as e:
+        return False, f"Rescate cancelado y revertido por seguridad: {type(e).__name__}: {e}"
+
+    integ = state.get("integrity", {}) or {}
+    collision_note = ""
+    if local_lote_id != historical_lote_id:
+        collision_note = f" El ID histórico {historical_lote_id} estaba ocupado por otro FULL; este FULL quedó con ID local {local_lote_id} sin reemplazar ningún dato ajeno."
     msg = (
-        f"Rescate limpio completo: 1 lote, {len(state.get('items', []))} producto(s), "
-        f"{len(state.get('scans', []))} escaneo(s), {len(state.get('picking_lists', []))} lista(s) picking, "
-        f"{len(state.get('label_events', []))} impresión(es) etiqueta, "
-        f"{len(state.get('reservas', []))} reserva(s) Kame, "
-        f"{len(state.get('postventa_errores', []))} error(es) postventa, "
-        f"{len(state.get('auditoria', []))} evento(s) auditoría."
+        f"Rescate limpio completo en lote local {local_lote_id}: {len(items)} producto(s), "
+        f"{expected_units} unidades, {expected_done} escaneadas, {len(state.get('scans', []) or [])} movimiento(s), "
+        f"{len(state.get('picking_lists', []) or [])} lista(s) picking, {len(state.get('incidencias', []) or [])} incidencia(s), "
+        f"{len(state.get('avisos', []) or [])} aviso(s), {len(state.get('postventa_errores', []) or [])} error(es) postventa."
+        + collision_note
     )
     if integ.get("fallback_from_picking"):
-        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde picking porque no estaban en lote_item."
+        msg += f" Se incorporaron {integ.get('fallback_from_picking')} producto(s) desde picking por falta en snapshot."
     if integ.get("unmatched_scans") or integ.get("ambiguous_scans"):
-        msg += f" Acopios recuperados desde Sheets: {integ.get('unmatched_scans',0)}; ambiguos: {integ.get('ambiguous_scans',0)}."
+        msg += f" Acopios recuperados: {integ.get('unmatched_scans',0)}; ambiguos: {integ.get('ambiguous_scans',0)}."
     return True, msg
 
 
@@ -10105,14 +10416,15 @@ def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, can
 
     user = clean_text(usuario) or get_operator_name()
     now = now_cl().isoformat(timespec="seconds")
+    backup_entity_key = new_backup_entity_key("PV")
     with db() as c:
         cur = c.execute(
             """
             INSERT INTO postventa_full_errores
             (lote_id, item_id, codigo_ml, codigo_universal, sku, descripcion, descripcion_kame, descripcion_ml, familia_kame, tipo_error,
              cantidad_solicitada, cantidad_preparada, cantidad_reportada_full, cantidad_diferencia,
-             cantidad_afectada, comentario, usuario, estado, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?)
+             cantidad_afectada, comentario, usuario, estado, created_at, backup_entity_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVO', ?, ?)
             """,
             (
                 lid,
@@ -10133,6 +10445,7 @@ def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, can
                 comment,
                 user,
                 now,
+                backup_entity_key,
             ),
         )
         error_id = int(cur.lastrowid)
@@ -10141,6 +10454,7 @@ def create_postventa_full_error(lote_id: int, item_id: int, tipo_error: str, can
     payload = build_lote_payload(lid)
     payload.update({
         "error_id": error_id,
+        "backup_entity_key": backup_entity_key,
         "item_id": iid,
         "codigo_ml": snap.get("codigo_ml", ""),
         "codigo_universal": snap.get("codigo_universal", ""),
@@ -10211,9 +10525,11 @@ def anular_postventa_full_error(error_id: int, motivo: str, usuario: str):
         c.commit()
 
     lid = int(err.get("lote_id") or 0)
+    backup_entity_key = clean_text(err.get("backup_entity_key", "")) or ensure_row_backup_entity_key("postventa_full_errores", eid, "PV")
     payload = build_lote_payload(lid)
     payload.update({
         "error_id": eid,
+        "backup_entity_key": backup_entity_key,
         "item_id": err.get("item_id") or "",
         "codigo_ml": err.get("codigo_ml") or "",
         "codigo_universal": err.get("codigo_universal") or "",
