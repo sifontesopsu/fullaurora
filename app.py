@@ -102,6 +102,26 @@ def to_int(v) -> int:
         return 0
 
 
+def parse_pdf_quantity_token(v) -> int | None:
+    """Convierte cantidades enteras leídas desde PDF ML.
+
+    El PDF de Mercado Libre puede mostrar miles como ``1,000`` o ``1.000``.
+    No usamos ``to_int`` aquí porque esa función acepta coma decimal y convertiría
+    ``1,000`` en 1. Para la columna de unidades del PDF solo aceptamos enteros
+    simples o enteros con separador de miles válido.
+    """
+    s = clean_text(v).replace("\u00a0", "").strip()
+    if not s:
+        return None
+    # Entero normal: 12, 90, 1000
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    # Miles con punto o coma: 1.000 / 1,000 / 12.345 / 12,345
+    if re.fullmatch(r"\d{1,3}([.,]\d{3})+", s):
+        return int(re.sub(r"[.,]", "", s))
+    return None
+
+
 def esc(v) -> str:
     return html.escape(clean_text(v), quote=True)
 
@@ -4186,10 +4206,21 @@ def parse_ml_full_pdf(uploaded_pdf) -> tuple[pd.DataFrame, dict]:
                     continue
 
                 qty = 0
-                for w in sorted(qty_words, key=lambda z: (float(z.get("top", 0)), float(z.get("x0", 0)))):
+                sorted_qty_words = sorted(qty_words, key=lambda z: (float(z.get("top", 0)), float(z.get("x0", 0))))
+                for pos, w in enumerate(sorted_qty_words):
                     t = clean_text(w.get("text", ""))
-                    if re.fullmatch(r"\d+", t):
-                        qty = int(t)
+                    parsed_qty = parse_pdf_quantity_token(t)
+                    if parsed_qty is not None:
+                        # Defensa adicional para PDFs que separen visualmente 1 000 en dos palabras.
+                        # Si el primer token es de 1-3 dígitos y el siguiente es exactamente 3 dígitos
+                        # en la misma línea, se interpreta como separador de miles por espacio.
+                        if re.fullmatch(r"\d{1,3}", t) and pos + 1 < len(sorted_qty_words):
+                            nxt = sorted_qty_words[pos + 1]
+                            nt = clean_text(nxt.get("text", ""))
+                            same_line = abs(float(nxt.get("top", 0)) - float(w.get("top", 0))) <= 3
+                            if same_line and re.fullmatch(r"\d{3}", nt):
+                                parsed_qty = int(f"{t}{nt}")
+                        qty = int(parsed_qty)
                         break
 
                 sku = norm_code(sku_m.group(1))
